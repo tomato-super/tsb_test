@@ -1,4 +1,5 @@
-add_subdirectory(crypto)
+add_subdirectory(common)
+add_subdirectory(pir)
 add_subdirectory(client)
 add_subdirectory(service)
 add_subdirectory(server)

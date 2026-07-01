@@ -8,11 +8,12 @@ add_executable(${OUTPUT_NAME} ${SOURCE_FILES})
 
 target_include_directories(${OUTPUT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    ${gRPC_INCLUDE_DIR}
 )
 
 target_link_libraries(${OUTPUT_NAME} PRIVATE
-    ${Cryptopp_LIBRARY}
+    vmpq_proto
+    tsb_common
 )
 
 message(STATUS "built client")

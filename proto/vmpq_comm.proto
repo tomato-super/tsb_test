@@ -12,8 +12,8 @@ service VMPQService {
 
 message InitTableRequest {
     string tableID = 1;
-    uint64 windowSize = 2;
-    uint64 numBucketSize = 3;
+    uint32 windowSize = 2;
+    uint32 numBucketSize = 3;
 }
 
 message InitTableResponse {
