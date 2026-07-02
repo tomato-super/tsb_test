@@ -1,5 +1,7 @@
-message(STATUS "building service ...")
+message(STATUS "building server ...")
+
+file(GLOB SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+add_library(query_service ${SOURCE_FILES})
 
 
-
-message(STATUS "built service")
+message(STATUS "built server")
