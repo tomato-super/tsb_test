@@ -9,6 +9,8 @@ list(APPEND CMAKE_PREFIX_PATH
     "$ENV{HOME}/.local"
 )
 
+set(PROJECT_BIN_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
+
 project(
     tsdb
     LANGUAGES CXX
