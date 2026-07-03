@@ -1,4 +1,4 @@
-#include "config.hpp"
+#include "common.hpp"
 #include <cryptopp/cryptlib.h>
 #include <cryptopp/aes.h>
 #include <cryptopp/secblock.h>

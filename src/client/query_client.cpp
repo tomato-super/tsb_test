@@ -1,11 +1,14 @@
 #include "query_client.hpp"
-#include "utility.hpp"
 
-void CheckRpcStatus(const grpc::Status& status, const std::string& rpc_name) {
+void CheckRpcStatus(const grpc::Status& status, const std::string& rpc_name, int server_id) {
     if (!status.ok()) {
         std::cerr << "[" << rpc_name << "] RPC failed: "
                   << status.error_code() << " - "
+                  << "Stub[" << server_id << "]: "
                   << status.error_message() << std::endl;
+    } else {
+        std::cout << "[" << rpc_name << "] RPC successful: "
+                  << "Stub[" << server_id << "]" << std::endl;
     }
 }
 
@@ -29,9 +32,8 @@ void QueryClient::InitSystem(string& id, uint32_t windowSize, uint32_t numbucket
 
     for(auto i = 0; i < NUM_SERVERS; i++) {
         status[i] = Stub_[i]->InitTable(&context[i], reqs[i], &resps[i]);
-        if (!status[i].ok()) {
-            CheckRpcStatus(status[i], "initTable");
-        }
+        CheckRpcStatus(status[i], "initTable", i);
+        
     }
 }
 
@@ -47,6 +49,8 @@ void QueryClient::AddValist(string& id, const vector<uint128_t>& data) {
     // 2. 分块发送
     const size_t chunk_size = 10000;  // 每块 10000 个元素，约 160KB
     size_t offset = 0;
+    // uint128_t sum = 0;
+    // uint128_t tmp = 0;
 
     while (offset < data.size()) {
         size_t end = std::min(offset + chunk_size, data.size());
@@ -70,11 +74,18 @@ void QueryClient::AddValist(string& id, const vector<uint128_t>& data) {
 
         for (int i = 0; i < NUM_SERVERS; i++) {
             auto status = Stub_[i]->UpdateBatchVarList(&contexts[i], reqs[i], &resps[i]);
-            CheckRpcStatus(status, "UpdateBatchVarList chunk " + std::to_string(offset));
+            // tmp = 0;
+            // std::memcpy(&tmp, resps[i].res().data(), sizeof(uint128_t));
+            // sum += tmp;
+            CheckRpcStatus(status, "UpdateBatchVarList chunk " + std::to_string(offset), i);
         }
-
         offset = end;
     }
+
+    // std::cout << "sum = " << utility::uint128ToString(sum) << std::endl;
 }
 
+void QueryClient::AddTable(string &id, uint32_t num_bucket, const vector<uint128_t> &raw) {
+    
 
+}

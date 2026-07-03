@@ -1,6 +1,6 @@
 #pragma once
 
-#include "config.hpp"
+#include "common.hpp"
 #include <string>
 #include <vector> 
 #include <unordered_map>
@@ -51,6 +51,7 @@ public:
     explicit VMPQServer(int server_id);
 
     void initTable(const string& table_id, uint32_t window_size, uint32_t num_bucket);
+    void updateBatchVarList(const string& var_list_id, const vector<std::pair<uint32_t, uint128_t>>& shares);
 
 private:
     int server_id_;

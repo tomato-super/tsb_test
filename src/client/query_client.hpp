@@ -1,7 +1,7 @@
 #pragma once
 
 #include "vmpq_comm.grpc.pb.h"
-#include "config.hpp"
+#include "common.hpp"
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <string>
@@ -21,7 +21,7 @@ public:
 
     void InitSystem(string& id, uint32_t windowSize, uint32_t numbucket);
     void AddValist(string& id, const vector<uint128_t>& data);
-    void AddTable();
+    void AddTable(string& id, uint32_t num_bucket, const vector<uint128_t>& raw);
 
 private:
     unique_ptr<VMPQService::Stub> Stub_[NUM_SERVERS];

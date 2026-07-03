@@ -57,6 +57,20 @@ std::string utility::uint128ToHex(uint128_t val) {
     return std::string("0x") + buf;
 }
 
+void utility::numToOneHotVect(
+    uint128_t val, uint32_t num_bucket, std::vector<uint128_t>& vec
+)
+{
+    vec.assign(num_bucket, 0);      // 全部初始化为 0
+    
+    if (val < num_bucket) {
+        vec[val] = 1;               // 对应位置设为 1
+    } else {
+        // val 超出范围的处理（可选）
+        throw std::out_of_range("val >= num_bucket");
+    }
+}
+
 uint128_t utility::randomUint128()
 {
     static thread_local AES_PRNG prng;

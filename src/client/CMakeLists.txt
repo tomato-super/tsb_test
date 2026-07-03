@@ -8,7 +8,7 @@ add_executable(${OUTPUT_NAME} ${SOURCE_FILES})
 
 target_include_directories(${OUTPUT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${gRPC_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/third_part/json
 )
 
 target_link_libraries(${OUTPUT_NAME} PRIVATE
