@@ -14,7 +14,7 @@ target_include_directories(${OUTPUT_NAME} PRIVATE
 
 target_link_libraries(${OUTPUT_NAME} PRIVATE
     tsb_common
-    vmpq_proto
+    pir_proto
 )
 
 message(STATUS "built server")

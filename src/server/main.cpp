@@ -1,5 +1,5 @@
 #include "vmpq_server.hpp"
-#include "vmpq_service.hpp"
+#include "pir_service.hpp"
 #include "json.hpp"
 #include <iostream>
 #include <fstream>
@@ -36,7 +36,7 @@ int main(int argc, char const *argv[]) {
     param_eval(argv[1], cfg);
 
     VMPQServer server(cfg.server_id);
-    VMPQServiceImpl service(server);
+    PIRServiceImpl service(server);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(
@@ -52,7 +52,7 @@ int main(int argc, char const *argv[]) {
     }
     
     auto health_service = srv->GetHealthCheckService();
-    health_service->SetServingStatus("VMPQ.VMPQService", true);
+    health_service->SetServingStatus("pir.PIRService", true);
 
     std::cout << "[Server] id=" << cfg.server_id 
           << " listening on 0.0.0.0:" << cfg.port << std::endl;

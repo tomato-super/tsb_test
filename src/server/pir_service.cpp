@@ -1,15 +1,15 @@
-#include "vmpq_service.hpp"
+#include "pir_service.hpp"
 #include "common.hpp"
 #include "utility.hpp"
 #include <iostream>
 
-using namespace VMPQ;
+using namespace pir;
 using grpc::ServerContext;
 using grpc::Status;
 
-VMPQServiceImpl::VMPQServiceImpl(VMPQServer &server) : server_(server) {}
+PIRServiceImpl::PIRServiceImpl(VMPQServer &server) : server_(server) {}
 
-Status VMPQServiceImpl::InitTable(
+Status PIRServiceImpl::InitTable(
     ServerContext *context, const InitTableRequest *req, InitTableResponse *resp
 )
 {   
@@ -17,7 +17,7 @@ Status VMPQServiceImpl::InitTable(
               << " table_id=" << req->tableid()
               << " window=" << req->windowsize()
               << " bucket=" << req->numbucketsize()
-              << " peer=" << context->peer()        // 客户端地址
+              << " peer=" << context->peer()
               << std::endl;
 
     try {
@@ -30,7 +30,7 @@ Status VMPQServiceImpl::InitTable(
     }
 }
 
-Status VMPQServiceImpl::UpdateVarList(
+Status PIRServiceImpl::UpdateVarList(
     ServerContext* context, const UpdateVarListRequest* req, UpdateVarListResponse* resp
 )
 {
@@ -38,21 +38,21 @@ Status VMPQServiceImpl::UpdateVarList(
     return Status::OK;
 }
 
-Status VMPQServiceImpl::UpdateTableVar(
+Status PIRServiceImpl::UpdateTableVar(
     ServerContext *context, const UpdateTableVarRequest *req, UpdateTableVarResponse *resp
 )
 {
     return Status::OK;
 }
 
-Status VMPQServiceImpl::UpdateBatchTable(
+Status PIRServiceImpl::UpdateBatchTable(
     ServerContext* context, const UpdateBatchTableRequest* req, UpdateBatchTableResponse* resp
 )
 {
     return Status::OK;
 }
 
-Status VMPQServiceImpl::UpdateBatchVarList(
+Status PIRServiceImpl::UpdateBatchVarList(
     ServerContext *context, const UpdateBatchVarListRequest *req, UpdateBatchVarListResponse *resp
 )
 {
@@ -72,7 +72,6 @@ Status VMPQServiceImpl::UpdateBatchVarList(
         shares.emplace_back(item.idx(), share);
     }
 
-    // ← 打印收到的数据摘要
     std::cout << "[RPC] UpdateBatchVarList"
               << " varlistid=" << req->varlistid()
               << " count=" << shares.size()
@@ -87,6 +86,6 @@ Status VMPQServiceImpl::UpdateBatchVarList(
         return Status::OK;
     } catch (const std::exception& e) {
         std::cerr << "[RPC] UpdateBatchVarList FAILED: " << e.what() << std::endl;
-        return Status(grpc::StatusCode::INTERNAL, e.what());
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
     }
 }

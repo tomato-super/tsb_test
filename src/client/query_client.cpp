@@ -14,7 +14,7 @@ void CheckRpcStatus(const grpc::Status& status, const std::string& rpc_name, int
 
 QueryClient::QueryClient(vector<shared_ptr<grpc::Channel>> channels) {
     for(auto i = 0; i < channels.size(); i++) {
-        this->Stub_[i] = VMPQService::NewStub(channels[i]);
+        this->Stub_[i] = PIRService::NewStub(channels[i]);
     }
 }
 

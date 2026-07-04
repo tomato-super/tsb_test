@@ -12,7 +12,7 @@ target_include_directories(${OUTPUT_NAME} PRIVATE
 )
 
 target_link_libraries(${OUTPUT_NAME} PRIVATE
-    vmpq_proto
+    pir_proto
     tsb_common
 )
 

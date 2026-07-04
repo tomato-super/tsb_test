@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package VMPQ;
+package pir;
 
-service VMPQService {
+service PIRService {
     rpc InitTable (InitTableRequest) returns (InitTableResponse) {}
     rpc UpdateVarList (UpdateVarListRequest) returns (UpdateVarListResponse) {}
     rpc UpdateBatchVarList (UpdateBatchVarListRequest) returns (UpdateBatchVarListResponse) {}
