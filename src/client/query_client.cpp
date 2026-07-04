@@ -86,6 +86,53 @@ void QueryClient::AddValist(string& id, const vector<uint128_t>& data) {
 }
 
 void QueryClient::AddTable(string &id, uint32_t num_bucket, const vector<uint128_t> &raw) {
-    
+    // 1. 逐值转独热向量 + 秘密共享（扁平化存储）
+    size_t total = raw.size() * num_bucket;
+    vector<uint128_t> share0(total), share1(total);
 
+    for (size_t i = 0; i < raw.size(); i++) {
+        vector<uint128_t> onehot;
+        utility::numToOneHotVect(raw[i], num_bucket, onehot);
+
+        for (size_t j = 0; j < num_bucket; j++) {
+            auto [s0, s1] = utility::AdditiveShare(onehot[j]);
+            share0[i * num_bucket + j] = s0;
+            share1[i * num_bucket + j] = s1;
+        }
+    }
+
+    // 2. 按行分块发送
+    const size_t chunk_rows = 100;
+    size_t offset = 0;
+
+    while (offset < raw.size()) {
+        size_t end = std::min(offset + chunk_rows, raw.size());
+
+        UpdateBatchTableRequest reqs[NUM_SERVERS];
+        UpdateBatchTableResponse resps[NUM_SERVERS];
+        grpc::ClientContext contexts[NUM_SERVERS];
+
+        for (int s = 0; s < NUM_SERVERS; s++) {
+            reqs[s].set_tableid(id);
+            for (size_t row = offset; row < end; row++) {
+                auto* update = reqs[s].mutable_update()->Add();
+                const uint128_t* row_ptr = s == 0
+                    ? &share0[row * num_bucket]
+                    : &share1[row * num_bucket];
+                for (size_t col = 0; col < num_bucket; col++) {
+                    update->add_val(
+                        reinterpret_cast<const char*>(&row_ptr[col]),
+                        sizeof(uint128_t)
+                    );
+                }
+            }
+        }
+
+        for (int i = 0; i < NUM_SERVERS; i++) {
+            auto status = Stub_[i]->UpdateBatchTable(&contexts[i], reqs[i], &resps[i]);
+            CheckRpcStatus(status, "UpdateBatchTable rows " + std::to_string(offset), i);
+        }
+
+        offset = end;
+    }
 }

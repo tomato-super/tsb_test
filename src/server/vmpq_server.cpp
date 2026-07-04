@@ -16,8 +16,13 @@ void VMPQServer::initTable(
     list.clear();
     list.resize(window_size);
 
-    table_.erase(table_id);
-    table_.emplace(table_id, OneHotTable(window_size, num_bucket));
+    auto it = table_.find(table_id);
+    if (it != table_.end() && it->second.match(window_size, num_bucket)) {
+        it->second.reset(window_size, num_bucket);
+    } else {
+        table_.erase(table_id);
+        table_.emplace(table_id, OneHotTable(window_size, num_bucket));
+    }
 }
 
 void VMPQServer::updateBatchVarList(
@@ -27,5 +32,18 @@ void VMPQServer::updateBatchVarList(
     auto& vl = var_list_[var_list_id];
     for (const auto& [idx, share] : shares) {
         vl[idx] = share;
+    }
+}
+
+void VMPQServer::updateBatchTable(
+    const string& table_id, const vector<vector<uint128_t>>& rows
+)
+{
+    auto it = table_.find(table_id);
+    if (it == table_.end()) {
+        throw std::invalid_argument("table not found: " + table_id);
+    }
+    for (const auto& row : rows) {
+        it->second.add_row(row);
     }
 }

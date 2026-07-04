@@ -30,26 +30,41 @@ Status PIRServiceImpl::InitTable(
     }
 }
 
-// Status PIRServiceImpl::UpdateVarList(
-//     ServerContext* context, const UpdateVarListRequest* req, UpdateVarListResponse* resp
-// )
-// {
-
-//     return Status::OK;
-// }
-
-// Status PIRServiceImpl::UpdateTableVar(
-//     ServerContext *context, const UpdateTableVarRequest *req, UpdateTableVarResponse *resp
-// )
-// {
-//     return Status::OK;
-// }
-
 Status PIRServiceImpl::UpdateBatchTable(
     ServerContext* context, const UpdateBatchTableRequest* req, UpdateBatchTableResponse* resp
 )
 {
-    return Status::OK;
+    if (req->tableid().empty()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "tableid is empty");
+    }
+
+    std::vector<std::vector<uint128_t>> rows;
+    rows.reserve(req->update().size());
+
+    for (const auto& update : req->update()) {
+        size_t col_count = update.val_size();
+        std::vector<uint128_t> row(col_count);
+        for (size_t j = 0; j < col_count; j++) {
+            std::memcpy(&row[j], update.val(j).data(), sizeof(uint128_t));
+        }
+        rows.push_back(std::move(row));
+    }
+
+    std::cout << "[RPC] UpdateBatchTable"
+              << " tableid=" << req->tableid()
+              << " rows=" << rows.size()
+              << " cols=" << (rows.empty() ? 0 : rows[0].size())
+              << " peer=" << context->peer()
+              << std::endl;
+
+    try {
+        server_.updateBatchTable(req->tableid(), rows);
+        resp->set_res("ok");
+        return Status::OK;
+    } catch (const std::exception& e) {
+        std::cerr << "[RPC] UpdateBatchTable FAILED: " << e.what() << std::endl;
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+    }
 }
 
 Status PIRServiceImpl::UpdateBatchVarList(

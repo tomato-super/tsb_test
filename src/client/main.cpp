@@ -61,20 +61,29 @@ void test_add_varlist(QueryClient& client, string& var_list_id,
     std::cout << "AddVarList 完成" << std::endl;
 }
 
-void test_reinit_same_params(QueryClient& client, string& table_id,
-                             uint32_t window_size, uint32_t num_bucket) {
-    std::cout << "\n=== Test 3: Re-init with same params ===" << std::endl;
-    
-    client.InitSystem(table_id, window_size, num_bucket);
-}
+void test_add_table(QueryClient& client, string& table_id,
+                    uint32_t window_size, uint32_t num_bucket) {
+    std::cout << "\n=== Test 5: AddTable ===" << std::endl;
+    std::cout << "table_id=" << table_id
+              << " window_size=" << window_size
+              << " num_bucket=" << num_bucket << std::endl;
 
-void test_reinit_diff_params(QueryClient& client, string& table_id,
-                             uint32_t new_window_size, uint32_t new_num_bucket) {
-    std::cout << "\n=== Test 4: Re-init with different params ===" << std::endl;
-    std::cout << "new_window_size=" << new_window_size 
-              << " new_num_bucket=" << new_num_bucket << std::endl;
+    // 生成测试数据：每个值 < num_bucket，保证独热编码合法
+    vector<uint128_t> raw(window_size);
+    for (uint32_t i = 0; i < window_size; i++) {
+        raw[i] = static_cast<uint128_t>(i % num_bucket);
+    }
 
-    client.InitSystem(table_id, new_window_size, new_num_bucket);
+    std::cout << "原始数据: ";
+    for (size_t i = 0; i < raw.size() && i < 10; i++) {
+        std::cout << utility::uint128ToString(raw[i]) << " ";
+    }
+    if (raw.size() > 10) std::cout << "...";
+    std::cout << std::endl;
+
+    client.AddTable(table_id, num_bucket, raw);
+
+    std::cout << "AddTable 完成" << std::endl;
 }
 
 int main(int argc, char const *argv[]) {
@@ -113,7 +122,10 @@ int main(int argc, char const *argv[]) {
     test_init_table(client, table_id, cfg.window_size, cfg.num_bucket);
 
     // Test 2: 发送变量列表
-    test_add_varlist(client, table_id, cfg.window_size);  // 发送 100 个元素
+    test_add_varlist(client, table_id, cfg.window_size);
+
+    // Test 3: 发送独热编码表
+    test_add_table(client, table_id, cfg.window_size, cfg.num_bucket);
 
 
     std::cout << "\n=== 所有测试完成 ===" << std::endl;

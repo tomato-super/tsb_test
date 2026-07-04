@@ -15,17 +15,9 @@ public:
         grpc::ServerContext* context, const pir::InitTableRequest* req,
         pir::InitTableResponse* resp) override;
 
-    // grpc::Status UpdateVarList(
-    //     grpc::ServerContext* context, const pir::UpdateVarListRequest* req,
-    //     pir::UpdateVarListResponse* resp) override;
-
     grpc::Status UpdateBatchVarList(
         grpc::ServerContext* context, const pir::UpdateBatchVarListRequest* req,
         pir::UpdateBatchVarListResponse* resp) override;
-
-    // grpc::Status UpdateTableVar(
-    //     grpc::ServerContext* context, const pir::UpdateTableVarRequest* req,
-    //     pir::UpdateTableVarResponse* resp) override;
 
     grpc::Status UpdateBatchTable(
         grpc::ServerContext* context, const pir::UpdateBatchTableRequest* req,
