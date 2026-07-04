@@ -4,9 +4,9 @@ package pir;
 
 service PIRService {
     rpc InitTable (InitTableRequest) returns (InitTableResponse) {}
-    rpc UpdateVarList (UpdateVarListRequest) returns (UpdateVarListResponse) {}
+    // rpc UpdateVarList (UpdateVarListRequest) returns (UpdateVarListResponse) {}
     rpc UpdateBatchVarList (UpdateBatchVarListRequest) returns (UpdateBatchVarListResponse) {}
-    rpc UpdateTableVar (UpdateTableVarRequest) returns (UpdateTableVarResponse) {}
+    // rpc UpdateTableVar (UpdateTableVarRequest) returns (UpdateTableVarResponse) {}
     rpc UpdateBatchTable (UpdateBatchTableRequest) returns (UpdateBatchTableResponse) {}
 }
 

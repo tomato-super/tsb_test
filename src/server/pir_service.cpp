@@ -30,20 +30,20 @@ Status PIRServiceImpl::InitTable(
     }
 }
 
-Status PIRServiceImpl::UpdateVarList(
-    ServerContext* context, const UpdateVarListRequest* req, UpdateVarListResponse* resp
-)
-{
+// Status PIRServiceImpl::UpdateVarList(
+//     ServerContext* context, const UpdateVarListRequest* req, UpdateVarListResponse* resp
+// )
+// {
 
-    return Status::OK;
-}
+//     return Status::OK;
+// }
 
-Status PIRServiceImpl::UpdateTableVar(
-    ServerContext *context, const UpdateTableVarRequest *req, UpdateTableVarResponse *resp
-)
-{
-    return Status::OK;
-}
+// Status PIRServiceImpl::UpdateTableVar(
+//     ServerContext *context, const UpdateTableVarRequest *req, UpdateTableVarResponse *resp
+// )
+// {
+//     return Status::OK;
+// }
 
 Status PIRServiceImpl::UpdateBatchTable(
     ServerContext* context, const UpdateBatchTableRequest* req, UpdateBatchTableResponse* resp
