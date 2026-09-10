@@ -1,7 +1,22 @@
+# ===========================================================================
+# 构建产物（可再生，一律不入库）
+#   约定：构建目录用 `build/`，或按用途命名成 `build_<用途>/`（见 TASK_PLAN §3.4）
+# ===========================================================================
 build/
-config/
+build_*/
+
+# protobuf/gRPC 生成代码（由 CMake 在构建时重新生成，见 proto/CMakeLists.txt）
 proto/gen
-third_parts/
+
+# 编辑器 / 系统
 .vscode/
-doc/paper
-doc/design
+*.swp
+.DS_Store
+
+# 第三方 vendor（体积大、非本项目代码；构建时仍需它在磁盘上）
+third_parts/
+
+# 论文目录：只忽略大体积二进制，源码/文本仍入库
+doc/paper/*.pdf
+
+doc/

@@ -49,6 +49,13 @@ public:
 
     bool initialized() const { return inited_; }
     uint64_t num_entries() const { return entries_.size(); }
+
+    // 统计（只增不减，用于测试与基准把"实际发生了多少次 PIR"量出来，
+    // 而不是靠公式估算）：
+    //   rpc_count()     —— PirQuery 被调用的次数（一次调用 = 一个网络往返批次）
+    //   queries_served()—— 累计处理过的查询集个数（每个 word 一个）
+    uint64_t rpc_count() const { return rpc_count_; }
+    uint64_t queries_served() const { return queries_served_; }
     uint64_t storage_bytes() const { return entries_.size() * kUint128Bytes; }
     const VmpqParams& params() const { return params_; }
 
@@ -61,6 +68,8 @@ private:
     bool inited_ = false;
     VmpqParams params_;
     std::vector<uint128_t> entries_;
+    mutable uint64_t rpc_count_ = 0;
+    mutable uint64_t queries_served_ = 0;
 };
 
 // ---------------------------------------------------------------------------

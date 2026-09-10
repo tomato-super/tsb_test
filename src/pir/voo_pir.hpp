@@ -33,6 +33,51 @@ namespace tsb {
 constexpr uint64_t kNoExtraIndex = std::numeric_limits<uint64_t>::max();
 
 // ---------------------------------------------------------------------------
+// 致命失败类型
+// ---------------------------------------------------------------------------
+
+// 查询索引**未被任何 hint 覆盖**：协议层面的致命失败（概率 < e^{−λ/2}，
+// 见 PIR_SPEC §5.3）。⚠️ 绝不可回退到明文取值等可区分的失败路径 ——
+// 那会把"正确性失败"升级为"隐私泄露"。
+class HintCoverageFailure : public std::runtime_error {
+public:
+    explicit HintCoverageFailure(const std::string& what)
+        : std::runtime_error(what) {}
+};
+
+// 覆盖该索引的 hint **都已在本轮批次中被消费**，必须先 `Refresh` 才能继续。
+// ⚠️ 这不是失败：每轮查询消费一条 hint 是协议要求（决策 D17），
+// 调用方（例如 VmpqClient::RetrieveColumns）应当在拿到重建值后立刻刷新。
+class HintsExhausted : public std::runtime_error {
+public:
+    explicit HintsExhausted(const std::string& what) : std::runtime_error(what) {}
+};
+
+// ---------------------------------------------------------------------------
+// hint 生命周期策略（⚠️ 决策 D17）
+// ---------------------------------------------------------------------------
+//
+// **为什么默认禁止复用**：同一条 hint 的真实半区偏移由 `PRF_off(h,k)` 决定，
+// 因此**跨轮恒定**；而哑组各分区与查询分区 ℓ 的偏移每轮重新随机。若客户端
+// 反复使用同一条 hint（查询后不刷新），服务器把几轮偏移向量放在一起比就能：
+//   ① 挑出"跨轮恒定"的分区 ⇒ 真实半区（`flip` 的随机置换失效）；
+//   ② 逐轮判定真实组；
+//   ③ 找出"恰好在某一轮掉出真实组"的分区 ⇒ 该轮的查询分区 ℓ，
+//      目标索引从 n 个候选缩到 σ = part_size 个候选。
+// 可执行证据见 `tests/test_voo_pir.cpp` 的
+// `VooPirPrivacy.HintReuseWithoutRefreshLeaksRealHalfAndQueryPartition`。
+//
+// 协议正确用法（对齐官方 `TwoSVClient::Online`）：**每轮查询后立即 Refresh**，
+// 用一条全新的 hint（新 hint_id、新 cutoff、新半区划分）替换被消费的槽位。
+enum class HintReusePolicy {
+    // 默认：`Query` 消费槽位，刷新前不得再次选中它（协议正确、部署用法）
+    kForbidReuse = 0,
+    // ⚠️ 显式不安全：允许反复选中同一条 hint。**仅供"纯正确性"扫描测试与
+    // "证明复用会泄露"的证伪测试**，任何部署路径都不得使用。
+    kAllowUnsafeForTesting = 1,
+};
+
+// ---------------------------------------------------------------------------
 // 参数
 // ---------------------------------------------------------------------------
 
@@ -76,6 +121,10 @@ struct VooPirQuery {
     std::vector<uint8_t> groups;
     // 客户端重建所需的信息
     uint64_t target_index = 0;
+    // 本条查询命中的 hint 槽位。Refresh 需要它来替换被消费的槽位
+    // （注意：LastQuerySlot() 只反映**最后一次** Query，批量生成查询时必须用
+    //  这个字段逐条对应，否则会刷新错槽位）。
+    size_t hint_slot = std::numeric_limits<size_t>::max();
     // 填充索引：哑组中"本应属于 hint 真实集合、但被替换掉"的那一项。
     // 它同时出现在 hint parity 与应答子集中，因此在重建时抵消。
     // case A（目标是 extra 项）时为 kNoExtraIndex。
@@ -111,6 +160,19 @@ public:
 
     const VooPirParams& params() const { return params_; }
 
+    // ---- hint 生命周期（决策 D17）----
+
+    // 默认 kForbidReuse：Query 消费槽位，Refresh 之前不得再次选中。
+    void SetHintReusePolicy(HintReusePolicy policy) { policy_ = policy; }
+    HintReusePolicy hint_reuse_policy() const { return policy_; }
+
+    // 槽位是否已被消费（kForbidReuse 下由 Query 置位，Refresh 清除）
+    bool hint_consumed(size_t slot) const {
+        return slot < consumed_.size() && consumed_[slot] != 0;
+    }
+    // 仍可被 Query 选中的 hint 数（kAllowUnsafeForTesting 下等于有效 hint 数）
+    size_t FreeHintCount() const;
+
     // ---- 离线阶段 ----
     //
     // 客户端本地生成全部 hint。db 只需提供按索引取值的能力
@@ -129,6 +191,13 @@ public:
     // ---- 在线阶段 ----
 
     // 生成查询。注意本函数会消耗一个 dummy 偏移计数器。
+    //
+    // ⚠️ **会消费被选中的 hint 槽位**（kForbidReuse，默认）：拿到重建值后
+    // 必须调用 `Refresh(q.hint_slot, q, material, value)` 把它换掉，否则该槽位
+    // 不可再用（再次需要时抛 `HintsExhausted`）。理由见 HintReusePolicy 的注释。
+    //
+    // 抛出：`HintCoverageFailure`（索引未被任何 hint 覆盖，致命）
+    //       `HintsExhausted`（覆盖它的 hint 都已被消费，需先 Refresh）
     VooPirQuery Query(uint64_t index);
 
     // 客户端重建：由两服务器应答恢复明文。
@@ -157,7 +226,8 @@ public:
         return Reconstruct(q, a0, a1);
     }
 
-    // Refresh：用 offline server 的输出替换被消耗的 hint 槽位
+    // Refresh：用 offline server 的输出替换被消耗的 hint 槽位。
+    // 同时**清除该槽位的"已消费"标记**，使其重新可用（决策 D17）。
     struct RefreshMaterial {
         uint64_t hint_id = 0;
         uint32_t select_cutoff = 0;
@@ -188,8 +258,19 @@ public:
     // dummy 偏移流已消耗的计数
     uint64_t dummy_counter() const { return dummy_counter_; }
 
-    // 在 hint 集合中查找包含 index 的槽位；找不到返回 SIZE_MAX
+    // 在 hint 集合中查找包含 index 的槽位；找不到返回 SIZE_MAX。
+    // kForbidReuse 下会**跳过已被消费**的槽位（故返回 SIZE_MAX 可能是
+    // "覆盖失败"也可能是"都已被消费"，用 FindHintIgnoringConsumed 区分）。
     size_t FindHint(uint64_t index) const;
+
+    // 忽略消费标记的查找（诊断/测试用；也用于把两种失效模式分开报错）
+    size_t FindHintIgnoringConsumed(uint64_t index) const {
+        return FindHintIn(params_, prf_, hints_, index);
+    }
+
+    // 列出所有覆盖 index 的槽位（含已消费的）。诊断与测试用：
+    // 一个索引通常被 ~λ/2 条 hint 覆盖，这个数量决定了"刷新前还能查几次"。
+    std::vector<size_t> HintsContaining(uint64_t index) const;
 
     // 纯函数形式，便于测试与复用
     static size_t FindHintIn(const VooPirParams& params, const AesPrf& prf,
@@ -235,6 +316,9 @@ private:
     std::vector<uint8_t> mac_key_;
     std::vector<VooPirHint> hints_;
     std::vector<MacTag> proofs_;
+    // 每个槽位是否已被 Query 消费（kForbidReuse），由 Refresh 清除
+    std::vector<uint8_t> consumed_;
+    HintReusePolicy policy_ = HintReusePolicy::kForbidReuse;
     uint64_t dummy_counter_ = 0;
     uint64_t next_hint_id_ = 0;
     size_t last_slot_ = std::numeric_limits<size_t>::max();

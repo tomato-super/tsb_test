@@ -53,9 +53,8 @@ public:
     void SetColumn(uint32_t attr_id, uint32_t attr_value,
                    const std::vector<uint128_t>& packed_words);
 
-    // 读取整列（共享形式）
-    const std::vector<uint128_t>& Column(uint32_t attr_id,
-                                         uint32_t attr_value) const;
+    // 读取整列（共享形式）。**按值返回**：不要改回返回内部/共享缓冲区的引用。
+    std::vector<uint128_t> Column(uint32_t attr_id, uint32_t attr_value) const;
 
     // 按 PIR 的扁平条目号读写单个 word。
     // 扁平索引 = 该属性的基址 + value * words_per_column + word_index
@@ -75,8 +74,9 @@ public:
 
 private:
     VmpqParams params_;
-    std::vector<uint128_t> entries_;             // 扁平 one-hot 打包 word（共享）
-    std::vector<uint64_t> attr_base_;            // 每个属性在 entries_ 中的基址
+    std::vector<uint128_t> entries_;   // 扁平条目表（one-hot 区 + value plane 区，均为共享）
+    std::vector<uint64_t> attr_base_;  // 每个属性 one-hot 区在 entries_ 中的基址
+    std::vector<uint64_t> plane_base_;  // 每个属性 value plane 区在 entries_ 中的基址
     std::vector<RingShare> attr_values_;         // 属性值加法共享
 };
 
@@ -137,6 +137,14 @@ public:
     std::vector<std::vector<uint8_t>> RetrieveColumns(
         const std::vector<std::pair<uint32_t, uint64_t>>& targets);
 
+    // 取回某个属性的 **value plane 组**：l_a 个比特向量，第 b 面的第 j 位 =
+    // 第 j 条记录在该属性上取值的第 b 个二进制位。
+    std::vector<std::vector<uint8_t>> RetrieveValuePlanes(uint32_t attr_id);
+
+    // 直接取回某个属性在**每条记录**上的明文取值（由 l_a 个比特面本地拼出）。
+    // 这是 SUM/矩的公共底座：一次往返即可拿到取值向量。
+    std::vector<uint64_t> RetrieveAttributeValues(uint32_t attr_id);
+
     // 谓词：属性 attr_id 取值为 attr_value
     struct Predicate {
         uint32_t attr_id = 0;
@@ -154,12 +162,12 @@ public:
 
     // SUM：对满足 filter 的记录的 sum_attr 取值求和。
     //
-    // ⚠️ **实现思路（见 §7.9 G5）**：VMPQ 的数据模型里**每个属性都是
-    // one-hot 索引**、取值域为 2^{l}。因此
-    //     SUM = Σ_v  v · Count(filter ∧ (sum_attr == v))
-    // 完全复用 Count 链路，无需 MPC。
-    // 代价：需要 |domain(sum_attr)| 次 Count 查询；论文的 Multiply 只需
-    // O(1) 次查询但需要 Beaver triple。此处取"正确优先、复用已验证链路"。
+    // ⚠️ **实现方式（PIR-02 后，见 §7.9 G5）**：取回 sum_attr 的 l_a 个
+    // **value plane** + filter 各列，在客户端本地还原每条记录的取值后求和。
+    // PIR 次数 = (|filter| + l_a) 个列，而早先的
+    // `SUM = Σ_v v·Count(filter ∧ attr==v)` 需要 2^{l_a}·(|filter|+1) 个列
+    // （实测开销 |domain| × 2 × Count，见 §7.10）。仍然不需要 MPC：
+    // 本实现的检索粒度是整列，客户端本就拿得到取值向量。
     uint64_t SumWithFilter(const std::vector<Predicate>& filter, uint32_t sum_attr);
 
     // AVG = SUM / COUNT（整数除法，向下取整）
@@ -175,7 +183,9 @@ public:
         uint64_t sum_sq = 0;
     };
 
-    // 一次取回 filter 命中的记录在 sum_attr 上的一阶与二阶矩
+    // 一次取回 filter 命中的记录在 sum_attr 上的一阶与二阶矩。
+    // filter 允许为空（表示全部记录）。count/sum/sum_sq 在**同一次 PIR 往返**
+    // 里全部得到。
     AggregateResult Aggregate(const std::vector<Predicate>& filter, uint32_t sum_attr);
 
     // 便利：直接对一条记录做 one-hot 校验（测试用）
@@ -183,9 +193,10 @@ public:
 
 private:
     VmpqParams params_;
-    // 客户端本地的明文扁平表（离线阶段与调试用）
+    // 客户端本地的明文扁平条目表（one-hot 区 + value plane 区；离线阶段与调试用）
     std::vector<uint128_t> plain_entries_;
     std::vector<uint64_t> attr_base_;
+    std::vector<uint64_t> plane_base_;
     VooPirClient pir_;                     // 客户端持有的 hint 集合
 
     // 单进程模式下内部持有的节点；远程模式下为空
@@ -197,8 +208,19 @@ private:
 
     uint64_t FlatIndex(uint32_t attr_id, uint32_t attr_value,
                        uint32_t word_index) const;
+    // 属性 attr_id 第 bit 个 value plane 的段起点
+    uint64_t PlaneFlatIndex(uint32_t attr_id, uint32_t bit) const;
     void EncodeAndDistribute(uint32_t record_index,
                              const std::vector<uint64_t>& record);
+
+    // 检索若干"扁平段"（每段 = [base, base+words)），返回每段的 window_size 位
+    // 比特向量。所有段的所有 word 在**同一次 RPC** 里发往两台服务器（口径 Q5），
+    // 并在收到应答后立刻刷新被消费的 hint（决策 D17）。
+    std::vector<std::vector<uint8_t>> RetrieveSegments(
+        const std::vector<std::pair<uint64_t, uint32_t>>& segments);
+
+    // 用 offline server 的材料替换 q 命中的那条 hint（决策 D17）
+    void RefreshSlot(const VooPirQuery& q, uint128_t value);
 };
 
 // ---------------------------------------------------------------------------

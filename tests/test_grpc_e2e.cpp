@@ -19,6 +19,7 @@
 #include "vmpq/vmpq.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -28,9 +29,16 @@ using namespace tsb;
 
 namespace {
 
-// 端口从 53000 起分配，避免与开发机上其它服务冲突
-std::string PortFor(int server_id) {
-    return "127.0.0.1:" + std::to_string(53000 + server_id);
+// ⚠️ 早期版本用固定端口（53001 起）：只要**并发**再跑一次测试套件
+// （例如另一个 agent / 另一个 build 目录同时在跑 ctest），或开发机上恰好有
+// 进程占用该端口，`InProcessNode` 就会绑定失败，表现为
+// `started() == false` + "No address added out of total 1 resolved"。
+// 现在一律用**临时端口**（内核分配 `:0`），再从 `bound_port()` 读回实际端口。
+constexpr char kEphemeralAddr[] = "127.0.0.1:0";
+
+// 已启动服务器对应的客户端地址
+std::string LocalAddress(const InProcessNode& node) {
+    return "127.0.0.1:" + node.bound_port();
 }
 
 VmpqParams MakeParams(uint32_t window) {
@@ -74,21 +82,21 @@ uint64_t PlainCount(const std::vector<std::vector<uint64_t>>& recs, uint32_t att
 // ===========================================================================
 
 TEST(GrpcVmpq, ServersStartAndAcceptConnections) {
-    InProcessNode s0(PortFor(0));
-    InProcessNode s1(PortFor(1));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
     EXPECT_TRUE(s0.started());
     EXPECT_TRUE(s1.started());
     EXPECT_NE(s0.bound_port(), s1.bound_port());
 
-    GrpcChannel c0(PortFor(0));
-    GrpcChannel c1(PortFor(1));
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     EXPECT_TRUE(c0.WaitForConnection(5000));
     EXPECT_TRUE(c1.WaitForConnection(5000));
 }
 
 TEST(GrpcVmpq, HandlesRpcErrorsGracefully) {
-    InProcessNode s0(PortFor(2));
-    GrpcChannel c0(PortFor(2));
+    InProcessNode s0(kEphemeralAddr);
+    GrpcChannel c0(LocalAddress(s0));
     EXPECT_TRUE(c0.WaitForConnection(5000));
 
     // 未 InitTable 就查询：服务器应返回错误而不是崩溃
@@ -109,13 +117,13 @@ TEST(GrpcVmpq, EndToEndCountMatchesPlaintext) {
     const VmpqParams p = MakeParams(1024);
     const auto recs = MakeRecords(p.window_size, 501);
 
-    InProcessNode s0(PortFor(3));
-    InProcessNode s1(PortFor(4));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
     ASSERT_TRUE(s0.started());
     ASSERT_TRUE(s1.started());
 
-    GrpcChannel c0(PortFor(3));
-    GrpcChannel c1(PortFor(4));
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     ASSERT_TRUE(c0.WaitForConnection(5000));
     ASSERT_TRUE(c1.WaitForConnection(5000));
 
@@ -144,13 +152,13 @@ TEST(GrpcVmpq, EndToEndMultiPredicateAndSum) {
     const VmpqParams p = MakeParams(1024);
     const auto recs = MakeRecords(p.window_size, 502);
 
-    InProcessNode s0(PortFor(5));
-    InProcessNode s1(PortFor(6));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
     ASSERT_TRUE(s0.started());
     ASSERT_TRUE(s1.started());
 
-    GrpcChannel c0(PortFor(5));
-    GrpcChannel c1(PortFor(6));
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     ASSERT_TRUE(c0.WaitForConnection(5000));
     ASSERT_TRUE(c1.WaitForConnection(5000));
 
@@ -184,10 +192,10 @@ TEST(GrpcVmpq, SinglePredicateQueryUsesOneRpc) {
     const VmpqParams p = MakeParams(1024);
     const auto recs = MakeRecords(p.window_size, 503);
 
-    InProcessNode s0(PortFor(7));
-    InProcessNode s1(PortFor(8));
-    GrpcChannel c0(PortFor(7));
-    GrpcChannel c1(PortFor(8));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     ASSERT_TRUE(c0.WaitForConnection(5000));
     ASSERT_TRUE(c1.WaitForConnection(5000));
     c0.InitTable(p.window_size, p.attr_sizes);
@@ -217,10 +225,10 @@ TEST(GrpcVmpq, MultiPredicateSendsAllQueriesInOneRpc) {
     const VmpqParams p = MakeParams(1024);
     const auto recs = MakeRecords(p.window_size, 504);
 
-    InProcessNode s0(PortFor(9));
-    InProcessNode s1(PortFor(10));
-    GrpcChannel c0(PortFor(9));
-    GrpcChannel c1(PortFor(10));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     ASSERT_TRUE(c0.WaitForConnection(5000));
     ASSERT_TRUE(c1.WaitForConnection(5000));
     c0.InitTable(p.window_size, p.attr_sizes);
@@ -243,6 +251,47 @@ TEST(GrpcVmpq, MultiPredicateSendsAllQueriesInOneRpc) {
 }
 
 // ===========================================================================
+// 诊断：单机 gRPC 回环下"每次 RPC"的固定开销
+//
+// ⚠️ 这条用例**只做诊断与量级看护**，不断言精确耗时（会随机器波动）。
+// 存在的理由：§7.11 的 demo 里在线延迟被 RPC 往返主导，而 §7.10 的 bench
+// 是进程内的、不含这部分 —— 两者不可混为一谈，必须把这块成本量出来。
+// ===========================================================================
+
+TEST(GrpcVmpq, PerRpcOverheadIsSmallButDominantInLoopback) {
+    const VmpqParams p = MakeParams(1024);
+    InProcessNode s0(kEphemeralAddr);
+    ASSERT_TRUE(s0.started());
+    GrpcChannel c0(LocalAddress(s0));
+    ASSERT_TRUE(c0.WaitForConnection(5000));
+    c0.InitTable(p.window_size, p.attr_sizes);
+
+    const VooPirParams pp = p.DerivePirParams();
+    PirQuerySetData q;
+    q.offsets.assign(pp.part_num, 1);
+    q.groups.assign(pp.part_num, 0);
+    // 一次单谓词查询 = ⌈N/128⌉ 个查询集
+    const uint32_t words = p.words_per_column();
+    std::vector<PirQuerySetData> sets(words, q);
+
+    // 热身（首次 RPC 含通道握手/HTTP2 建连）
+    for (int i = 0; i < 5; ++i) (void)c0.PirQuery(sets);
+
+    constexpr int kRounds = 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kRounds; ++i) (void)c0.PirQuery(sets);
+    const double per_rpc_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+            .count() / kRounds;
+
+    std::printf("  [诊断] 单机 gRPC 回环：%u 个查询集/次 ⇒ %.3f ms/RPC\n",
+                words, per_rpc_ms);
+    // 进程内同一操作约 0.3 ms（§7.10 N=1024 的 Cnt1）：回环 RPC 至少不慢到离谱。
+    // 放宽到 50 ms 只为拦住病态回归（例如每次调用重建通道/加 sleep）。
+    EXPECT_TRUE(per_rpc_ms < 50.0);
+}
+
+// ===========================================================================
 // 隐私性：服务器只拿到自己的共享
 // ===========================================================================
 
@@ -250,10 +299,10 @@ TEST(GrpcVmpq, NeitherServerAloneHoldsPlaintextBits) {
     const VmpqParams p = MakeParams(1024);
     const auto recs = MakeRecords(p.window_size, 505);
 
-    InProcessNode s0(PortFor(11));
-    InProcessNode s1(PortFor(12));
-    GrpcChannel c0(PortFor(11));
-    GrpcChannel c1(PortFor(12));
+    InProcessNode s0(kEphemeralAddr);
+    InProcessNode s1(kEphemeralAddr);
+    GrpcChannel c0(LocalAddress(s0));
+    GrpcChannel c1(LocalAddress(s1));
     ASSERT_TRUE(c0.WaitForConnection(5000));
     ASSERT_TRUE(c1.WaitForConnection(5000));
     c0.InitTable(p.window_size, p.attr_sizes);

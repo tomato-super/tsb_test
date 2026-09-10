@@ -33,8 +33,11 @@ std::array<uint8_t, kAesKeyBytes> AesKey();
 // ---- 确定性 PRNG（测试与可复现实验用）----
 //
 // ⚠️ 仅供测试/复现：生产路径必须使用上面的 CSPRNG。
-// 实现为 AES-PRF 计数器流：out_i = AES_{key}(nonce || counter_i)，
-// 与项目既有的 AES_PRNG 设计一致。
+// 实现为 AES-PRF 计数器流：out_i = AES_{key}( LE64(nonce) || LE64(counter_i) )。
+//
+// ⚠️ **nonce 的 64 位全部参与**，counter 也是完整 64 位（可产出 2^64 个块）。
+// 早期实现只用了 `nonce >> 32` 且把 counter 塞进 16 位，导致"不同 nonce 产生同一
+// 密钥流"（seed 99 与 100 完全相同）与 1 MiB 的流长上限 —— 已修复，并有用例固化。
 class DeterministicPrng {
 public:
     explicit DeterministicPrng(const std::array<uint8_t, kAesKeyBytes>& key,

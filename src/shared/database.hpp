@@ -37,10 +37,16 @@ struct OneHotParams {
 };
 
 // LCTE 编码表：N 条记录 × m 列（m = |R|，编码范围大小）
+//
+// 阈值集合（论文 §Left-Threshold Cumulative Encoding）：
+//   R = {r_1, ..., r_m}，本文取 **单位间隔的连续整数**
+//   R = {r_min, r_min+1, ..., r_min+m-1}。
+// 1-based 的 r_i = range_min + i - 1，等价说法：
+//   **0-based 列索引 i 对应的阈值是 range_min + i**。
 struct LcteParams {
-    uint32_t window_size = 0;  // 记录数 N
-    uint32_t range_size = 0;   // 列数 m
-    int64_t range_min = 0;     // 编码范围左端点 r_min
+    uint32_t window_size = 0;  // 记录数 N（LcteEncode 本身不依赖它，供上层整形/校验用）
+    uint32_t range_size = 0;   // 列数 m = |R|
+    int64_t range_min = 0;     // 阈值集合左端点 r_min（R 的最小元素）
 };
 
 // ---------------------------------------------------------------------------
@@ -172,9 +178,23 @@ std::vector<uint128_t> MakeOneHotRow(uint64_t onehot_index, uint32_t num_bucket)
 std::vector<uint128_t> EncodeOneHotRows(const std::vector<uint64_t>& values,
                                         uint32_t num_bucket);
 
-// LCTE 编码：LCTE(x) = ([x < r_1], [x < r_2], ..., [x < r_m])
-// 其中 r_i = range_min + i，i = 1..range_size。
-// 单调性：x < r_1 时全 1；x >= r_m 时全 0。
+// LCTE 编码（论文 §Left-Threshold Cumulative Encoding）：
+//   LCTE(x) = ([x < r_1], [x < r_2], ..., [x < r_m])
+// 其中 1-based 的 r_i = range_min + i - 1，即 **0-based 列索引 i 的阈值为
+// range_min + i**，阈值集合 R = {range_min, ..., range_min + m - 1}。
+//
+// 边界语义（直接由 Iverson 括号 [·] 给出）：
+//   * x <  range_min          ⇒ 全 1（每一列都满足 x < r_i）
+//   * x == range_min          ⇒ 第 0 列为 0，其余为 1
+//   * x >= range_min + m - 1  ⇒ 全 0（即 x >= r_m，没有任何列满足）
+//
+// 单调性：列索引递增 ⇒ 阈值递增 ⇒ `x < r_i` 越来越难成立，
+// 因此行向量形如 `0...01...1`（关于列索引**非减**）；
+// 等价地，随 x 增大，1 的位置整体左移（每个分量关于 x 非增）。
+//
+// ⚠️ 历史缺陷已修正：本函数此前用 `range_min + i + 1` 作为第 i 列的阈值，
+// 与论文的 R = {r_min, ..., r_min+m-1} 相比**整体偏移了 1**，
+// 导致 x = r_min 时错误地给出全 1、x = r_max 的判定点也整体右移。
 std::vector<uint128_t> LcteEncode(int64_t x, const LcteParams& params);
 
 // 把一批取值编码成 LCTE 表的扁平数据（行优先）

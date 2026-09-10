@@ -179,10 +179,20 @@ int main(int argc, char** argv) {
         const uint64_t words = params.words_per_column();
         uint64_t total_columns = 0;
         for (uint32_t s : sizes) total_columns += s;
+        // 服务器存的条目表 = one-hot 区（每取值一列） + value plane 区
+        //（每属性 l_a 个比特面，供 SUM/矩 还原每条记录的取值）。
+        const uint64_t one_hot_entries = total_columns * words;
+        const uint64_t plane_entries =
+            static_cast<uint64_t>(params.num_planes()) * words;
         std::cout << "\n客户端侧账目：每列 " << words << " 个 word，共 "
-                  << total_columns << " 列 ⇒ 每台服务器存放 "
-                  << total_columns * words << " 个共享条目（"
-                  << (total_columns * words * 16 / 1024) << " KB，按位打包）\n";
+                  << total_columns << " 列 ⇒ one-hot 区 "
+                  << one_hot_entries << " 个共享条目 + value plane 区 "
+                  << params.num_planes() << " 个面 × " << words << " words = "
+                  << plane_entries << " 个 ⇒ 合计 "
+                  << (one_hot_entries + plane_entries) << " 个（"
+                  << ((one_hot_entries + plane_entries) * 16 / 1024)
+                  << " KB，按位打包；PIR 数据库补齐到 2 的幂后为 "
+                  << params.PaddedEntries() << " 个）\n";
         std::cout << "本通道 RPC 统计：server0=" << ch0.rpc_count()
                   << "，server1=" << ch1.rpc_count() << "\n";
 

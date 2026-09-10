@@ -1,0 +1,179 @@
+// MPRAQ 线上协议（任务 S5 前置 / `TASK_PLAN.md` §9.2）。
+//
+// 与 `proto/vmpq.proto` 的关系：**分层意图相同、语义不同**。
+//   * 相同的部分：都是"客户端 → 单台服务器"的请求-应答；`StoreParams` 的几何
+//     由客户端推导后**显式下发**（服务器不猜）；一次查询 RPC 携带**整批**查询集
+//     （Q5 的摊薄往返口径）；16 字节元素一律小端。
+//   * 不同的部分（为什么不能复用 vmpq.proto）：
+//       1. VMPQ 的表是"one-hot 条目 + 每属性取值域 2^{l_a}"，条目数可以**补齐到
+//          2 的幂**；MPRAQ 的表是"**LCTE 特征位**，每列 ⌈N/128⌉ 个 128 位 word，
+//          列主序展平"，且补齐只补**列**（`StoreParams::column_count` vs
+//          `real_column_count`）⇒ 几何字段完全不同。
+//       2. MPRAQ 的 PIR 是 **Plinko**：查询集是 `(offsets[α], groups[α])`，应答是
+//          **两个** parity（`acc0`/`acc1`）；VMPQ 的 V-OO-PIR 查询集与应答结构不同。
+//       3. MPRAQ 还要传**属性值的 mod q 加法共享**（`ModShare`，q = 2^127−1）与
+//          SecureMul 的通用中转（`Relay`，见下）。
+//
+// 三条消息层设计口径（照 `vmpq.proto` 的注释习惯写明，便于后来人对齐）：
+// ⚠️ **包名为什么是 `mpraqwire` 而不是 `mpraq`**：C++ 侧的协议命名空间已经叫
+//    `tsb::mpraq`（`src/mpraq/*.hpp`）。protobuf 的 package 会生成**全局**命名空间
+//    `mpraq`，于是 `tsb` 内的 `mpraq::MpraqNode`（协议类型）与 `::mpraq::InitTableRequest`
+//    （线上类型）会互相遮蔽 —— 实测编译不过。用 `mpraqwire`（"MPRAQ 的线上协议"）
+//    把两者彻底分开：线上类型一律写 `::mpraqwire::X`，协议类型一律写 `mpraq::Y`。
+//
+//   * ⚠️ **半诚实版本**：不含任何 proof/验证值字段（决策 D16；MPRAQ 侧的验证机制
+//     待 `TASK_PLAN.md` §7.13 的 V1 裁决 ⇒ 本文件**不能**预留"看着像"的字段）。
+//   * ⚠️ **`n` 是 word 数而非记录数**（D24④ / D19-6）：`StoreParams.entry_count =
+//     column_count · words_per_column`，`PlinkoQuery.block_size` 是"**每个区块的
+//     word 数**"。写错会静默错 128 倍 ⇒ 服务端对几何做显式校验并返回可读错误。
+//   * 每个 `bytes` 元素都是**定长 16 字节小端 uint128**（与 `grpc_vmpq.cpp` 的
+//     `ToBytes`/`FromBytes` 完全同一约定）：`toBytesLE` 写、`fromBytesLE` 读。
+
+syntax = "proto3";
+
+package mpraqwire;
+
+service MpraqService {
+    // 初始化：按 `StoreParams` 分配服务器侧存储（特征表 + 每属性一条长度 N 的向量）
+    rpc InitTable (InitTableRequest) returns (InitTableResponse) {}
+
+    // 装载：上传一段**只属于本服务器**的特征 word XOR 共享（决策 D12/D3）
+    rpc UploadFeatureWords (UploadFeatureWordsRequest)
+        returns (UploadFeatureWordsResponse) {}
+
+    // 装载：上传某属性的**本方** mod q 加法共享（长度必须等于 N）
+    rpc SetAttributeShares (SetAttributeSharesRequest)
+        returns (SetAttributeSharesResponse) {}
+
+    // 在线检索：一次请求携带**全部列的全部 word** 的查询集（Q5 / D24④）
+    rpc ServerResp (PirQueryRequest) returns (PirQueryResponse) {}
+
+    // 通用 opaque 转发：`ITransportServer`/`ITransportClient`（net/transport.hpp）
+    // 的 gRPC 实现，用来跑 MPRAQ 的 SecureMul 三方消息流（MPA-05）。
+    // 服务端把 `payload` 原样交给注册的 handler，handler 的返回值放进应答。
+    // ⚠️ 本 RPC 与上面四条 MPRAQ 存储 RPC **语义无关**（不做解析），只是字节搬运；
+    //    "服务器之间零通信"这一结构性保证因此仍然成立：一台服务器的服务实例只
+    //    持有**自己那一个** handler，没有任何句柄能触达另一台。
+    rpc Relay (RelayRequest) returns (RelayResponse) {}
+}
+
+// ---------------------------------------------------------------------------
+// 存储几何（`src/mpraq/node.hpp` 的 `StoreParams` 逐字段映射）
+// ---------------------------------------------------------------------------
+// ⚠️ 字段编号一旦发布**不要改**（线上协议），新增字段一律往后编。
+
+message LcteParamsProto {
+    // R = [range_min, range_min + range_size − 1]（LCTE 的阈值区间）
+    int64 range_min = 1;
+    uint32 range_size = 2;
+    uint32 window_size = 3;  // 与 N 一致（上层校验；0 表示未声明）
+}
+
+message StoreAttributeProto {
+    string name = 1;          // 可读名（只用于服务端报错信息）
+    uint32 id = 2;            // 必须按 0,1,2,... 连续编号
+    LcteParamsProto lcte = 3; // 该属性的 LCTE 参数
+    int64 domain_min = 4;     // 闭取值域下界
+    int64 domain_max = 5;     // 闭取值域上界
+}
+
+// ⚠️ `PlinkoParams` 的派生量（block_count/main_hints/…）**不上线**：
+//    服务端一律用 `PlinkoParams::Validate()` + `StoreParams::Validate()` 自己核对，
+//    避免"客户端报一个 c、服务器按另一个算"的静默错值。
+message PlinkoParamsProto {
+    uint64 n = 1;              // **word 数**（= column_count · words_per_column），D24④
+    uint64 w = 2;              // 区块大小（**必须是 2 的幂**，D21）
+    uint32 lambda = 3;         // 安全参数 λ
+    double prp_epsilon = 4;    // iPRF 的 PRP 目标 ε（D22-1）
+}
+
+message StoreParamsProto {
+    uint64 num_records = 1;        // N
+    uint64 words_per_column = 2;   // ⌈N/128⌉
+    uint64 column_count = 3;       // **补齐后**的总列数
+    uint64 real_column_count = 4;  // 真实（未补齐）的总列数
+    PlinkoParamsProto plinko = 5;
+    repeated StoreAttributeProto attrs = 6;
+}
+
+message InitTableRequest {
+    StoreParamsProto params = 1;
+}
+
+message InitTableResponse {
+    bool ok = 1;
+    string error = 2;  // ok == false 时的可读原因
+}
+
+// ---------------------------------------------------------------------------
+// 装载：特征 word 共享 / 属性值共享
+// ---------------------------------------------------------------------------
+
+message UploadFeatureWordsRequest {
+    uint64 base_index = 1;  // 起始条目号（**列主序**展平后的下标）
+    // 每个元素 16 字节小端 uint128 的**本方 XOR 分量**；长度必须等于
+    // `count`（= words.size()）。不得上传明文——服务器之间不共谋是安全前提。
+    repeated bytes words = 2;
+}
+
+message UploadFeatureWordsResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
+message SetAttributeSharesRequest {
+    uint32 attr_id = 1;
+    // 每个元素 16 字节小端 uint128 的 `ModShare`（mod q = 2^127−1 的加法共享）。
+    // ⚠️ 长度必须**恰好**等于 N；服务端不做补齐/截断（静默补齐会算错聚合）。
+    repeated bytes shares = 2;
+}
+
+message SetAttributeSharesResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
+// ---------------------------------------------------------------------------
+// 在线检索（Plinko 的 Query / Answer）
+// ---------------------------------------------------------------------------
+
+// 单个 word 的一次 Plinko 查询：每个区块恰好一个偏移 + 一个分组比特。
+// 服务器视角下不同查询的 (offsets, groups) 联合分布相同，故不泄露目标（半诚实）。
+message PirQuerySet {
+    repeated uint32 offsets = 1 [packed = true];  // 长度 = c，每个 < w
+    repeated uint32 groups = 2 [packed = true];   // 长度 = c，取值 0/1
+}
+
+message PirQueryRequest {
+    // queries[j] 对应第 j 个待检索 word。
+    // ⚠️ 客户端把**整列（乃至多列）的全部 word** 一次性放进这里（Q5/D24④）。
+    repeated PirQuerySet queries = 1;
+    uint64 blocks = 2;      // c（几何自足：服务端据此校验查询集长度）
+    uint64 block_size = 3;  // w = **每个区块的 word 数**（D24④，写错静默错 128 倍）
+}
+
+message PirAnswer {
+    bytes acc0 = 1;  // 16 字节小端：分组比特为 0 的区块上的 XOR 累加
+    bytes acc1 = 2;  // 16 字节小端：分组比特为 1 的区块上的 XOR 累加
+}
+
+message PirQueryResponse {
+    repeated PirAnswer answers = 1;  // 与 queries 一一对应、同序
+    string error = 2;                // 非空表示被拒绝（此时 answers 无意义）
+}
+
+// ---------------------------------------------------------------------------
+// 通用 opaque 转发（`net/transport.hpp` 的 `ITransportClient/ITransportServer`）
+// ---------------------------------------------------------------------------
+
+message RelayRequest {
+    bytes payload = 1;  // 上层自己序列化的字节（MPA-05 的线格式是 34/27/58/43 B）
+}
+
+message RelayResponse {
+    bool ok = 1;       // 与 `tsb::Response::ok` 同语义
+    bytes payload = 2; // ok == true 时 handler 的返回值
+    string error = 3;  // ok == false 时可读原因（handler 抛异常 / 未注册 handler /
+                       // 入参非法）。⚠️ 传输层失败**必须**能表达：客户端据此构造
+                       // `Response::Err(...)`，绝不静默返回空 payload 冒充成功。
+}

@@ -2,7 +2,7 @@
 //
 // 用法：./vmpq_server <config.json>
 //
-// 配置示例（见 config/server_vmpq_0.json）：
+// 配置示例（见 config/vmpq_server_0.json）：
 //   { "server_id": 0, "host_port": "50051" }
 //
 // ⚠️ 半诚实模型：本进程只持有**自己那一半** XOR 共享。两台服务器之间不通信，

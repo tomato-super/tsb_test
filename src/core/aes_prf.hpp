@@ -110,8 +110,9 @@ public:
 
 private:
     std::array<uint8_t, kAesKeyBytes> key_;
-    // ECB 上下文的 ProcessData 非 const，故用指针 + mutable 保持 Eval 的 const 语义。
-    mutable std::unique_ptr<CryptoPP::ECB_Mode<CryptoPP::AES>::Encryption> enc_;
+    // 单块 AES 密码本（ECB 语义）。加密上下文按 const 使用，用指针 + mutable
+    // 保持 Eval 的 const 语义。
+    mutable std::unique_ptr<CryptoPP::AES::Encryption> enc_;
 
     void InitCipher();
     void ProcessBlock(uint8_t out[16], const uint8_t in[16]) const;

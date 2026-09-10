@@ -54,6 +54,35 @@ uint64_t PlainCount(const std::vector<std::vector<uint64_t>>& recs,
     return c;
 }
 
+// 明文基准：同时满足全部谓词的记录数
+uint64_t PlainCountMulti(const std::vector<std::vector<uint64_t>>& recs,
+                         const std::vector<std::pair<uint32_t, uint64_t>>& preds) {
+    uint64_t c = 0;
+    for (const auto& r : recs) {
+        bool ok = true;
+        for (const auto& [a, v] : preds) {
+            if (r[a] != v) { ok = false; break; }
+        }
+        if (ok) ++c;
+    }
+    return c;
+}
+
+// 明文基准：对满足谓词的记录，求 sum_attr 之和
+uint64_t PlainSumWithFilter(const std::vector<std::vector<uint64_t>>& recs,
+                            const std::vector<std::pair<uint32_t, uint64_t>>& preds,
+                            uint32_t sum_attr) {
+    uint64_t total = 0;
+    for (const auto& r : recs) {
+        bool ok = true;
+        for (const auto& [a, v] : preds) {
+            if (r[a] != v) { ok = false; break; }
+        }
+        if (ok) total += r[sum_attr];
+    }
+    return total;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -70,9 +99,13 @@ TEST(VmpqParams, WordsPerColumn) {
 }
 
 TEST(VmpqParams, TotalEntriesAndPadding) {
-    // (64 + 32) 个取值 × 8 words = 768 个真实条目
+    // one-hot 区：(64 + 32) 个取值 × 8 words = 768
+    // value plane 区：(6 + 5) 个比特面 × 8 words = 88（PIR-02 新增）
     const VmpqParams p = MakeParams(1024);
-    EXPECT_EQ(p.TotalEntries(), static_cast<uint64_t>(768));
+    EXPECT_EQ(p.OneHotEntries(), static_cast<uint64_t>(768));
+    EXPECT_EQ(p.PlaneEntries(), static_cast<uint64_t>(88));
+    EXPECT_EQ(p.TotalEntries(), static_cast<uint64_t>(856));
+    EXPECT_EQ(p.num_planes(), 11u);
     // V-OO-PIR 要求 n 是 2 的幂，故补齐到 1024
     EXPECT_EQ(p.PaddedEntries(), static_cast<uint64_t>(1024));
     EXPECT_TRUE((p.PaddedEntries() & (p.PaddedEntries() - 1)) == 0);
@@ -149,8 +182,9 @@ TEST(Vmpq, InitDistributesXorSharesThatReconstruct) {
     EXPECT_EQ(client.node(0).num_entries(), p.PaddedEntries());
     EXPECT_EQ(client.node(1).num_entries(), p.PaddedEntries());
 
-    // 两服务器的 XOR 必须重建出明文 one-hot 表
-    const uint64_t n = p.TotalEntries();
+    // 两服务器的 XOR 必须重建出明文 one-hot 表（只遍历 one-hot 区；
+    // value plane 区的校验见 ValuePlanesAreXorOfOneHotColumns）
+    const uint64_t n = p.OneHotEntries();
     for (uint64_t i = 0; i < n; ++i) {
         const uint128_t a = client.node(0).Entry(i);
         const uint128_t b = client.node(1).Entry(i);
@@ -339,51 +373,198 @@ TEST(Vmpq, StorageAccountingMatchesLayout) {
     VmpqClient client(p, prf);
     client.Init(recs);
 
-    // 服务器只存 one-hot 索引的共享（按位打包后的 word），大小 = 16 × 补齐后条目数。
+    // 服务器存的是一张扁平条目表的共享：one-hot 区 + value plane 区
+    //（都按位打包成 128 位 word），大小 = 16 × 补齐后条目数。
     //
-    // 注意这里**没有**属性值 E 的共享：因为 SUM 走 §7.9 G5 的归约
-    //（SUM = Σ_v v·Count），根本不需要单独存储属性值。这是该归约带来的额外好处。
+    // 注意这里**没有**属性值 E 的共享：SUM 走 value plane 还原每条记录的取值
+    //（§7.9 G5），不需要单独存储属性值。
     const uint64_t expected = kUint128Bytes * p.PaddedEntries();
     EXPECT_EQ(client.node(0).storage_bytes(), expected);
     EXPECT_EQ(client.node(1).storage_bytes(), expected);
 }
 
 // ===========================================================================
-// 多谓词 Count（VMP-03）
+// value plane（PIR-02：SUM/矩 的批量优化底座）
 // ===========================================================================
 
-namespace {
+TEST(Vmpq, ValuePlanesAreXorOfOneHotColumns) {
+    // 比特面 = one-hot 中"该位为 1"的那些列的 XOR。各列互斥（每条记录在该
+    // 属性上只有一个取值），故 XOR 即 OR ⇒ **比特面是 one-hot 表的线性函数**。
+    //
+    // 意义：两台服务器**联合**本来就能算出该比特面（各自对己方共享做 XOR，
+    // 得到的仍是一份合法共享，互补那份正是对方算出的），上传比特面只相当于
+    // 多带一份与库内容无关的新鲜随机掩码 ⇒ **不带来任何额外泄露**。
+    //
+    // ⚠️ 必须比**重建后的明文**：XOR 共享只保证 (s0 ^ s1) 等于明文，
+    // 单台服务器侧的掩码是各自独立随机的，两边不相等（也不是"错"）。
+    const VmpqParams p = MakeParams(1024);
+    const auto recs = MakeRecords(p.window_size, 137);
+    const AesPrf prf = MakePrf(43);
+    VmpqClient client(p, prf);
+    client.Init(recs);
 
-// 明文基准：同时满足全部谓词的记录数
-uint64_t PlainCountMulti(const std::vector<std::vector<uint64_t>>& recs,
-                         const std::vector<std::pair<uint32_t, uint64_t>>& preds) {
-    uint64_t c = 0;
-    for (const auto& r : recs) {
-        bool ok = true;
-        for (const auto& [a, v] : preds) {
-            if (r[a] != v) { ok = false; break; }
+    std::vector<uint64_t> attr_base, plane_base;
+    ComputeEntryLayout(p, attr_base, plane_base);
+
+    const VmpqNode& n0 = client.node(0);
+    const VmpqNode& n1 = client.node(1);
+    const auto plain = [&n0, &n1](uint64_t i) {
+        return static_cast<uint128_t>(n0.Entry(i) ^ n1.Entry(i));
+    };
+
+    const uint32_t w = p.words_per_column();
+    for (uint32_t a = 0; a < p.num_attributes(); ++a) {
+        const uint32_t bits = p.bits_per_attr(a);
+        for (uint32_t b = 0; b < bits; ++b) {
+            for (uint32_t word = 0; word < w; ++word) {
+                uint128_t xored = 0;
+                for (uint32_t v = 0; v < p.attr_sizes[a]; ++v) {
+                    if (((v >> b) & 1u) == 0) continue;
+                    xored = static_cast<uint128_t>(
+                        xored ^ plain(attr_base[a] + static_cast<uint64_t>(v) * w +
+                                      word));
+                }
+                const uint128_t plane =
+                    plain(plane_base[a] + static_cast<uint64_t>(b) * w + word);
+                EXPECT_TRUE(xored == plane);
+            }
         }
-        if (ok) ++c;
     }
-    return c;
+    // 与记录直接对照（同一事实的独立路径）：比特面第 b 面 = 取值的第 b 位
+    for (uint32_t a = 0; a < p.num_attributes(); ++a) {
+        for (uint32_t b = 0; b < p.bits_per_attr(a); ++b) {
+            const uint128_t word0 =
+                plain(plane_base[a] + static_cast<uint64_t>(b) * w);
+            for (uint32_t j = 0; j < 128; ++j) {
+                const bool got = ((word0 >> j) & 1u) != 0;
+                EXPECT_EQ(got, ((recs[j][a] >> b) & 1u) != 0);
+            }
+        }
+    }
 }
 
-// 明文基准：对满足谓词的记录，求 sum_attr 之和
-uint64_t PlainSumWithFilter(const std::vector<std::vector<uint64_t>>& recs,
-                            const std::vector<std::pair<uint32_t, uint64_t>>& preds,
-                            uint32_t sum_attr) {
-    uint64_t total = 0;
-    for (const auto& r : recs) {
-        bool ok = true;
-        for (const auto& [a, v] : preds) {
-            if (r[a] != v) { ok = false; break; }
+TEST(Vmpq, RetrieveAttributeValuesMatchesPlaintext) {
+    // 由 l_a 个比特面本地拼出每条记录的取值，必须与明文逐条一致
+    const VmpqParams p = MakeParams(1024);
+    const auto recs = MakeRecords(p.window_size, 139);
+    const AesPrf prf = MakePrf(47);
+    VmpqClient client(p, prf);
+    client.Init(recs);
+
+    for (uint32_t a = 0; a < p.num_attributes(); ++a) {
+        const auto vals = client.RetrieveAttributeValues(a);
+        EXPECT_EQ(vals.size(), static_cast<size_t>(p.window_size));
+        for (uint32_t j = 0; j < p.window_size; ++j) {
+            EXPECT_EQ(vals[j], recs[j][a]);
         }
-        if (ok) total += r[sum_attr];
+        // 比特面个数必须等于 l_a
+        EXPECT_EQ(client.RetrieveValuePlanes(a).size(),
+                  static_cast<size_t>(p.bits_per_attr(a)));
     }
-    return total;
 }
 
-}  // namespace
+TEST(Vmpq, ValuePlaneRetrievalRejectsBadAttribute) {
+    const VmpqParams p = MakeParams(1024);
+    const auto recs = MakeRecords(p.window_size, 141);
+    const AesPrf prf = MakePrf(53);
+    VmpqClient client(p, prf);
+    client.Init(recs);
+    EXPECT_THROW(client.RetrieveValuePlanes(p.num_attributes()), std::out_of_range);
+    EXPECT_THROW(client.RetrieveAttributeValues(p.num_attributes()),
+                 std::out_of_range);
+}
+
+TEST(Vmpq, AggregateUsesOneRpcPerQueryRegardlessOfDomainSize) {
+    // PIR-02 的核心收益：SUM/矩 的 PIR 次数从
+    //   2^{l_a}·(|filter|+1) 个列  →  (|filter| + l_a) 个列
+    // 这里用"查询集个数"直接量出来（单进程下每次 PirQuery 调用由
+    // LocalChannel 直接转发，故用 queries_served 口径观测）。
+    const VmpqParams p = MakeParams(1024);  // l = {6, 5}
+    const auto recs = MakeRecords(p.window_size, 143);
+    const AesPrf prf = MakePrf(59);
+    VmpqClient client(p, prf);
+    client.Init(recs);
+
+    const uint32_t w = p.words_per_column();
+    const uint32_t sum_bits = p.bits_per_attr(kAttrDoctor);  // 5
+    const auto r = client.Aggregate({{kAttrPatient, 5}}, kAttrDoctor);
+    // 期望取回：filter 1 列 + 比特面 5 个 = 6 列 × w 个 word
+    const uint64_t expected_words =
+        static_cast<uint64_t>(1 + sum_bits) * w;
+    EXPECT_EQ(client.node(0).queries_served(), expected_words);
+    EXPECT_EQ(client.node(1).queries_served(), expected_words);
+    // 早先的实现会是 (1+1)×2^5 = 64 个列 ⇒ 512 个 word（约 10.7 倍）
+    EXPECT_TRUE(expected_words * 8 < static_cast<uint64_t>(2) * (1 + 1) *
+                                       (1u << sum_bits) * w);
+
+    // 结果本身必须与明文一致
+    uint64_t cnt = 0, sum = 0, sum_sq = 0;
+    for (const auto& rec : recs) {
+        if (rec[kAttrPatient] != 5) continue;
+        ++cnt;
+        sum += rec[kAttrDoctor];
+        sum_sq += rec[kAttrDoctor] * rec[kAttrDoctor];
+    }
+    EXPECT_EQ(r.count, cnt);
+    EXPECT_EQ(r.sum, sum);
+    EXPECT_EQ(r.sum_sq, sum_sq);
+}
+
+TEST(Vmpq, RepeatedTargetsInOneBatchExerciseHintLifecycle) {
+    // 同一列被重复放进**同一批**查询时（例如用户写了重复谓词），多条查询集会
+    // 竞争同一个索引的候选 hint。消费制（决策 D17）下第二条查询必须换一条
+    // hint；若某索引的候选 hint 恰好都在本批里被用光，还要能"先结算本批
+    // （重建 + 刷新）再重试"。这里用 16 个重复目标把这条路径压出来：
+    // 旧实现（复用同一条 hint）会侥幸通过，新实现必须真的走刷新路径。
+    const VmpqParams p = MakeParams(1024);
+    const auto recs = MakeRecords(p.window_size, 147);
+    const AesPrf prf = MakePrf(67);
+    VmpqClient client(p, prf);
+    client.Init(recs);
+
+    const uint64_t want = PlainCount(recs, kAttrPatient, 7);
+    std::vector<VmpqClient::Predicate> many(16, {kAttrPatient, 7});
+    EXPECT_EQ(client.CountMultiPredicate(many), want);
+
+    // 整个过程中不能有槽位停留在"已消费"状态（否则说明漏了刷新）
+    EXPECT_EQ(client.pir().FreeHintCount(), client.pir().ValidHintCount());
+    EXPECT_EQ(client.CountMultiPredicate({{kAttrPatient, 7}, {kAttrPatient, 7}}), want);
+    EXPECT_EQ(client.CountMultiPredicate({{kAttrPatient, 7}}), want);
+}
+
+TEST(Vmpq, Lambda80ParameterSetWorksEndToEnd) {
+    // 论文的部署取值 λ=80（TASK_PLAN §8）。半诚实版本必须在部署参数下也全部正确。
+    VmpqParams p = MakeParams(1024);
+    p.lambda = 80;
+    const auto recs = MakeRecords(p.window_size, 145);
+    const AesPrf prf = MakePrf(61);
+    VmpqClient client(p, prf);
+    client.Init(recs);
+
+    // M = λ√n 条 hint **全部有效**（决策 D15(3)）
+    const VooPirParams pp = p.DerivePirParams();
+    EXPECT_EQ(client.pir().ValidHintCount(), static_cast<size_t>(pp.num_hints()));
+    EXPECT_EQ(client.pir().FreeHintCount(), static_cast<size_t>(pp.num_hints()));
+
+    // 单谓词 Count 全取值对照明文
+    for (uint32_t a = 0; a < p.num_attributes(); ++a) {
+        for (uint32_t v = 0; v < p.attr_sizes[a]; ++v) {
+            EXPECT_EQ(client.CountSinglePredicate(a, v), PlainCount(recs, a, v));
+        }
+    }
+    // 多谓词 + 聚合
+    EXPECT_EQ(client.CountMultiPredicate({{kAttrPatient, 9}, {kAttrDoctor, 4}}),
+              PlainCountMulti(recs, {{kAttrPatient, 9}, {kAttrDoctor, 4}}));
+    const auto r = client.Aggregate({{kAttrPatient, 9}}, kAttrDoctor);
+    EXPECT_EQ(r.count, PlainCount(recs, kAttrPatient, 9));
+    EXPECT_EQ(r.sum, PlainSumWithFilter(recs, {{kAttrPatient, 9}}, kAttrDoctor));
+    // 刷新后 hint 池必须没有任何残留消费（决策 D17）
+    EXPECT_EQ(client.pir().FreeHintCount(), client.pir().ValidHintCount());
+}
+
+// ===========================================================================
+// 多谓词 Count（VMP-03）
+// ===========================================================================
 
 TEST(Vmpq, RetrieveColumnMatchesPlaintextBits) {
     const VmpqParams p = MakeParams(1024);

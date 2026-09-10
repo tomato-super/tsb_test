@@ -7,6 +7,7 @@ add_library(tsb_core STATIC
     mset_hash.cpp
     random.cpp
     config.cpp
+    iprf.cpp
 )
 
 target_include_directories(tsb_core PUBLIC

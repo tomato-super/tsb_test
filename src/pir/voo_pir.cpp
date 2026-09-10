@@ -221,6 +221,7 @@ void VooPirClient::HintInit(const std::vector<uint128_t>& db) {
     const uint64_t m_target = params_.num_hints();
     hints_.clear();
     proofs_.clear();
+    consumed_.clear();
     hints_.reserve(static_cast<size_t>(m_target));
     proofs_.reserve(static_cast<size_t>(m_target));
 
@@ -340,6 +341,20 @@ void VooPirClient::HintInit(const std::vector<uint128_t>& db) {
         }
         hints_.push_back(h);
     }
+
+    // 生命周期记账（决策 D17）：装载完成后所有槽位都可用
+    consumed_.assign(hints_.size(), 0);
+}
+
+size_t VooPirClient::FreeHintCount() const {
+    if (policy_ == HintReusePolicy::kAllowUnsafeForTesting) {
+        return ValidHintCount();
+    }
+    size_t free_count = 0;
+    for (size_t i = 0; i < hints_.size(); ++i) {
+        if (hints_[i].select_cutoff != 0 && consumed_[i] == 0) ++free_count;
+    }
+    return free_count;
 }
 
 size_t VooPirClient::ValidHintCount() const {
@@ -354,30 +369,49 @@ size_t VooPirClient::ValidHintCount() const {
 // 查找含目标索引的 hint
 // ---------------------------------------------------------------------------
 
+namespace {
+// 该 hint 是否包含索引 index。
+//   case A：index 恰为 hint 的 extra 项（零次 AES）
+//   case B：index 与 hint 真实集合在分区 ℓ 上的 PRF 偏移相同
+// 判定顺序即 PIR_SPEC §3.2 的性能关键顺序（先便宜后昂贵）。
+bool HintContains(const VooPirParams& params, const AesPrf& prf,
+                  const VooPirHint& h, uint64_t index) {
+    if (h.select_cutoff == 0) return false;  // 无效 hint 一律跳过
+    const auto [ell, off] = VooPirClient::Locate(params, index);
+    if (h.extra_part == ell && h.extra_offset == off) return true;
+    if (VooPirClient::HintOffset(params, prf, h, ell) != off) return false;
+    return VooPirClient::IsRealPartition(prf, h, ell);
+}
+}  // namespace
+
 size_t VooPirClient::FindHintIn(const VooPirParams& params, const AesPrf& prf,
                                 const std::vector<VooPirHint>& hints,
                                 uint64_t index) {
-    const auto [ell, off] = Locate(params, index);
     for (size_t h = 0; h < hints.size(); ++h) {
-        const VooPirHint& hh = hints[h];
-        if (hh.select_cutoff == 0) continue;  // 无效 hint 跳过
-
-        // case A：目标是 extra 项（零次 AES）
-        if (hh.extra_part == ell && hh.extra_offset == off) {
-            return h;
-        }
-        // case B：目标是真实集合在分区 ℓ 上的那一项
-        const uint32_t r = HintOffset(params, prf, hh, ell);
-        if (r != off) continue;
-        if (IsRealPartition(prf, hh, ell)) {
-            return h;
-        }
+        if (HintContains(params, prf, hints[h], index)) return h;
     }
     return std::numeric_limits<size_t>::max();
 }
 
 size_t VooPirClient::FindHint(uint64_t index) const {
-    return FindHintIn(params_, prf_, hints_, index);
+    // ⚠️ kForbidReuse 下必须**继续往后找**下一条覆盖该索引的 hint，
+    // 而不是"首条被消费就报失败"——每个索引通常被 ~λ/2 条 hint 覆盖。
+    for (size_t slot = 0; slot < hints_.size(); ++slot) {
+        if (!HintContains(params_, prf_, hints_[slot], index)) continue;
+        if (policy_ == HintReusePolicy::kForbidReuse && consumed_[slot] != 0) {
+            continue;  // 已消费：刷新前不得复用（决策 D17）
+        }
+        return slot;
+    }
+    return std::numeric_limits<size_t>::max();
+}
+
+std::vector<size_t> VooPirClient::HintsContaining(uint64_t index) const {
+    std::vector<size_t> slots;
+    for (size_t slot = 0; slot < hints_.size(); ++slot) {
+        if (HintContains(params_, prf_, hints_[slot], index)) slots.push_back(slot);
+    }
+    return slots;
 }
 
 // ---------------------------------------------------------------------------
@@ -393,10 +427,17 @@ VooPirQuery VooPirClient::Query(uint64_t index) {
     last_slot_ = FindHint(index);
     last_failed_ = (last_slot_ == std::numeric_limits<size_t>::max());
     if (last_failed_) {
+        // ⚠️ 两种失效必须分开报（否则调用方无法区分"该刷新"与"该重跑离线"）：
+        if (FindHintIgnoringConsumed(index) != std::numeric_limits<size_t>::max()) {
+            // 覆盖它的 hint 都已被本轮消费 —— 正常状态，先 Refresh 再来
+            throw HintsExhausted(
+                "VooPirClient::Query: 覆盖该索引的 hint 都已在本轮被消费，"
+                "必须先 Refresh 才能继续查询（决策 D17：禁止复用未刷新的 hint）");
+        }
         // ⚠️ 绝不可回退到可区分的失败路径（例如直接明文取值）——
         // 那会把"正确性失败"升级为"隐私泄露"（论文 §2 明确警告）。
         // 这里显式抛错，由上层决定重跑离线阶段。
-        throw std::runtime_error(
+        throw HintCoverageFailure(
             "VooPirClient::Query: 找不到包含该索引的 hint（概率 < e^{-λ/2}）；"
             "应当重跑离线阶段，而不是回退到可区分的路径");
     }
@@ -418,6 +459,7 @@ VooPirQuery VooPirClient::Query(uint64_t index) {
     q.offsets.assign(params_.part_num, 0);
     q.groups.assign(params_.part_num, 0);
     q.target_index = index;
+    q.hint_slot = last_slot_;
     q.hint_parity = h.parity;
     q.hit_via_extra = via_extra;
     q.take_accumulator_1 = (beta ^ flip);
@@ -465,6 +507,13 @@ VooPirQuery VooPirClient::Query(uint64_t index) {
                                : (static_cast<uint64_t>(h.extra_part) *
                                       params_.part_size +
                                   h.extra_offset);
+
+    // ⚠️ 消费该槽位（决策 D17）：在 Refresh 换掉它之前，后续 Query 不会再选中
+    // 它。若允许多轮复用同一条 hint，服务器可以从"跨轮恒定的偏移"里还原出
+    // 真实半区与每一轮的查询分区 ℓ（证伪测试见 test_voo_pir.cpp）。
+    if (policy_ == HintReusePolicy::kForbidReuse) {
+        consumed_[last_slot_] = 1;
+    }
     return q;
 }
 
@@ -575,6 +624,8 @@ void VooPirClient::Refresh(size_t hint_slot, const VooPirQuery& q,
     h.extra_offset = off;
 
     hints_[hint_slot] = h;
+    // 槽位已被全新的 hint 替换 ⇒ 重新可用（决策 D17）
+    if (hint_slot < consumed_.size()) consumed_[hint_slot] = 0;
     // 半诚实版本不维护证明；启用证明时这里需要服务器侧标签输入（尚未实现）
 }
 

@@ -112,11 +112,15 @@ SecureMulRound2 SecureMulServerPhase2(const SecureMulServerInput& in, uint128_t 
     // ⚠️ **勘误**：MPRAQ 论文 Algorithm 5 把最后一项写成 `⟨α⟩_p·e·d·2^{-1}`，
     // 这是错的——照抄会导致 `mac ≠ α·z`，MAC 校验恒失败（见决策 D14）。
     //
-    // 推导：z 的公式里末项是 `e·d·2^{-1}`，因此
-    //     z = c + d·b + e·a + e·d/2
-    //     正确 MAC 应为 α·z = αc + d·(αb) + e·(αa) + α·e·d/2
-    // 而论文把它写成了 …… + α·e·d/2 之外**又**乘了一次 2^{-1}，
-    // 于是 mac = α·z 不成立。本实现按正确公式计算。
+    // 推导（2026-09-10 用精确整数模型复核，三种约定各 200 轮；见 D14）：
+    //     z 侧：两台各给 `e·d·2^{-1}`，求和 = `e·d` ⇒ z = c + d·b + e·a + e·d ✔ = x·y
+    //     mac 侧：α **本身是加法共享的**，两台各给 `⟨α⟩_p·e·d` 时和恰为 `α·e·d`
+    //            ⇒ mac = αc + d·αb + e·αa + α·e·d ✔ = α·z
+    //     论文把 mac 末项写成 `⟨α⟩_p·e·d·2^{-1}`，求和后比 `α·z` **少 `α·e·d/2`** ⇒ 校验恒失败。
+    // ⚠️ 因此 **z 侧的 `2^{-1}` 不能删**（两台各一份正好凑成 1），只删 mac 侧那一个。
+    //     实测：论文写法 0/200 通过、本写法 200/200 通过。
+    // ⚠️ 另一个易错点：`in.triple.*.value` 是**本服务器分片**，不是重建值；
+    //     本函数算的是"单台分片"，两台求和才等于 z/mac。
     uint128_t mac = in.triple.alpha_c.value;
     mac = addMod(mac, mulMod(d, in.triple.alpha_b.value, q), q);
     mac = addMod(mac, mulMod(e, in.triple.alpha_a.value, q), q);

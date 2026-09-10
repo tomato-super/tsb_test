@@ -1,5 +1,6 @@
 #include "core/aes_prf.hpp"
 #include "core/field.hpp"
+#include "core/random.hpp"
 #include "test_framework.hpp"
 
 #include <array>
@@ -272,3 +273,71 @@ TEST(AesPrf, DummyStreamDoesNotRepeatWithinBatch) {
     }
 }
 
+// ===========================================================================
+// DeterministicPrng（测试用确定性随机源；D6 的可复现性依赖它）
+// ===========================================================================
+
+namespace {
+std::array<uint8_t, kAesKeyBytes> PrngKey(uint8_t fill) {
+    std::array<uint8_t, kAesKeyBytes> k{};
+    k.fill(fill);
+    return k;
+}
+}  // namespace
+
+TEST(DeterministicPrng, IsReproducibleForSameKeyAndNonce) {
+    const auto key = PrngKey(0x11);
+    random::DeterministicPrng a(key, 7);
+    random::DeterministicPrng b(key, 7);
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(a.Next(), b.Next());
+    // Reset 之后必须能原样重放
+    a.Reset();
+    random::DeterministicPrng c(key, 7);
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(a.Next(), c.Next());
+}
+
+TEST(DeterministicPrng, UsesAllNonceBits) {
+    // ⚠️ 回归用例：早期实现用 `nonce >> 32`，于是"只有低 32 位不同"的 nonce
+    // 产出**完全相同**的密钥流（seed 99 与 100 一模一样）。
+    const auto key = PrngKey(0x22);
+    const auto stream = [&key](uint64_t nonce, int n) {
+        random::DeterministicPrng p(key, nonce);
+        std::vector<uint128_t> out;
+        for (int i = 0; i < n; ++i) out.push_back(p.Next());
+        return out;
+    };
+    EXPECT_TRUE(stream(99, 4) != stream(100, 4));          // 低 32 位必须参与
+    EXPECT_TRUE(stream(0, 4) != stream(uint64_t{1} << 32, 4));  // 高 32 位也要参与
+    EXPECT_TRUE(stream(1, 4) != stream((uint64_t{1} << 32) | 1, 4));
+    // 不同密钥、同一 nonce 也要不同
+    random::DeterministicPrng other(PrngKey(0x23), 99);
+    EXPECT_TRUE(other.Next() != stream(99, 1)[0]);
+}
+
+TEST(DeterministicPrng, SupportsLongStreams) {
+    // ⚠️ 回归用例：早期 counter 只有 16 位 ⇒ 第 65536 个块就抛异常（1 MiB 上限）
+    const auto key = PrngKey(0x33);
+    random::DeterministicPrng p(key, 3);
+    constexpr uint64_t kN = 70000;  // > 2^16
+    uint128_t acc = 0;
+    for (uint64_t i = 0; i < kN; ++i) acc = static_cast<uint128_t>(acc ^ p.Next());
+    EXPECT_TRUE(acc != 0);
+    const uint128_t after = p.Next();
+    random::DeterministicPrng q(key, 3);
+    uint128_t same = 0;
+    for (uint64_t i = 0; i <= kN; ++i) same = q.Next();
+    EXPECT_EQ(after, same);
+}
+
+TEST(DeterministicPrng, BelowIsInRangeAndDeterministic) {
+    const auto key = PrngKey(0x44);
+    random::DeterministicPrng a(key, 5);
+    random::DeterministicPrng b(key, 5);
+    for (uint32_t i = 0; i < 64; ++i) {
+        const uint128_t bound = static_cast<uint128_t>(1000 + i);
+        const uint128_t x = a.Below(bound);
+        EXPECT_TRUE(x < bound);
+        EXPECT_EQ(x, b.Below(bound));
+    }
+    EXPECT_THROW(a.Below(0), std::invalid_argument);
+}

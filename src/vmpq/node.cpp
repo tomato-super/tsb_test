@@ -39,6 +39,8 @@ std::vector<PirAnswerData> VmpqNode::PirQuery(
     if (!inited_) {
         throw std::logic_error("VmpqNode::PirQuery: 尚未 InitTable");
     }
+    ++rpc_count_;
+    queries_served_ += queries.size();
     const uint32_t P = params_.DerivePirParams().part_num;
     const uint32_t sigma = params_.DerivePirParams().part_size;
 

@@ -5,6 +5,7 @@
 
 add_library(tsb_pir STATIC
     voo_pir.cpp
+    plinko.cpp
 )
 
 target_include_directories(tsb_pir PUBLIC

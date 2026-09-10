@@ -1,0 +1,11 @@
+{
+    "servers": [
+        {"id": 0, "address": "localhost:50051"},
+        {"id": 1, "address": "localhost:50052"}
+    ],
+    "params": {
+        "window_size": 1024,
+        "attr_sizes": [64, 32],
+        "lambda": 24
+    }
+}

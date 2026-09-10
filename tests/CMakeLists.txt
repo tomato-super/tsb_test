@@ -62,3 +62,48 @@ add_tsb_test(test_grpc_e2e test_grpc_e2e.cpp LIBS tsb_net tsb_vmpq vmpq_proto)
 
 # ---- 双服务器仿真框架 ----
 add_tsb_test(test_cluster test_cluster.cpp)
+
+# ---- 第 5 层：MPRAQ（MPA-01 LCTE 编码 + MPA-02 谓词解析）----
+add_tsb_test(test_mpraq_lcte test_mpraq_lcte.cpp LIBS tsb_mpraq)
+
+# ---- 第 1 层：core/iprf（FND-06，MPRAQ 检索底座）----
+add_tsb_test(test_iprf test_iprf.cpp)
+
+# ---- 第 5 层：MPRAQ（MPA-05 SecureMul 三方消息流）----
+add_tsb_test(test_mpraq_securemul test_mpraq_securemul.cpp LIBS tsb_mpraq tsb_net)
+
+# ---- 检索原语（PIR-04）：Plinko 六算法（MPRAQ 的检索底座）----
+add_tsb_test(test_plinko test_plinko.cpp LIBS tsb_pir)
+
+# ---- 第 5 层：MPRAQ（MPA-03 Init：服务器共享表 + 客户端七步）----
+add_tsb_test(test_mpraq_init test_mpraq_init.cpp LIBS tsb_mpraq tsb_pir tsb_net)
+add_tsb_test(test_mpraq_count test_mpraq_count.cpp LIBS tsb_mpraq tsb_pir tsb_net)
+# ---- 第 5 层：MPRAQ（MPA-06 Sum/Avg：批量 SecureMul 聚合）----
+add_tsb_test(test_mpraq_sum test_mpraq_sum.cpp LIBS tsb_mpraq tsb_pir tsb_net)
+# ---- 第 5 层：MPRAQ（MPA-07 恶意模型验证路径：系统级篡改注入矩阵 + 验证边界）----
+add_tsb_test(test_mpraq_malicious test_mpraq_malicious.cpp LIBS tsb_mpraq tsb_pir tsb_net)
+
+# ---- 第 5 层：MPRAQ（§9.2 S5 前置：MPRAQ 的传输层 = 真实 gRPC）----
+add_tsb_test(test_mpraq_grpc test_mpraq_grpc.cpp LIBS tsb_net_mpraq tsb_mpraq tsb_pir mpraq_proto)
+
+# ---- 第 5 层：MPRAQ（MPA-08 端到端 demo：真实 gRPC、客户端 + 两台服务器实例）----
+# 复用 `src/net/mpraq_remote_securemul.*`（两进程链路）与 `tests/support/mpraq_baseline.hpp`
+add_tsb_test(test_mpraq_e2e test_mpraq_e2e.cpp LIBS tsb_net_mpraq_remote)
+
+# ---- 第 5 层：MPRAQ（MPA-09 参数与复杂度验证：确定性公式/账目不变量）----
+# ⚠️ 只用结构/账目/公式类断言（铁律 D6，**不含计时断言**）；用例 ⑥⑧ 会**驱动 `bench_mpraq`
+# 二进制**（断言"超预算拒绝运行"与"`--json` 可解析"——这两条是**程序/契约**行为，
+# 在进程内调库函数证明不了）⇒ 必须依赖 `bench_mpraq` 目标并把它的路径编译进来。
+add_tsb_test(test_mpraq_scaling test_mpraq_scaling.cpp
+    LIBS tsb_net_mpraq_remote tsb_net_mpraq tsb_mpraq tsb_pir tsb_net)
+add_dependencies(test_mpraq_scaling bench_mpraq)
+target_compile_definitions(test_mpraq_scaling PRIVATE
+    MPRAQ_BENCH_BIN="$<TARGET_FILE:bench_mpraq>")
+
+# ---- 第 5 层：MPRAQ（规模配置层：行数/每属性列数/谓词数 ⇒ 其余自动派生）----
+# ⚠️ 确定性、**无计时断言**（铁律 D6）；用例 ⑧ 会读仓库内的示例配置
+# `config/mpraq_scale.json` ⇒ 把它的绝对路径编译进来（不依赖运行目录）。
+add_tsb_test(test_mpraq_scale_config test_mpraq_scale_config.cpp
+    LIBS tsb_mpraq tsb_pir tsb_net)
+target_compile_definitions(test_mpraq_scale_config PRIVATE
+    MPRAQ_SCALE_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/mpraq_scale.json")

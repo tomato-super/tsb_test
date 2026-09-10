@@ -227,9 +227,14 @@ std::vector<uint128_t> EncodeOneHotRows(const std::vector<uint64_t>& values,
 }
 
 std::vector<uint128_t> LcteEncode(int64_t x, const LcteParams& params) {
+    // 论文 §Left-Threshold Cumulative Encoding：
+    //   R = {r_1, ..., r_m}，本文取 R = {r_min, r_min+1, ..., r_min+m-1}，
+    //   LCTE(x) = ([x < r_1], ..., [x < r_m])。
+    // 1-based 的 r_i = range_min + i - 1，等价于 **0-based 列索引 i 的阈值为
+    // range_min + i**（此前实现误用 range_min + i + 1，整体偏移了 1）。
     std::vector<uint128_t> row(params.range_size, 0);
     for (uint32_t i = 0; i < params.range_size; ++i) {
-        const int64_t threshold = params.range_min + static_cast<int64_t>(i) + 1;
+        const int64_t threshold = params.range_min + static_cast<int64_t>(i);
         row[i] = (x < threshold) ? static_cast<uint128_t>(1) : static_cast<uint128_t>(0);
     }
     return row;

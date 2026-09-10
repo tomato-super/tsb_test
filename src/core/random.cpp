@@ -74,10 +74,23 @@ DeterministicPrng::DeterministicPrng(const std::array<uint8_t, kAesKeyBytes>& ke
     : prf_(key), nonce_(nonce), counter_(0) {}
 
 uint128_t DeterministicPrng::Next() {
-    // out = AES_key(nonce || counter)
-    return prf_.EvalDomainU32(PrfDomain::kDummyOffset,
-                              static_cast<uint32_t>(nonce_ >> 32),
-                              static_cast<uint32_t>(counter_++));
+    // out = AES_key( LE64(nonce) || LE64(counter) )
+    //
+    // ⚠️ 这里修掉了一个**共享底座缺陷**（FND-06 的实现过程中暴露）：
+    // 原实现是
+    //     EvalDomainU32(kDummyOffset, (uint32_t)(nonce_ >> 32), (uint32_t)counter_)
+    // 有两个问题：
+    //   1. `nonce_` 的**低 32 位被静默丢弃** ⇒ (key, nonce=99) 与 (key, nonce=100)
+    //      产生**完全相同**的密钥流。测试里到处写的 `DeterministicPrng(key, seed)`
+    //      因此可能拿到同一份"随机"数据，D6 的"确定性可复现"名不副实。
+    //   2. counter 被塞进 16 位域（w1 ≤ 0xFFFF）⇒ 流长上限 64 KiB 个块（1 MiB），
+    //      超出直接抛异常。
+    // 现在用完整 128 位输入块（nonce 与 counter 各占 8 字节小端），
+    // 非 2 的幂/长流/确定性三件事都不再受限。
+    uint8_t buf[kUint128Bytes];
+    toBytesLE(static_cast<uint128_t>(nonce_), buf);
+    toBytesLE(static_cast<uint128_t>(counter_++), buf + 8);
+    return prf_.Eval(fromBytesLE(buf));
 }
 
 uint128_t DeterministicPrng::Below(uint128_t bound) {

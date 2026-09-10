@@ -365,17 +365,32 @@ TEST(Encoding, OneHotRowsFlatLayoutIsRowMajor) {
 // ---------------------------------------------------------------------------
 
 TEST(Encoding, LcteBasicThresholds) {
-    // R = {10, 11, 12, 13, 14}（range_min=9, range_size=5）
-    // 阈值序列 r_1..r_m = 10, 11, 12, 13, 14
+    // 修正后的论文口径：R = {r_min, ..., r_min+m-1}，
+    // 0-based 列索引 i 的阈值 = r_min + i。
+    // 取 range_min = 10, range_size = 5 ⇒ R = {10, 11, 12, 13, 14}
+    // （r_1 = 10 = r_min，r_m = 14 = r_min + m - 1）。
+    //
+    // ⚠️ 注意参数选取的变化：这里刻意让 range_min 就等于 R 的最小元素，
+    // 以固化"第 0 列阈值 = range_min"（旧实现是 range_min + 1）。
     LcteParams p;
     p.range_size = 5;
-    p.range_min = 9;
+    p.range_min = 10;
 
-    // x = 9: 9 < 10,11,12,13,14 全部为真 -> 全 1
+    // x = 9 (< r_min): 9 < 10,11,12,13,14 全部为真 -> 全 1
     const auto v9 = LcteEncode(9, p);
     for (auto b : v9) EXPECT_EQ(b, static_cast<uint128_t>(1));
 
-    // x = 11: 11<10 假; 11<11 假; 11<12,13,14 真 -> {0,0,1,1,1}
+    // x = 10 (= r_min = 第 0 列的阈值):
+    //   10<10 假; 10<11,12,13,14 真 -> {0,1,1,1,1}
+    // （旧实现下这里会错误地给出全 1，正是被修正的偏移 1 缺陷）
+    const auto v10 = LcteEncode(10, p);
+    EXPECT_EQ(v10[0], static_cast<uint128_t>(0));
+    EXPECT_EQ(v10[1], static_cast<uint128_t>(1));
+    EXPECT_EQ(v10[2], static_cast<uint128_t>(1));
+    EXPECT_EQ(v10[3], static_cast<uint128_t>(1));
+    EXPECT_EQ(v10[4], static_cast<uint128_t>(1));
+
+    // x = 11 (= 第 1 列的阈值): 11<10,11 假; 11<12,13,14 真 -> {0,0,1,1,1}
     const auto v11 = LcteEncode(11, p);
     EXPECT_EQ(v11[0], static_cast<uint128_t>(0));
     EXPECT_EQ(v11[1], static_cast<uint128_t>(0));
@@ -383,7 +398,7 @@ TEST(Encoding, LcteBasicThresholds) {
     EXPECT_EQ(v11[3], static_cast<uint128_t>(1));
     EXPECT_EQ(v11[4], static_cast<uint128_t>(1));
 
-    // x = 14 (= r_m): 全部为假 -> 全 0
+    // x = 14 (= r_m = r_min + m - 1): 全部为假 -> 全 0
     const auto v14 = LcteEncode(14, p);
     for (auto b : v14) EXPECT_EQ(b, static_cast<uint128_t>(0));
 
@@ -392,37 +407,38 @@ TEST(Encoding, LcteBasicThresholds) {
     for (auto b : v100) EXPECT_EQ(b, static_cast<uint128_t>(0));
 }
 
-TEST(Encoding, LcteIsMonotoneNonIncreasing) {
-    // 论文强调的"累积"性质：LCTE(x) 随列索引 i 增大而**非增**。
-    // 合法的形状只有两种：全 1、全 0，或"先若干 1 后全是 0"。
-    // 也就是说，一旦出现 1 -> 0，之后不允许再出现 0 -> 1。
+TEST(Encoding, LcteIsMonotoneNonIncreasingInValue) {
+    // 关于**取值**的单调性（论文："The monotonicity of the resulting vector
+    // ... reflects the cumulative nature"）：
+    //   x1 < x2  ⇒  LCTE(x1) 的每个分量 ≥ LCTE(x2) 的对应分量
+    // 因为对每个固定阈值 r_i 都有 [x1 < r_i] ≥ [x2 < r_i]。
+    // 等价说法：1 的位置随 x 增大而整体左移。
+    //
+    // ⚠️ 原用例写的是"关于列索引"的形状检查，且判据 saw_one_to_zero 在合法的
+    // 0...01...1 形状下恒为假，整段断言实际空转（方向也写反了：行向量关于列
+    // 索引是**非减**的）。这里改为按取值域穷举、逐分量比较，属性才真正生效；
+    // 列索引方向的形状断言见 LcteShapeIsPrefixOfZeros。
     LcteParams p;
     p.range_size = 8;
     p.range_min = 0;
-    for (int64_t x = -2; x <= 10; ++x) {
-        const auto row = LcteEncode(x, p);
-        bool saw_one_to_zero = false;
-        for (size_t i = 1; i < row.size(); ++i) {
-            const uint128_t prev = row[i - 1];
-            const uint128_t cur = row[i];
-            if (prev == 1 && cur == 0) {
-                saw_one_to_zero = true;
-            }
-            if (saw_one_to_zero) {
-                // 掉下去之后不能再升回来
-                EXPECT_TRUE(!(prev == 0 && cur == 1));
+    for (int64_t x1 = -3; x1 <= 9; ++x1) {
+        for (int64_t x2 = x1 + 1; x2 <= 10; ++x2) {
+            const auto a = LcteEncode(x1, p);
+            const auto b = LcteEncode(x2, p);
+            for (size_t i = 0; i < a.size(); ++i) {
+                EXPECT_TRUE(a[i] >= b[i]);
             }
         }
     }
 }
 
 TEST(Encoding, LcteShapeIsPrefixOfZeros) {
-    // 合法行的形式必然是 0...01...1（随列索引 i 增大而**非减**的补集形态）。
-    // 直观理解：阈值 r_i 随 i 递增，x < r_i 越来越容易成立，
-    // 所以行向量是从 0 过渡到 1，且只会过渡一次。
+    // 合法行的形状必然是 0...01...1：关于列索引 i **非减**（一旦变成 1 就不会
+    // 再回到 0）。直观理解：阈值 r_i = range_min + i 随 i 递增，x < r_i 越来越
+    // 容易成立，所以 0→1 只会发生一次。
     LcteParams p;
     p.range_size = 10;
-    p.range_min = -5;
+    p.range_min = -5;  // 负数阈值：R = {-5, -4, ..., 4}
     for (int64_t x = -6; x <= 5; ++x) {
         const auto row = LcteEncode(x, p);
         bool seen_one = false;
@@ -435,22 +451,27 @@ TEST(Encoding, LcteShapeIsPrefixOfZeros) {
                 EXPECT_FALSE(seen_one);  // 0 不能出现在 1 之后
             }
         }
-        // 阈值 r_i = range_min + i + 1，统计满足 x < r_i 的列数
+        // 阈值 r_i = range_min + i（0-based 列索引 i），统计满足 x < r_i 的列数
         size_t expected_ones = 0;
         for (uint32_t i = 0; i < p.range_size; ++i) {
-            if (x < p.range_min + static_cast<int64_t>(i) + 1) ++expected_ones;
+            if (x < p.range_min + static_cast<int64_t>(i)) ++expected_ones;
         }
         EXPECT_EQ(ones, expected_ones);
     }
+    // 两侧边界的显式断言（x < r_min ⇒ 全 1；x >= r_max ⇒ 全 0）
+    for (auto b : LcteEncode(-6, p)) EXPECT_EQ(b, static_cast<uint128_t>(1));
+    for (auto b : LcteEncode(4, p)) EXPECT_EQ(b, static_cast<uint128_t>(0));
+    for (auto b : LcteEncode(5, p)) EXPECT_EQ(b, static_cast<uint128_t>(0));
 }
 
 TEST(Encoding, LcteOneCountEqualsPosition) {
-    // 对 x = r_k，恰好有 (k-1) 个 1（因为 x < r_i 当且仅当 i > k-1）
+    // 对 x = r_k（1-based 的 r_k = range_min + k - 1），恰好有 (m - k) 个 1：
+    // 列 i（0-based）的阈值是 range_min + i = r_{i+1}，x < r_{i+1} ⟺ i + 1 > k ⟺ i ≥ k。
     LcteParams p;
     p.range_size = 6;
-    p.range_min = 100;  // 阈值 101..106
+    p.range_min = 100;  // 阈值集合 R = {100, 101, ..., 105}
     for (int64_t k = 1; k <= 6; ++k) {
-        const int64_t x = 100 + k;  // = r_k
+        const int64_t x = p.range_min + (k - 1);  // = r_k
         const auto row = LcteEncode(x, p);
         size_t ones = 0;
         for (auto b : row) {
@@ -463,15 +484,18 @@ TEST(Encoding, LcteOneCountEqualsPosition) {
 TEST(Encoding, LcteRowsFlatLayoutIsRowMajor) {
     LcteParams p;
     p.range_size = 2;
-    p.range_min = 0;  // 阈值 1, 2
-    const auto flat = EncodeLcteRows({0, 2}, p);
-    // x=0: 0<1 真, 0<2 真 -> {1,1}
-    // x=2: 2<1 假, 2<2 假 -> {0,0}
-    EXPECT_EQ(flat.size(), static_cast<size_t>(4));
+    p.range_min = 0;  // 阈值集合 R = {0, 1}（第 0 列阈值 0，第 1 列阈值 1）
+    const auto flat = EncodeLcteRows({-1, 0, 1}, p);
+    // x=-1 (< r_min): -1<0 真, -1<1 真 -> {1,1}
+    // x= 0 (= r_min):  0<0 假,  0<1 真 -> {0,1}
+    // x= 1 (= r_m):    1<0 假,  1<1 假 -> {0,0}
+    EXPECT_EQ(flat.size(), static_cast<size_t>(6));
     EXPECT_EQ(flat[0], static_cast<uint128_t>(1));
     EXPECT_EQ(flat[1], static_cast<uint128_t>(1));
     EXPECT_EQ(flat[2], static_cast<uint128_t>(0));
-    EXPECT_EQ(flat[3], static_cast<uint128_t>(0));
+    EXPECT_EQ(flat[3], static_cast<uint128_t>(1));
+    EXPECT_EQ(flat[4], static_cast<uint128_t>(0));
+    EXPECT_EQ(flat[5], static_cast<uint128_t>(0));
 }
 
 // ---------------------------------------------------------------------------
