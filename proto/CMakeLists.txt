@@ -1,37 +1,35 @@
+# gRPC 接口定义。
+#
+# 历史说明：早期的 pir_comm.proto（表上传接口）已随 src/common、src/client、
+# src/server 一并移除（决策 D9）。当前只有 vmpq.proto 一个协议文件，
+# 服务于 src/apps 的端到端 demo 与真实 gRPC 通道。
+
 set(_PROTOBUF_PROTOC "$ENV{HOME}/.local/bin/protoc")
 set(_GRPC_CPP_PLUGIN "$ENV{HOME}/.local/bin/grpc_cpp_plugin")
 
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gen/pir")
-set(PIR_PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/pir_comm.proto")
-set(PIR_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/gen/pir")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gen/vmpq")
+set(VMPQ_PROTO_FILE "${CMAKE_CURRENT_SOURCE_DIR}/vmpq.proto")
+set(VMPQ_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/gen/vmpq")
 
-get_filename_component(PROTO_NAME ${PIR_PROTO_FILE} NAME_WE)
 add_custom_command(
     OUTPUT
-        "${PIR_GEN_DIR}/${PROTO_NAME}.pb.cc"
-        "${PIR_GEN_DIR}/${PROTO_NAME}.pb.h"
-        "${PIR_GEN_DIR}/${PROTO_NAME}.grpc.pb.cc"
-        "${PIR_GEN_DIR}/${PROTO_NAME}.grpc.pb.h"
+        "${VMPQ_GEN_DIR}/vmpq.pb.cc"
+        "${VMPQ_GEN_DIR}/vmpq.pb.h"
+        "${VMPQ_GEN_DIR}/vmpq.grpc.pb.cc"
+        "${VMPQ_GEN_DIR}/vmpq.grpc.pb.h"
     COMMAND ${_PROTOBUF_PROTOC}
         --proto_path=${CMAKE_CURRENT_SOURCE_DIR}
-        --cpp_out=${PIR_GEN_DIR}
-        --grpc_out=${PIR_GEN_DIR}
+        --cpp_out=${VMPQ_GEN_DIR}
+        --grpc_out=${VMPQ_GEN_DIR}
         --plugin=protoc-gen-grpc=${_GRPC_CPP_PLUGIN}
-        ${PIR_PROTO_FILE}
-    DEPENDS ${PIR_PROTO_FILE}
-    COMMENT "Generating C++/gRPC sources for ${PROTO_NAME}"
+        ${VMPQ_PROTO_FILE}
+    DEPENDS ${VMPQ_PROTO_FILE}
+    COMMENT "Generating C++/gRPC sources for vmpq"
 )
 
-list(APPEND PIR_SRCS
-    "${PIR_GEN_DIR}/${PROTO_NAME}.grpc.pb.cc"
-    "${PIR_GEN_DIR}/${PROTO_NAME}.pb.cc"
+add_library(vmpq_proto
+    "${VMPQ_GEN_DIR}/vmpq.grpc.pb.cc"
+    "${VMPQ_GEN_DIR}/vmpq.pb.cc"
 )
-
-list(APPEND PIR_HDRS
-    "${PIR_GEN_DIR}/${PROTO_NAME}.grpc.pb.h"
-    "${PIR_GEN_DIR}/${PROTO_NAME}.grpc.pb.h"
-)
-
-add_library(pir_proto ${PIR_SRCS} ${PIR_HDRS})
-target_include_directories(pir_proto PUBLIC ${PIR_GEN_DIR})
-target_link_libraries(pir_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+target_include_directories(vmpq_proto PUBLIC ${VMPQ_GEN_DIR})
+target_link_libraries(vmpq_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)

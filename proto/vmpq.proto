@@ -1,0 +1,74 @@
+// VMPQ 线上协议（取代早期的 pir_comm.proto 表上传接口）。
+//
+// 设计口径（决策 Q5，负责人裁决）：
+//   VMPQ 的 PIR 一次查询产生一个查询集，无法避免"把所有谓词发过去"。
+//   因此在线阶段**一次请求携带全部谓词的全部查询集**，客户端在本地做谓词组合。
+//   这也顺带摊薄了"每列 ⌈N/128⌉ 个 word 各需一次 PIR"带来的往返次数。
+//
+// 三层消息：
+//   InitTable   —— 分配服务器侧存储（论文 Algorithm 2）
+//   UploadEntries —— 装载共享（论文 Algorithm 3；一次性装载，决策 D8）
+//   PirQuery    —— 在线检索（论文 Algorithm 4/5 的 Query/Answer）
+//
+// ⚠️ 半诚实版本移除全部 proof（决策 D16）：协议里**没有**任何验证值字段。
+
+syntax = "proto3";
+
+package vmpq;
+
+service VmpqService {
+    // 初始化：按 schema 分配 one-hot 索引表存储
+    rpc InitTable (InitTableRequest) returns (InitTableResponse) {}
+
+    // 装载：上传一段只属于**本服务器**的 XOR 共享（决策 D12）
+    rpc UploadEntries (UploadEntriesRequest) returns (UploadEntriesResponse) {}
+
+    // 在线查询：一次发送全部谓词的全部查询集
+    rpc PirQuery (PirQueryRequest) returns (PirQueryResponse) {}
+}
+
+message InitTableRequest {
+    uint32 window_size = 1;        // N
+    repeated uint32 attr_sizes = 2;  // 每个属性的取值域 2^{l_a}
+}
+
+message InitTableResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
+message UploadEntriesRequest {
+    uint64 base_index = 1;   // 起始扁平条目号
+    // 每个元素 16 字节（小端 uint128）。必须恰好是本服务器的共享，
+    // 不得上传明文——服务器之间不共谋是协议的安全前提。
+    repeated bytes entries = 2;
+}
+
+message UploadEntriesResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
+// 单个 word 的一次 PIR 查询：每个分区恰好一个偏移 + 一个分组比特。
+// 服务器视角下不同查询的 (offsets, groups) 联合分布相同，故不泄露目标。
+message PirQuerySet {
+    repeated uint32 offsets = 1 [packed = true];  // 长度 = part_num，每个 < part_size
+    repeated uint32 groups = 2 [packed = true];   // 长度 = part_num，取值 0/1
+}
+
+message PirQueryRequest {
+    // queries[j] 对应第 j 个待检索目标。
+    // ⚠️ 客户端会把**所有谓词的所有 word** 一次性放进这里（Q5），
+    //    而不是逐个谓词往返。
+    repeated PirQuerySet queries = 1;
+}
+
+message PirAnswer {
+    bytes acc0 = 1;  // 16 字节，分组比特为 0 的条目之 XOR
+    bytes acc1 = 2;  // 16 字节，分组比特为 1 的条目之 XOR
+}
+
+message PirQueryResponse {
+    repeated PirAnswer answers = 1;
+    string error = 2;
+}

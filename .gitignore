@@ -1,5 +1,7 @@
 build/
 config/
 proto/gen
-third_part/
+third_parts/
 .vscode/
+doc/paper
+doc/design
