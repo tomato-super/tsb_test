@@ -84,7 +84,7 @@ void RequireSecureMulModulus(uint128_t q) {
     if ((q & 1u) == 0) {
         throw std::invalid_argument(
             "SecureMulFlow: 模数 q 必须为奇数（Z_{2^k} 中 2 不可逆，公式里的 "
-            "e·d·2^{-1} 无定义；见 TASK_PLAN 决策 D11）");
+            "SPDZ MAC 需要 α 可逆；见 TASK_PLAN 决策 D11 与论文 §xmac）");
     }
     if (q > (static_cast<uint128_t>(1) << 127)) {
         throw std::invalid_argument(
@@ -346,12 +346,11 @@ Phase2Response SecureMulServerState::RunPhase2(const Phase2Request& req) {
     }
     stage_ = Stage::kConsumed;
 
-    // ⚠️ 这里落地的是 §2 的公式（论文原文 vs 修正式）：
-    //   z_p   = ⟨c⟩_p + d·⟨b⟩_p + e·⟨a⟩_p + e·d·2^{-1}      ← 与论文 (P-z) 相同
-    //   mac_p = ⟨αc⟩_p + d·⟨αb⟩_p + e·⟨αa⟩_p + ⟨α⟩_p·e·d    ← 论文 (P-mac) 去掉末项 2^{-1}
+    // ⚠️ 这里落地的是 §2 的公式（**已按新版论文对齐**）：
+    //   z_p   = ⟨c⟩_p + d·⟨b⟩_p + e·⟨a⟩_p        ← 纯线性，无 e·d 项
+    //   mac_p = ⟨αc⟩_p + d·⟨αb⟩_p + e·⟨αa⟩_p     ← 纯线性，无 ⟨α⟩_p·e·d 项
     // 两个公式都在 `tsb::SecureMulServerPhase2` 里，本模块只做搬运。
-    // （z 侧那个 2^{-1} 被"两台服务器各贡献一次"抵消，因此**不能**去掉；
-    //   mac 侧的 2^{-1} 若不删则校验恒失败 —— 详见头文件 §2 的推导。）
+    // 公开项 `e·d` 由客户端在 `VerifyAndReconstruct` 里**验证通过之后**补出。
     const SecureMulServerInput in{attribute_share_, triple_};
     const SecureMulRound2 r2 = SecureMulServerPhase2(in, req.d, req.e, q_);
     Phase2Response out;
@@ -791,18 +790,51 @@ SecureMulFlowResult VerifyAndReconstruct(
 
     // z = z_0 + z_1、mac = mac_0 + mac_1
     //
-    // ⚠️ 公式检查点（§2）：`shared/mpc` 的 z_p 末项含 2^{-1} 且**两台各算一次**，
-    //    因此 z = c + d·b + e·a + 2·(e·d·2^{-1}) = f·E；
-    //    而 mac_p 末项是 ⟨α⟩_p·e·d（**没有** 2^{-1}），两台相加得 α·e·d，
-    //    与 α·z 的末项 α·e·d 对齐 ⇒ mac == α·z。
-    //    若有人"顺手"把 z 末项的 2^{-1} 也去掉，z 会变成 f·E + d·e，恒错。
+    // ⚠️ 公式检查点（§2，**已按新版论文对齐**）：服务端只算纯线性部分
+    //        z_lin = c + d·b + e·a,   mac = α·(c + d·b + e·a) = α·z_lin
+    //    ⇒ `mac == α·z_lin` 成立（注意两侧都是**线性部分**）；
+    //    公开项 `e·d` 由**客户端**在上面校验通过后补出 ⇒ 最终 z = f·E。
+    //    ⚠️ 两处"顺手改动"都会坏：
+    //      ① 若把 `e·d` 加回服务端，需要 `2^{-1}`（特征 2 里不存在），且破坏论文
+    //         可靠性论证所依赖的"服务端表达式纯线性"形式；
+    //      ② 若在客户端**先加再校验**，`mac ?= α·z` 两侧不等 ⇒ 诚实流程也失败。
     const AuthenticatedShare a0{phase2.first.z_share, phase2.first.mac_share};
     const AuthenticatedShare a1{phase2.second.z_share, phase2.second.mac_share};
     const MacVerificationResult v =
         VerifyAuthenticatedDetailed(a0, a1, client.alpha(), q);
-    out.z = v.z;
     out.mac = v.mac;
     out.expected_mac = v.expected_mac;
+
+    // ⚠️ **公开项 `e·d` 由客户端在验证通过之后补上**（新版论文 :556-562）。
+    //    服务端只返回**线性**部分 `z_lin = c + d·b + e·a`，其 MAC 恰好是 `α·z_lin`
+    //    ⇒ `mac ?= α·z_lin` 先校验；真正的乘积是
+    //        z_lin + e·d = (a+d)(b+e) = f·E .
+    //    客户端知道 `d = f − a`（它自己算并发出去的）与 `e`（它自己重建并中转的），
+    //    所以这一个域乘完全可以在本地做，**不需要**服务端折入、也不需要 `2^{-1}`。
+    //
+    //    ⚠️ **顺序不能反**：必须先校验 `mac ?= α·z_lin` 再加 `e·d`；
+    //       先加会让两侧不等 ⇒ 诚实流程也会失败。
+    //    ⚠️ **不能省略**：旧实现把 `e·d·2^{-1}` 折进了服务端，所以那时 `z` 已是完整乘积；
+    //       改成客户端补之后，若这里不加，`z` 会**静默偏小 `e·d`**。
+    //    ⚠️ 特征 2 的理由：`GF(2^ℓ)` / `Z_{2^k}` 里 `2` 不可逆，"服务端各给一半"不成立
+    //       （且特征 2 下 `x ⊕ x = 0`，没有"各给一半"的类比）⇒ 客户端补是唯一可行做法。
+    if (v.ok) {
+        if (triple == nullptr) {
+            // 客户端不知道 `a` ⇒ 算不出 `d` ⇒ 补不出公开项。
+            // **不能静默返回偏小的 z**：那会让上层聚合出错误结果。
+            out.error =
+                "SecureMulFlow: 需要 triple 才能补公开项 e·d（客户端必须知道 a 以算 d = f − a）"
+                "；调用方传了 triple = nullptr ⇒ 无法重建完整乘积，abort 当前查询";
+            out.failure = SecureMulFailure::kClientLocalCheckFailed;
+            return out;
+        }
+        const uint128_t d_public = subMod(reduce(f, q), reduce(triple->a, q), q);
+        out.z = addMod(reduce(v.z, q), mulMod(reduce(e_sent, q), d_public, q), q);
+    } else {
+        // 校验失败：z 无意义（上层按失败处理并置 0）。保持与旧行为一致地写出重建值，
+        // 便于诊断；**绝不**允许调用方把它当有效值（见下面 out.ok 的语义）。
+        out.z = v.z;
+    }
 
     // =======================================================================
     // 第 3 层（v3 新增）：§4.5-A 复核"z 与客户端本地视角的属性值一致"

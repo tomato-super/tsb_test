@@ -11,23 +11,23 @@ void RequireOddModulus(uint128_t q) {
         throw std::invalid_argument("SecureMul: 模数 q 必须 >= 3");
     }
     if ((q & 1u) == 0) {
-        // 决策 D11：偶数模数下 2 不可逆，SecureMul 公式中的 e·d·2^{-1} 无定义
+        // ⚠️ 本检查的**理由已变**（2026-10-08，对齐新版论文）：
+        //    SecureMul 不再使用 `2^{-1}`（公开项 `e·d` 改由客户端在验证后补），
+        //    因此"偶数模数下 e·d·2^{-1} 无定义"这条**不再是**本检查的动机。
+        //    现在要求奇数的真实理由是 **SPDZ MAC 需要域**：`mac = α·z` 要求 α 可逆，
+        //    而 `Z_{2^k}` 里 α 可能是偶数（不可逆）⇒ 非零偏差未必可逆 ⇒ 恶意服务器
+        //    可返回任意错值而校验仍通过（论文 :137-141 对同类失败的说明）。
+        //    ⚠️ 本函数只校验**奇数**（廉价的必要条件）；**素数性**由调用方与
+        //    决策 D11 / `core/field` 保证，本函数不做素性测试。
         throw std::invalid_argument(
-            "SecureMul: 模数 q 必须为奇数（Z_{2^k} 中 2 不可逆，"
-            "公式里的 e·d·2^{-1} 无定义；见 TASK_PLAN 决策 D11）");
+            "SecureMul: 模数 q 必须为奇数（SPDZ MAC 需要域：Z_{2^k} 里 α 可能不可逆，"
+            "非零偏差未必可逆 ⇒ 校验可被绕过；见 TASK_PLAN 决策 D11 与论文 §xmac）");
     }
     if (q > (static_cast<uint128_t>(1) << 127)) {
         throw std::invalid_argument(
             "SecureMul: 模数 q 必须 <= 2^127（core/field 的 modmul 约束）");
     }
 }
-
-namespace {
-
-// 2^{-1} mod q，q 为奇数
-uint128_t Inv2(uint128_t q) { return modInverse(static_cast<uint128_t>(2), q); }
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // triple 生成与共享
@@ -99,32 +99,37 @@ SecureMulRound1 SecureMulServerPhase1(const SecureMulServerInput& in, uint128_t 
 SecureMulRound2 SecureMulServerPhase2(const SecureMulServerInput& in, uint128_t d,
                                       uint128_t e, uint128_t q) {
     RequireOddModulus(q);
-    const uint128_t inv2 = Inv2(q);
 
-    // ⟨z⟩_p = ⟨c⟩_p + d·⟨b⟩_p + e·⟨a⟩_p + e·d·2^{-1}
+    // ⚠️ 公式**已按新版论文对齐**（2026-10-08）：服务端只算**纯线性**部分，
+    //    公开项 `e·d` **不由服务端折入**，而是由客户端在 MAC 校验通过后补上。
+    //
+    //    ⟨z⟩_p   = ⟨c⟩_p + d·⟨b⟩_p + e·⟨a⟩_p                 （无 e·d）
+    //    ⟨mac⟩_p = ⟨αc⟩_p + d·⟨αb⟩_p + e·⟨αa⟩_p              （无 ⟨α⟩_p·e·d）
+    //
+    //    于是两台求和：z = c + d·b + e·a，mac = α·(c + d·b + e·a) = α·z ✔
+    //    客户端校验通过后输出 `z + e·d = (a+d)(b+e) = f·E` ✔
+    //
+    // 为什么必须这样（两条理由，指向同一改法）：
+    //   ① 论文 :556-557 明确：`e·d` **故意**不折进服务端表达式，
+    //      "keeps the servers' expressions purely linear in their shares,
+    //       which is the form the soundness argument relies on"；
+    //   ② 折进服务端需要 `2^{-1}`（两台各给一半才能凑成整份），而
+    //      **特征 2 的域/环（GF(2^ℓ) / Z_{2^k}）里 `2` 不可逆**；更强的是，
+    //      在特征 2 下"两台各加一次"恒为 `x ⊕ x = 0`，**没有"各给一半"的类比**。
+    //      ⇒ 只要层可能落在特征 2，客户端补公开项就是**唯一**可行做法。
+    //    （旧实现用 `e·d·2^{-1}` + `⟨α⟩_p·e·d`，在 `Z_q`（奇素数）下结果等价，
+    //      但它破坏了 ① 的形式、且绑定了奇特征；决策 D14 的勘误仍然有效：
+    //      **mac 末项绝不能再乘 `2^{-1}`**，否则 `mac ≠ α·z` 恒失败。）
+    //
+    // ⚠️ 易错点：`in.triple.*.value` 是**本服务器分片**，不是重建值；
+    //    本函数算的是"单台分片"，两台求和才等于 z/mac。
     uint128_t z = in.triple.c.value;
     z = addMod(z, mulMod(d, in.triple.b.value, q), q);
     z = addMod(z, mulMod(e, in.triple.a.value, q), q);
-    z = addMod(z, mulMod(mulMod(e, d, q), inv2, q), q);
 
-    // ⟨mac⟩_p = ⟨αc⟩_p + d·⟨αb⟩_p + e·⟨αa⟩_p + ⟨α⟩_p·e·d
-    //
-    // ⚠️ **勘误**：MPRAQ 论文 Algorithm 5 把最后一项写成 `⟨α⟩_p·e·d·2^{-1}`，
-    // 这是错的——照抄会导致 `mac ≠ α·z`，MAC 校验恒失败（见决策 D14）。
-    //
-    // 推导（2026-09-10 用精确整数模型复核，三种约定各 200 轮；见 D14）：
-    //     z 侧：两台各给 `e·d·2^{-1}`，求和 = `e·d` ⇒ z = c + d·b + e·a + e·d ✔ = x·y
-    //     mac 侧：α **本身是加法共享的**，两台各给 `⟨α⟩_p·e·d` 时和恰为 `α·e·d`
-    //            ⇒ mac = αc + d·αb + e·αa + α·e·d ✔ = α·z
-    //     论文把 mac 末项写成 `⟨α⟩_p·e·d·2^{-1}`，求和后比 `α·z` **少 `α·e·d/2`** ⇒ 校验恒失败。
-    // ⚠️ 因此 **z 侧的 `2^{-1}` 不能删**（两台各一份正好凑成 1），只删 mac 侧那一个。
-    //     实测：论文写法 0/200 通过、本写法 200/200 通过。
-    // ⚠️ 另一个易错点：`in.triple.*.value` 是**本服务器分片**，不是重建值；
-    //     本函数算的是"单台分片"，两台求和才等于 z/mac。
     uint128_t mac = in.triple.alpha_c.value;
     mac = addMod(mac, mulMod(d, in.triple.alpha_b.value, q), q);
     mac = addMod(mac, mulMod(e, in.triple.alpha_a.value, q), q);
-    mac = addMod(mac, mulMod(in.triple.alpha.value, mulMod(e, d, q), q), q);
 
     return SecureMulRound2{ModShare{z}, ModShare{mac}};
 }
@@ -158,8 +163,15 @@ SecureMulResult SecureMulRun(uint128_t x, const SecureMulServerInput& share0,
     const AuthenticatedShare a0{r2_0.z, r2_0.mac};
     const AuthenticatedShare a1{r2_1.z, r2_1.mac};
     out.mac_result = VerifyAuthenticatedDetailed(a0, a1, keys.alpha, q);
-    out.z = out.mac_result.z;
     out.ok = out.mac_result.ok;
+    out.z = out.mac_result.z;
+    // 6. **验证通过后**才补公开项（新版论文 :556-562）：
+    //    服务端只给了线性部分 `z = c + d·b + e·a`（其 MAC 恰好是 `α·z`），
+    //    真正的乘积累 `z + e·d = (a+d)(b+e) = x·y` 由客户端补。
+    //    ⚠️ 顺序不能反：先补再校验会让 `mac ?= α·z` 两侧不等。
+    if (out.ok) {
+        out.z = addMod(out.z, mulMod(e, d, q), q);
+    }
     return out;
 }
 
