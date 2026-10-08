@@ -14,7 +14,12 @@ proto/gen
 .DS_Store
 
 # 第三方 vendor（体积大、非本项目代码；构建时仍需它在磁盘上）
-third_parts/
+third_parts/*
+# ⚠️ 例外：`json/json.hpp` 是本项目**构建必需**的单头文件（CMake 直接 include），
+#    且**不是**自动生成的 ⇒ 必须入库，否则全新 clone 连 `cmake` 都过不了。
+#    （必须写成 `third_parts/*` 而非 `third_parts/`：gitignore 不允许在被排除的
+#      父目录下重新纳入文件。）
+!third_parts/json/
 
 # 论文目录：只忽略大体积二进制，源码/文本仍入库
 doc/paper/*.pdf
