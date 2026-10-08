@@ -24,30 +24,30 @@
 //   ③ `N ≥ 2^16` 不支持（两进程安装帧会到 ~80 MB，需分块安装，未实现）。
 //
 // ===========================================================================
-// 1. 口径（每个数字都必须能回答"这是进程内还是两进程？是区块访问还是 word 查询还是 RPC？"）
+// 1. 口径（每个数字都必须能回答"这是进程内还是两进程？是区块访问还是查询集还是 RPC？"）
 // ===========================================================================
 //   | 量 | 口径 |
 //   |---|---|
 //   | `mode=local` | 进程内 `LocalTransport` + 进程内 `MpraqNode`（无序列化/无回环） |
 //   | `mode=grpc-two-process` | 真实 gRPC、**两个服务器进程**（`mpraq_server`），
 //   |              | 客户端通过 `GrpcMpraqChannel`（数据 RPC）+ `Relay`（SecureMul）接入 |
-//   | 查询集数 | = 一个 128 位 word 的一次 PIR 检索 = `列数 × ⌈N/128⌉`（**不是** RPC） |
+//   | 查询集数 | = **一个条目**的一次 PIR 检索 = `列数`（一个条目 = 一整列；**不是** RPC） |
 //   | RPC 次数 | = `ServerRespBatch` 调用次数；**一次 `RunBatch` 恒 1**（与批次大小无关） |
-//   | 区块访问量 | = 查询集数 × `c`（`c = n/w`；论文 `Õ(n/r)` 的实数化口径） |
-//   | `word` 查询 | 与"查询集"同义（1 个 word = 1 个查询集） |
+//   | 区块访问量 | = 查询集数 × `kappa`（`kappa = m/w`；论文 `Õ(n/r)` 的实数化口径） |
+//   | 条目宽度 | `entry_words = ⌈n/128⌉` 个字；应答与缓存都按**整条目**搬运 |
 //   | 安装段（D34） | 两进程下每次 `Sum` 把 `N` 条 `SecureMulServerSetup` 下发给**每台**
 //   |              | ⇒ `install_bytes = 2×(13+152N)`，**单列**、不并入 `wire_messages` |
-//   | 服务器存储 | §1 公式 `16·m·⌈N/128⌉ + 16·N·|attrs|`（`m` = **补齐后**列数）；双报补齐前 |
+//   | 服务器存储 | `16·m·entry_words + 16·n·|attrs|`（`m` = **补齐后**条目数）；双报"不含补齐" |
 //
 // ===========================================================================
-// 2. L14 查询预算（**先算清楚再跑**，绝不跑到一半抛异常）
+// 2. 查询预算（台账 L14；**先算清楚再跑**，绝不跑到一半抛异常）
 // ===========================================================================
 // 两条硬上限（`TASK_PLAN.md` 台账 L14）：
-//   ① 每次 word 查询消费 1 条常规 hint 并提升 1 条备份 ⇒ 一次离线支持 `q = λw/2` 次；
-//   ② 重复访问同一 `(列, word)` 要另取"未答复过"的新索引 ⇒ 新鲜索引池 `n = m·⌈N/128⌉`。
-// ⇒ 本程序在**任何** Init/查询之前先算 `planned_words = 列数 × ⌈N/128⌉ × 重复次数`，
-//   与 `min(q, n)` 比较；超预算就**拒绝运行**并给出可读算式（退出码 **3**），
-//   绝不把失败推迟到 `PlinkoBackupsExhausted`（那是"跑到一半炸"，不是参数校验）。
+//   ① 每次查询消费 1 条常规 hint 并提升 1 条备份 ⇒ 一次离线支持 `N_T = λw/2` 次；
+//   ② 重复访问同一**条目**要另取"未答复过"的新索引 ⇒ 新鲜索引池 = `m`。
+// ⇒ 本程序在**任何** Init/查询之前先算 `planned_sets = 列数 × 重复次数`
+//   （**一列 = 一个条目 = 1 个查询集**），与 `min(N_T, m)` 比较；
+//   超预算就**拒绝运行**（退出码 **3**），绝不把失败推迟到 `PlinkoBackupsExhausted`。
 //
 // ===========================================================================
 // 3. 机器可读输出（`MPA-10` / 自动汇总用）
@@ -121,11 +121,6 @@ std::string Num(uint64_t v) { return std::to_string(v); }
 
 // 与 `mpraq/init.cpp` 的 `NextPow2` 同义（那份在匿名命名空间里 ⇒ 这里只用于**报告**
 // "升级前的最小补齐列数 m0"，与几何推导本身无关）
-uint64_t NextPow2Local(uint64_t v) {
-    uint64_t p = 1;
-    while (p < v && p < (static_cast<uint64_t>(1) << 62)) p <<= 1;
-    return p;
-}
 std::string NumD(double v, int prec = 2) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(prec) << v;
@@ -357,6 +352,9 @@ struct Options {
     uint32_t lambda = 80;
     double eps = 1e-4;
     uint64_t seed = 7;
+    // 运行方式（安全档位）——**接口预留**（`src/mpraq/security_mode.hpp`）。
+    // 默认恶意档；`--security-mode semi-honest` 显式 opt-in（严格解析，非法值拒绝启动）。
+    MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
     uint64_t prng_seed = 11;
     uint64_t w = 0;                  // 0 = 自动派生；否则显式 w（必须 2 的幂）
     std::vector<uint64_t> w_list;    // init-w / storage 用的显式 w 网格
@@ -374,6 +372,9 @@ struct Options {
     bool keep_servers = false;        // 调试：跑完不杀自己起的服务器
     int sum_attr = 1;
     bool quick = false;
+    // 默认只打一行 `[规模]` 摘要（连同表格已给出的几何）；`--verbose` 追加 `est.Report()`
+    // 的完整派生明细。**只影响人读输出**：`--json` 契约与 L14 拒绝路径不受影响。
+    bool verbose = false;
     // ---- 规模配置层（行数 / 每属性列数 / 谓词数 ⇒ 其余自动派生）----
     // `--config FILE` + `--columns-per-attribute C`（= 每属性列数，JSON 的
     // `columns_per_attribute`）、`--attributes A`、`--predicates K`；`--rows/--lambda/--eps/
@@ -467,6 +468,8 @@ Options ParseArgs(int argc, char** argv) {
         } else if (a == "--seed") {
             o.seed = std::stoull(next("--seed"));
             o.has_seed = true;
+        } else if (a == "--security-mode") {
+            o.security_mode = ParseMpraqSecurityMode(next("--security-mode"));
         } else if (a == "--prng-seed") {
             o.prng_seed = std::stoull(next("--prng-seed"));
         } else if (a == "--w") {
@@ -519,15 +522,18 @@ Options ParseArgs(int argc, char** argv) {
             o.allow_large_n = true;
         } else if (a == "--quick") {
             o.quick = true;
+        } else if (a == "--verbose" || a == "-v") {
+            o.verbose = true;
         } else if (a == "--help" || a == "-h") {
             std::cout
                 << "用法: mpraq_bench [--exp online|sum|init-w|storage|tradeoff|all]\n"
                    "                   [--mode local|grpc] [--rows 1024,2048,...]\n"
                    "                   [--lambda 80] [--eps 1e-4] [--w 0|2^k]\n"
                    "                   [--predicate range|conj] [--columns K] [--repeat R]\n"
-                   "                   [--no-sum] [--json] [--json-out FILE]\n"
+                   "                   [--security-mode malicious|semi-honest] [--no-sum] [--json] [--json-out FILE]\n"
                    "                   [--server0 host:port --server1 host:port]\n"
                    "                   [--spawn-servers PATH_TO_mpraq_server] [--quick]\n"
+                   "                   [--verbose]  # 额外打印规模派生明细（默认只打一行 [规模]）\n"
                    "                   [--allow-large-n]  # 越过 N > 2^15 的默认保护（探测用）\n"
                    "\n"
                    "规模配置层（负责人只管三个量；其余全部自动派生）：\n"
@@ -561,20 +567,22 @@ Options ParseArgs(int argc, char** argv) {
 // 几何 + L14 预算（**在任何重活之前**完成；超预算 ⇒ 拒绝运行，退出码 3）
 // ===========================================================================
 
+// 几何（符号向论文看齐，D41）：`n` = 记录数、`entry_words` = ⌈n/128⌉、`levels` = 真实层数、
+// `m` = PIR 条目数（含列级补齐）、`w` = 块大小（条目/块）、`kappa` = 块数 = m/w、
+// `main_hints` = λw、`backup_hints` = N_T = λw/2、`hint_slots` = H = λw + N_T。
 struct Geometry {
-    size_t N = 0;
-    size_t words_per_column = 0;   // ⌈N/128⌉
-    size_t real_columns = 0;       // M
-    size_t column_count = 0;       // m（补齐到 2 的幂）
-    size_t padding_columns = 0;    // m − M
-    uint64_t n = 0;                // word 数 = m·⌈N/128⌉
-    uint64_t w = 0;
-    uint64_t c = 0;                // 区块数
+    size_t n = 0;                  // 记录数 = 列长（bit）
+    size_t entry_words = 0;        // ⌈n/128⌉：条目宽度（字）
+    size_t levels = 0;             // 真实 LCTE 层数
+    size_t m = 0;                  // PIR 条目数（含补齐列）
+    size_t padding_columns = 0;    // m − levels
+    uint64_t w = 0;                // 块大小（条目/块）
+    uint64_t kappa = 0;            // 块数 = m / w（偶数）
     uint32_t lambda = 0;
     double eps = 0.0;
     uint64_t main_hints = 0;       // λw
-    uint64_t q = 0;                // 备份 hint 数 = λw/2
-    uint64_t H = 0;                // λw + q
+    uint64_t backup_hints = 0;     // N_T = λw/2
+    uint64_t hint_slots = 0;       // H = λw + N_T
 };
 
 // 退出码 3 = **参数/L14 预算被拒**（与运行期失败 1 区分）；测试按这个码断言。
@@ -589,30 +597,31 @@ Geometry DeriveGeometry(size_t N, const Options& o, uint64_t w_explicit) {
     const MpraqPaddedGeometry g = DerivePaddedGeometry(
         g_scale.real_columns(), N, o.lambda, o.eps, w_explicit != 0, w_explicit);
     Geometry G;
-    G.N = N;
-    G.words_per_column = (N + 127) / 128;
-    G.real_columns = g.real_column_count;
-    G.column_count = g.column_count;
+    G.n = N;
+    G.entry_words = (N + 127) / 128;
+    G.levels = g.levels;
+    G.m = static_cast<uint64_t>(g.m);   // PIR 条目数 = m（一个条目 = 一整列）
     G.padding_columns = g.padding_columns;
-    G.n = static_cast<uint64_t>(g.column_count) * G.words_per_column;
     G.w = g.plinko.w;
-    G.c = g.plinko.block_count();
+    G.kappa = g.plinko.blocks();
     G.lambda = g.plinko.lambda;
     G.eps = g.plinko.prp_epsilon;
     G.main_hints = g.plinko.main_hints();
-    G.q = g.plinko.backup_hints();
-    G.H = g.plinko.hint_slots();
+    G.backup_hints = g.plinko.backup_hints();
+    G.hint_slots = g.plinko.hint_slots();
     return G;
 }
 
 struct Budget {
     Geometry g;
-    uint64_t columns = 0;        // 本次实验计划的列数
+    uint64_t columns = 0;       // 本次实验计划的列数
     uint64_t repeat = 1;
-    uint64_t planned_words = 0;  // 列数 × ⌈N/128⌉ × repeat
-    uint64_t hint_cap = 0;       // q = λw/2
-    uint64_t pool_cap = 0;       // n
-    uint64_t budget = 0;         // min(q, n)
+    // ⚠️ 列粒度：**一列 = 一个条目 = 1 个查询集** ⇒ 计划量就是「列数 × repeat」，
+    //    **不再乘以 ⌈N/128⌉**（旧 word 口径的 128 倍消耗已作废）。
+    uint64_t planned_sets = 0;
+    uint64_t hint_cap = 0;       // N_T = λw/2
+    uint64_t pool_cap = 0;       // m（新鲜索引池 = 条目数）
+    uint64_t budget = 0;         // min(N_T, m)
     std::string binding;         // 较紧的那条
     double used_ratio = 0.0;
 };
@@ -623,28 +632,21 @@ Budget PlanBudget(const Geometry& g, uint64_t planned_columns, uint64_t repeat) 
     b.g = g;
     b.columns = planned_columns;
     b.repeat = repeat;
-    b.planned_words = planned_columns * static_cast<uint64_t>(g.words_per_column) * repeat;
-    b.hint_cap = g.q;
-    b.pool_cap = g.n;
+    b.planned_sets = planned_columns * repeat;
+    b.hint_cap = g.backup_hints;
+    b.pool_cap = g.m;
     b.budget = std::min(b.hint_cap, b.pool_cap);
-    b.binding = (b.pool_cap <= b.hint_cap) ? "pool(n)" : "hint(q)";
+    b.binding = (b.pool_cap <= b.hint_cap) ? "pool(m)" : "hint(N_T)";
     b.used_ratio = b.budget == 0 ? 1.0
-                                 : static_cast<double>(b.planned_words) /
+                                 : static_cast<double>(b.planned_sets) /
                                        static_cast<double>(b.budget);
-    if (b.planned_words > b.budget) {
+    if (b.planned_sets > b.budget) {
         std::ostringstream oss;
-        oss << "[mpraq_bench][L14 预算拒绝运行] 本实验的 word 查询总数 " << b.planned_words
-            << " > 上限 min(q, n) = " << b.budget << "（q = λw/2 = " << b.hint_cap
-            << "、n = m·⌈N/128⌉ = " << b.pool_cap << "；**较紧的是** " << b.binding << "）。\n"
-            << "  算式：列数 " << planned_columns << " × ⌈N/128⌉ = " << g.words_per_column
-            << " × 重复 " << repeat << " = " << b.planned_words
-            << "（N = " << g.N << "、λ = " << g.lambda << "、w = " << g.w
-            << "、m = " << g.column_count << "、n = " << g.n << "、q = " << g.q << "）\n"
-            << "  原因：① 每次 PIR word 查询消费 1 条常规 hint 并提升 1 条备份 ⇒ 上限 q；\n"
-            << "        ② 重复访问同一 (列, word) 需另取未答复过的新索引 ⇒ 上限 n（D8：不做摊销式离线）。\n"
-            << "  处置：减小 --columns/--repeat，或加大 --lambda/--w 放大 q，"
-               "或加大 N（放大 n = m·⌈N/128⌉）。**不**以异常收场（绝不在中途抛 "
-               "PlinkoBackupsExhausted）。";
+        oss << "[mpraq_bench][budget_rejected] planned_sets=" << b.planned_sets
+            << " > 上限 min(N_T, m) = " << b.budget << "（N_T = λw/2 = " << b.hint_cap
+            << "、m = " << b.pool_cap << "；较紧的是 " << b.binding << "）。"
+            << " plan columns=" << planned_columns << " repeat=" << repeat
+            << " limit=" << b.budget;
         throw L14Rejected(oss.str());
     }
     return b;
@@ -654,37 +656,33 @@ Json BudgetJson(const Budget& b) {
     Json j;
     j.U64("planned_columns", b.columns)
         .U64("repeat", b.repeat)
-        .U64("planned_word_queries", b.planned_words)
-        .U64("hint_cap_q", b.hint_cap)
-        .U64("pool_cap_n", b.pool_cap)
-        .U64("budget_min_q_n", b.budget)
+        .U64("planned_sets", b.planned_sets)
+        .U64("backup_hints", b.hint_cap)
+        .U64("pool_m", b.pool_cap)
+        .U64("budget", b.budget)
         .Str("binding_constraint", b.binding)
         .Dbl("budget_used_ratio", b.used_ratio)
-        .U64("budget_headroom", b.budget - b.planned_words);
+        .U64("budget_headroom", b.budget - b.planned_sets);
     return j;
 }
 
 Json GeometryJson(const Geometry& g) {
-    // `m0` = **不升级**时的最小补齐列数（D26 口径的"升级前"对照；D35 允许 ×2 升级）
-    const uint64_t m0 = NextPow2Local(static_cast<uint64_t>(g.real_columns));
+    // ⚠️ 列粒度下**没有"补齐到 2 的幂"**（D41 取代 D35）⇒ 不再有 m0 / "是否升级" 这类字段；
+    //    补齐只补到 `2w` 的倍数，用 `levels` / `m` / `padding_columns` 三个量就描述完整。
     Json j;
-    j.U64("records_N", g.N)
-        .U64("words_per_column", g.words_per_column)
-        .U64("real_columns_M", g.real_columns)
-        .U64("columns_padded_m", g.column_count)
-        .U64("columns_min_pow2_m0", m0)
-        .U64("column_upgrade_factor", m0 == 0 ? 0 : g.column_count / m0)
-        .Bool("column_upgrade_applied", g.column_count > m0)
+    j.U64("n", g.n)
+        .U64("entry_words", g.entry_words)
+        .U64("levels", g.levels)
+        .U64("m", g.m)
         .U64("padding_columns", g.padding_columns)
-        .U64("entries_n_words", g.n)
-        .U64("block_size_w", g.w)
-        .U64("blocks_c", g.c)
+        .U64("w", g.w)
+        .U64("kappa", g.kappa)
         .U64("lambda", g.lambda)
         .Dbl("prp_epsilon", g.eps, 3)
         .U64("main_hints_lambda_w", g.main_hints)
-        .U64("backup_hints_q", g.q)
-        .U64("hint_slots_H", g.H)
-        .U64("block_accesses_per_query_set", g.c);
+        .U64("backup_hints_N_T", g.backup_hints)
+        .U64("hint_slots_H", g.hint_slots)
+        .U64("block_accesses_per_query_set", g.kappa);
     return j;
 }
 
@@ -930,7 +928,7 @@ public:
     uint64_t PlannedColumns() const {
         if (o_.columns > 0) return o_.columns;
         if (has_scale_) return g_scale.dedup_columns();
-        return geom_.real_columns;
+        return geom_.levels;
     }
 
     Budget Plan() const { return PlanBudget(geom_, PlannedColumns(), o_.repeat); }
@@ -940,6 +938,7 @@ public:
         p.lambda = lambda_;
         p.prp_epsilon = eps_;
         p.seed = o_.seed;
+        p.security_mode = o_.security_mode;   // 接口预留；服务端据此做一致性校验
         p.has_explicit_w = (w_explicit_ != 0);
         p.w = w_explicit_;
         const auto t0 = Clock::now();
@@ -995,40 +994,43 @@ public:
             uint64_t nq0 = 0, nq1 = 0, nw0 = 0, nw1 = 0;
             if (o_.columns > 0) {
                 // ---- 裸列路径：精确 K 列的查询集（不经过谓词层）----
-                if (o_.columns > geom_.real_columns) {
+                if (o_.columns > geom_.levels) {
                     throw std::invalid_argument(
-                        "--columns 不能超过真实列数 M = " + Num(geom_.real_columns));
+                        "--columns 不能超过真实列数 M = " + Num(geom_.levels));
                 }
                 rpc0 = ChannelU64(RpcSnapshot(0));
                 rpc1 = ChannelU64(RpcSnapshot(1));
                 NodeSnapshot(0, &nq0, &nw0);
                 NodeSnapshot(1, &nq1, &nw1);
-                // 用**裸条目号**构造（全局列号 → 条目号），与 `GlobalColumnWordIndex` 同源
+                // 用**裸条目号**构造（一列 = 一个条目，条目号 = 全局列号）
                 std::vector<uint64_t> flat_indices;
-                flat_indices.reserve(o_.columns * geom_.words_per_column);
+                flat_indices.reserve(o_.columns);
                 for (size_t col = 0; col < o_.columns; ++col) {
-                    for (size_t word = 0; word < geom_.words_per_column; ++word) {
-                        flat_indices.push_back(client_->GlobalColumnWordIndex(col, word));
-                    }
+                    flat_indices.push_back(client_->GlobalEntryIndex(col));
                 }
                 MpraqQueryBatch batch = client_->CreateQueriesForIndices(flat_indices);
-                const std::vector<uint128_t> words = client_->RunBatch(batch);
+                const std::vector<PlinkoEntry> cols = client_->RunBatch(batch);
                 c.count = 0;
                 uint64_t plain_popcount = 0;
-                // 逐 word 与**明文**对照（确定性 oracle：同一次 Init 的明文副本）
-                for (size_t i = 0; i < words.size(); ++i) {
-                    // 全局列主序：flat = 全局列号 · ⌈N/128⌉ + word 序号（D24④）
-                    const uint64_t flat =
-                        client_->GlobalColumnWordIndex(i / geom_.words_per_column,
-                                                       i % geom_.words_per_column);
-                    const uint128_t plain = client_->PlainFeatureWord(flat);
-                    if (words[i] != plain) {
-                        throw std::runtime_error("裸列查询：重建 word 与明文不一致");
+                // 逐**整列**与明文副本对照（确定性 oracle：同一次 Init 的明文副本）；
+                // ⚠️ 只数恰好 n 个有效 bit（不变量 I3：尾部填充位不计入）
+                const std::vector<uint128_t>& plain_words = client_->plain_feature_words();
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    const size_t base = i * geom_.entry_words;
+                    for (size_t w = 0; w < cols[i].size(); ++w) {
+                        if (cols[i][w] != plain_words[base + w]) {
+                            throw std::runtime_error("裸列查询：重建整列与明文不一致");
+                        }
                     }
-                    c.count += static_cast<uint64_t>(__builtin_popcountll(static_cast<uint64_t>(words[i]))) +
-                               static_cast<uint64_t>(__builtin_popcountll(static_cast<uint64_t>(words[i] >> 64)));
-                    plain_popcount += static_cast<uint64_t>(__builtin_popcountll(static_cast<uint64_t>(plain))) +
-                                      static_cast<uint64_t>(__builtin_popcountll(static_cast<uint64_t>(plain >> 64)));
+                    for (size_t j = 0; j < geom_.n; ++j) {
+                        const bool bit =
+                            ((cols[i][j / 128] >> (j % 128)) & static_cast<uint128_t>(1)) != 0;
+                        const bool pbit =
+                            ((plain_words[base + j / 128] >> (j % 128)) &
+                             static_cast<uint128_t>(1)) != 0;
+                        if (bit) ++c.count;
+                        if (pbit) ++plain_popcount;
+                    }
                 }
                 if (c.count != plain_popcount) {
                     throw std::runtime_error("裸列查询：重建比特数与明文不一致");
@@ -1084,13 +1086,13 @@ public:
         // 平均口径（进程内/两进程都报"平均每次"）
         r.count_ms /= o_.repeat;
 
-        // **精确对照**：查询集数 == 列数 × ⌈N/128⌉ × repeat
+        // **精确对照**：查询集数 == 列数 × repeat（一列 = 一个条目 = 1 个查询集）
         const uint64_t expected =
-            static_cast<uint64_t>(r.columns_used) * geom_.words_per_column * o_.repeat;
+            static_cast<uint64_t>(r.columns_used) * o_.repeat;
         r.columns_identity_ok = (r.queries_issued == expected);
         if (!r.columns_identity_ok) {
             throw std::runtime_error("查询集数 " + Num(r.queries_issued) +
-                                     " ≠ 列数×⌈N/128⌉×repeat = " + Num(expected));
+                                     " ≠ 列数×repeat = " + Num(expected));
         }
         // 每台 RPC 次数 == 查询（Count）次数；标量路径恒 0
         for (int i = 0; i < 2; ++i) {
@@ -1114,10 +1116,10 @@ public:
         r.online_ms_per_query_set =
             r.queries_issued == 0 ? 0.0 : r.count_ms / static_cast<double>(r.queries_issued);
         r.online_ms_per_block_access =
-            (r.queries_issued == 0 || geom_.c == 0)
+            (r.queries_issued == 0 || geom_.kappa == 0)
                 ? 0.0
                 : r.count_ms /
-                      (static_cast<double>(r.queries_issued) * static_cast<double>(geom_.c));
+                      (static_cast<double>(r.queries_issued) * static_cast<double>(geom_.kappa));
         return r;
     }
 
@@ -1147,8 +1149,9 @@ public:
             r->avg = AvgOverFilter(s);
         } else {
             r->avg = 0;
-            HPRINT("        ⚠️ count = 0 ⇒ Avg 无定义（未调用 `AvgOverFilter`；"
-                   "Sum = 0 与明文基准仍逐值对照）\n");
+            // count = 0 ⇒ Avg 在数学上无定义（未调用 `AvgOverFilter`）；Sum = 0 与明文基准
+            // 仍逐值对照。此处只打裸键值。
+            HPRINT("        avg count=0 avg=undefined avg_called=0 sum_checked=1\n");
         }
         // 裸列模式的 filter 是"全命中"⇒ 基准取**空谓词**（`Filter(d, {})` = 全 1）
         const std::vector<mpraq_baseline::Pred> bpreds =
@@ -1196,9 +1199,9 @@ public:
     // 服务器存储：公式（双报）+ 实测
     void FillStorage(Row* r) {
         const StoreParams& sp = client_->store_params();
-        r->feature_bytes_padded = 16ull * sp.column_count * sp.words_per_column;
-        r->feature_bytes_unpadded = 16ull * sp.real_column_count * sp.words_per_column;
-        r->attr_bytes = 16ull * sp.num_records * sp.num_attributes();
+        r->feature_bytes_padded = 16ull * sp.m * sp.entry_words;
+        r->feature_bytes_unpadded = 16ull * sp.levels * sp.entry_words;
+        r->attr_bytes = 16ull * sp.n * sp.num_attributes();
         r->server_storage_formula_padded = r->feature_bytes_padded + r->attr_bytes;
         r->server_storage_formula_unpadded = r->feature_bytes_unpadded + r->attr_bytes;
         for (int i = 0; i < 2; ++i) {
@@ -1231,16 +1234,16 @@ public:
         r.chunk_count = t.chunk_count;
         r.chunk_words = t.chunk_words;
         r.hint_ms_per_entry =
-            geom_.n == 0 ? 0.0 : r.hint_ms / static_cast<double>(geom_.n);
+            geom_.m == 0 ? 0.0 : r.hint_ms / static_cast<double>(geom_.m);
         r.hint_slots_measured = client_->hint_slot_count();
         r.hint_logical_bytes = client_->logical_hint_bytes();
         r.hint_state_bytes = client_->hint_state_bytes();
-        r.block_key_bytes = geom_.c * 32ull;  // IprfKey = 2 × AES-128 密钥
-        r.cache_bytes = geom_.n * (16ull + 1ull + 8ull);
+        r.block_key_bytes = geom_.kappa * 32ull;  // IprfKey = 2 × AES-128 密钥
+        r.cache_bytes = geom_.m * (16ull + 1ull + 8ull);
         r.hint_formula_task_bytes =
-            static_cast<double>(geom_.H) * 16.125;               // 任务书的写法（不含 parity）
+            static_cast<double>(geom_.hint_slots) * 16.125;               // 任务书的写法（不含 parity）
         r.hint_formula_spec_bytes =
-            static_cast<double>(geom_.H) * (16.0 + 16.125);      // MPRAQ_IMPL §1 / PLINKO_SPEC §6
+            static_cast<double>(geom_.hint_slots) * (16.0 + 16.125);      // MPRAQ_IMPL §1 / PLINKO_SPEC §6
         r.backup_remaining = client_->backup_remaining();
         FillStorage(&r);
     }
@@ -1328,9 +1331,8 @@ private:
 
 Json RowJson(const Row& r) {
     Json g = GeometryJson(r.geom);
-    // D35 口径的"升级前"对照：m0 = NextPow2(M)（未升级时的最小补齐列数）
-    const uint64_t m0 = NextPow2Local(static_cast<uint64_t>(r.geom.real_columns));
-    const uint64_t feature_no_upgrade = 16ull * m0 * r.geom.words_per_column;
+    // "不含补齐"对照：直接用真实层数 levels（D41 取代了 D35 的"×2 升级"口径）
+    const uint64_t feature_no_upgrade = 16ull * r.geom.levels * r.geom.entry_words;
     const uint64_t total_no_upgrade = feature_no_upgrade + r.attr_bytes;
     Json b = r.has_budget ? BudgetJson(r.budget) : Json();
 
@@ -1363,7 +1365,7 @@ Json RowJson(const Row& r) {
         .U64("baseline_count", r.baseline_count)
         .U64("queries_issued", r.queries_issued)
         .U64("columns_used", r.columns_used)
-        .U64("queries_per_column", r.geom.words_per_column)
+        .U64("queries_per_column", r.geom.entry_words)
         .Bool("queries_identity_ok", r.columns_identity_ok)
         .U64("pir_rpc_server0", r.rpc_delta[0])
         .U64("pir_rpc_server1", r.rpc_delta[1])
@@ -1393,8 +1395,8 @@ Json RowJson(const Row& r) {
         .U64("records", r.sm.records)
         .U64("frame_bytes_phase1", r.sm.frame_bytes_phase1)
         .U64("frame_bytes_phase2", r.sm.frame_bytes_phase2)
-        .U64("frame_formula_6_plus_34N", 6 + 34ull * r.geom.N)
-        .U64("frame_formula_6_plus_58N", 6 + 58ull * r.geom.N)
+        .U64("frame_formula_6_plus_34N", 6 + 34ull * r.geom.n)
+        .U64("frame_formula_6_plus_58N", 6 + 58ull * r.geom.n)
         .Dbl("offline_triple_ms", r.sm.offline_triple_ms, 4)
         .Dbl("offline_setup_ms", r.sm.offline_setup_ms, 4)
         .Dbl("securemul_online_ms", r.sm.online_ms, 4)
@@ -1402,18 +1404,14 @@ Json RowJson(const Row& r) {
         .U64("install_frames", r.sm.install_frames)
         .U64("install_rounds", r.sm.install_rounds)
         .U64("install_bytes", r.sm.install_bytes)
-        .U64("install_formula_bytes", 2ull * (13 + 152ull * r.geom.N))
+        .U64("install_formula_bytes", 2ull * (13 + 152ull * r.geom.n))
         .U64("server_state_peak_bytes", r.sm.server_state_peak_bytes)
         .U64("server_state_allocated_bytes", r.sm.server_state_allocated_bytes);
 
     Json srv;
+    // ⚠️ D41 取代 D35：不再有"×2 升级"口径，`*_no_upgrade` / `upgrade_extra_bytes` 三个
+    //    字段随之删除；"补齐代价"由 `padded` 与 `unpadded` 两个字段之差表达。
     srv.U64("feature_bytes_padded", r.feature_bytes_padded)
-        .U64("feature_bytes_no_upgrade", feature_no_upgrade)
-        .U64("total_bytes_no_upgrade", total_no_upgrade)
-        .U64("upgrade_extra_bytes",
-             r.server_storage_formula_padded > total_no_upgrade
-                 ? r.server_storage_formula_padded - total_no_upgrade
-                 : 0)
         .U64("feature_bytes_unpadded", r.feature_bytes_unpadded)
         .U64("attribute_bytes", r.attr_bytes)
         .U64("total_bytes_formula_padded", r.server_storage_formula_padded)
@@ -1435,10 +1433,14 @@ Json RowJson(const Row& r) {
         .Raw("count", count.Dump())
         .Raw("sum", sum.Dump())
         .Raw("server_storage", srv.Dump())
+        // JSON `notes`：字段名与结构不变，值改为纯 ASCII（原中文说明移到本注释）——
+        // mode=local 为进程内 LocalTransport；mode=grpc-two-process 为真实 gRPC 两进程。
+        // 一列 = 一个条目 = 1 个查询集；RPC 次数 = ServerRespBatch 调用数；
+        // 区块访问量 = 查询集数×kappa；install_* = D34 的离线材料下发（仅两进程）。
         .Str("notes",
-             "mode=local 为进程内 LocalTransport；mode=grpc-two-process 为真实 gRPC 两进程。"
-             "查询集数=word 查询数=列数×⌈N/128⌉；RPC 次数=ServerRespBatch 调用数；"
-             "区块访问量=查询集数×c；install_*=D34 的离线材料下发（仅两进程）。");
+             "mode=local:in-process LocalTransport; mode=grpc-two-process:real gRPC. "
+             "query_sets=columns (one entry = one entire column); rpc=ServerRespBatch calls; "
+             "block_accesses=query_sets*kappa; install_*=D34 offline setup (two-process only).");
     return out;
 }
 
@@ -1468,7 +1470,7 @@ Json ConfigJson(const Options& o, const char* bench_build) {
         .U64("repeat", o.repeat)
         .Bool("with_sum", o.with_sum)
         .Str("build_type", bench_build)
-        .Str("query_set_unit", "one 128-bit word PIR retrieval")
+        .Str("query_set_unit", "one PIR entry retrieval (= one entire column, entry_words*16 B)")
         .Str("rpc_unit", "IMpraqChannel::ServerRespBatch call (= 1 network round trip)")
         .Str("block_access_unit", "one (block, offset) read on one server")
         .Str("install_unit", "SecureMulServerSetup delivery, D34 (two-process only)")
@@ -1476,82 +1478,72 @@ Json ConfigJson(const Options& o, const char* bench_build) {
         .U64("client_max_receive_bytes",
              static_cast<uint64_t>(kGrpcClientMaxReceiveBytes))
         .Str("client_max_receive_note",
-             "客户端收包上限；SecureMul 的应答帧 = 19+43N / 19+58N 字节 ⇒ 这是"
-             "「两进程能跑多大 N」的硬天花板（服务器侧必须同样放宽，见 mpraq_server）");
+             "client max receive bytes; SecureMul response frames = 19+43N / 19+58N bytes "
+             "=> hard ceiling for two-process N (server side must widen too, see mpraq_server)");
     return j;
 }
 
+// PrintHeader：只打裸 `key=value`。以下口径**保留在注释里**（print 精简纪律）：
+//   * mode=grpc  = 真实 gRPC、两个服务器进程、回环 socket；
+//     mode=local = 进程内 LocalTransport + 进程内 MpraqNode。两者**不可互相引用**。
+//   * scale_layer=1 表示走规模配置层（--config / --columns-per-attribute / --attributes /
+//     --predicates）⇒ schema、合成数据、谓词全部自动派生；=0 表示沿用旧口径
+//     （属性 0/1 = 6/4 列、M = 10、谓词 = --predicate）。
+//   * grpc_max_recv 是客户端显式设置的收包上限；gRPC 默认仅 4 MiB ⇒ `N > 72 315` 时
+//     Phase2 应答帧（19+58N）会被拒。
+//   * 复杂度口径（D41）：PIR 条目数 = `m`（LCTE 层数），一次列查询实测为
+//     `kappa = m/w` 次**区块访问**；论文的 Õ(n/r) 是渐近口径，本表**不**把 kappa 与 n/r
+//     等同（Q9 报告 D6）。更新（O(log n)）D8 不做 ⇒ 不产出该曲线。
 void PrintHeader(const Options& o) {
-    HPRINT("=====================================================================\n");
-    HPRINT("MPRAQ 参数与复杂度验证（MPA-09）\n");
-    HPRINT("=====================================================================\n");
-    HPRINT("实验 = %s；口径 = %s%s\n", o.exp.c_str(), ModeName(o.mode),
-                o.mode == Mode::kGrpcTwoProcess
-                    ? "（真实 gRPC、两个服务器进程、回环 socket）"
-                    : "（进程内 LocalTransport + 进程内 MpraqNode）");
-    HPRINT("参数：λ = %u、ε = %g、seed = %llu、prng_seed = %llu、谓词 = %s、"
-                "raw_columns = %zu、repeat = %u\n",
-                o.lambda, o.eps, static_cast<unsigned long long>(o.seed),
-                static_cast<unsigned long long>(o.prng_seed), o.predicate.c_str(),
-                o.columns, o.repeat);
-    HPRINT("[gRPC] 客户端收包上限 = %d 字节（%d MiB，**显式设置**；gRPC 默认仅 4 MiB ⇒"
-           " `N > 72 315` 时 Phase2 应答帧 19+58N 会被拒）\n",
-           kGrpcClientMaxReceiveBytes, kGrpcClientMaxReceiveBytes / (1024 * 1024));
-    if (o.scale_enabled) {
-        HPRINT("规模层：**已启用**（--config %s%s%s%s）⇒ schema/合成数据/谓词全部自动派生；"
-               "每个 N 会打印一行换算"
-               "（N、每属性列数、属性数、M、m、谓词数 k ⇒ 去重列数=min(k,M)、"
-               "查询集数=min(k,M)×⌈N/128⌉、每台 RPC=1）\n",
-               o.config.empty() ? "(默认值)" : o.config.c_str(),
-               o.has_cpa ? " + --columns-per-attribute" : "",
-               o.has_attributes ? " + --attributes" : "",
-               o.has_predicates ? " + --predicates" : "");
-    } else {
-        HPRINT("规模层：**未启用** ⇒ 沿用旧口径（属性 0/1 = 6/4 列、M = 10、谓词 = %s）；"
-               "要按「行数/每属性列数/谓词数」驱动请给 `--config` 或 "
-               "--columns-per-attribute/--attributes/--predicates\n",
-               o.predicate.c_str());
-    }
-    HPRINT("⚠️ 复杂度口径：`n` 是 **word 数** m·⌈N/128⌉（不是记录数）；"
-                "在线检索实测为 c = n/w 次**区块访问**；\n"
-                "   论文的 Õ(n/r) 是渐近口径，本表**不**把 c 与 n/r 等同（Q9 报告 D6）。"
-                "更新（O(log n)）D8 不做 ⇒ 不产出该曲线。\n\n");
+    HPRINT("exp=%s mode=%s\n", o.exp.c_str(), ModeName(o.mode));
+    HPRINT("lambda=%u eps=%g seed=%llu prng_seed=%llu predicate=%s raw_columns=%zu repeat=%u\n",
+           o.lambda, o.eps, static_cast<unsigned long long>(o.seed),
+           static_cast<unsigned long long>(o.prng_seed), o.predicate.c_str(), o.columns, o.repeat);
+    HPRINT("grpc_max_recv=%d scale_layer=%d\n", kGrpcClientMaxReceiveBytes,
+           o.scale_enabled ? 1 : 0);
 }
 
+// PrintGeometry：只打裸 `key=value`。
+//   * wpr  = ⌈N/128⌉（每列 word 数）；M = 真实列数；m = 补齐后列数；pad = 补齐列数。
+//   * n = m·wpr（PIR 条目数 = word 数，不是记录数）；c = n/w（块数，偶数）。
+//   * lw = λw（常规 hint）；N_T = λw/2（备份）；H = λw + N_T（槽位）。
+//   * 若 m > NextPow2(M)，说明触发了 D35 的列数 ×2 升级；此时服务器存储
+//     16·m·wpr 同比放大，升级前后各打一次（upgrade 行）。
 void PrintGeometry(const Geometry& g, bool planned_only) {
-    HPRINT("  几何（由程序自算，非手填）：N=%zu、⌈N/128⌉=%zu、M=%zu、m=%zu（补 %zu 列）、"
-                "n=%llu、w=%llu、c=%llu、λ=%u、λw=%llu、q=λw/2=%llu、H=λw+q=%llu\n",
-                g.N, g.words_per_column, g.real_columns, g.column_count, g.padding_columns,
-                static_cast<unsigned long long>(g.n),
-                static_cast<unsigned long long>(g.w),
-                static_cast<unsigned long long>(g.c), g.lambda,
-                static_cast<unsigned long long>(g.main_hints),
-                static_cast<unsigned long long>(g.q),
-                static_cast<unsigned long long>(g.H));
-    const uint64_t m0 = NextPow2Local(static_cast<uint64_t>(g.real_columns));
-    if (g.column_count > m0) {
-        HPRINT("        ⚠️ 列数被**升级**（决策 D35）：m0 = NextPow2(M) = %llu → m = %llu"
-               "（×%llu）；服务器存储 16·m·⌈N/128⌉ 同比放大：%llu → %llu B\n",
-               static_cast<unsigned long long>(m0),
-               static_cast<unsigned long long>(g.column_count),
-               static_cast<unsigned long long>(g.column_count / m0),
-               static_cast<unsigned long long>(16ull * m0 * g.words_per_column),
-               static_cast<unsigned long long>(16ull * g.column_count * g.words_per_column));
+    // ⚠️ 标签向论文看齐（D41）：`n` = 记录数、`entry_words` = ⌈n/128⌉、`levels` = 真实层数、
+    //    `m` = PIR 条目数、`w` = 块大小（条目/块）、`kappa` = 块数、`lw` = λw、
+    //    `N_T` = 备份 hint 数（λw/2）、`H` = 槽位（λw + N_T）。
+    HPRINT("geom n=%zu entry_words=%zu levels=%zu m=%zu pad=%zu w=%llu kappa=%llu "
+           "lambda=%u lw=%llu N_T=%llu H=%llu\n",
+           g.n, g.entry_words, g.levels, g.m, g.padding_columns,
+           static_cast<unsigned long long>(g.w), static_cast<unsigned long long>(g.kappa),
+           g.lambda, static_cast<unsigned long long>(g.main_hints),
+           static_cast<unsigned long long>(g.backup_hints), static_cast<unsigned long long>(g.hint_slots));
+    // ⚠️ 列粒度下**不再有"补齐到 2 的幂"**（D41 取代 D35）：`m` 只需是 `2w` 的倍数，
+    //    所以这里只报补齐了多少列与它带来的存储增量，不再报"×N 升级倍数"。
+    if (g.padding_columns > 0) {
+        HPRINT("padding levels=%zu m=%zu pad=%zu srv_delta=%llu\n", g.levels,
+               g.m, g.padding_columns,
+               static_cast<unsigned long long>(16ull * g.padding_columns * g.entry_words));
     }
     if (planned_only) return;
 }
 
+// PrintBudget：只打裸 `key=value`。
+//   * planned_sets = 列数 × repeat；上限 = min(N_T=λw/2, m)；
+//   * binding 是较紧的那条上限的名字；used_ratio 是 planned/budget；margin = budget − planned。
 void PrintBudget(const Budget& b) {
-    HPRINT("  L14 预算：计划 %llu 个 word 查询（列数 %llu × ⌈N/128⌉ %zu × repeat %llu）"
-                " ≤ min(q=%llu, n=%llu) = %llu ⇒ 通过（较紧的是 %s，用量 %.1f%%，余量 %llu）\n",
-                static_cast<unsigned long long>(b.planned_words),
-                static_cast<unsigned long long>(b.columns), b.g.words_per_column,
-                static_cast<unsigned long long>(b.repeat),
-                static_cast<unsigned long long>(b.hint_cap),
-                static_cast<unsigned long long>(b.pool_cap),
-                static_cast<unsigned long long>(b.budget), b.binding.c_str(),
-                b.used_ratio * 100.0,
-                static_cast<unsigned long long>(b.budget - b.planned_words));
+    // ⚠️ 标签向论文看齐（D41）：`N_T` = λw/2（备份 hint）、`m` = PIR 条目数（新鲜索引池）。
+    HPRINT("budget planned_sets=%llu columns=%llu entry_words=%zu repeat=%llu N_T=%llu m=%llu "
+           "cap=%llu binding=%s used_pct=%.1f margin=%llu\n",
+           static_cast<unsigned long long>(b.planned_sets),
+           static_cast<unsigned long long>(b.columns), b.g.entry_words,
+           static_cast<unsigned long long>(b.repeat),
+           static_cast<unsigned long long>(b.hint_cap),
+           static_cast<unsigned long long>(b.pool_cap),
+           static_cast<unsigned long long>(b.budget), b.binding.c_str(),
+           b.used_ratio * 100.0,
+           static_cast<unsigned long long>(b.budget - b.planned_sets));
 }
 
 // ===========================================================================
@@ -1560,19 +1552,20 @@ void PrintBudget(const Budget& b) {
 
 std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
     std::vector<Row> rows;
-    HPRINT("---- 实验 1：在线 Count 成本 vs 规模（%s）----\n", ModeName(o.mode));
-    HPRINT("%8s %6s %6s %6s %6s %6s %9s %9s %8s %8s %8s %10s %12s\n", "N", "wpr", "m",
-                "n", "w", "c", "queries", "cols", "RPC0", "RPC1", "blocks/台",
-                "Count ms", "ms/queryset");
+    HPRINT("exp=online mode=%s\n", ModeName(o.mode));
+    HPRINT("%8s %6s %6s %6s %6s %6s %9s %9s %8s %8s %8s %10s %12s\n", "n", "levels",
+                "m", "e_words", "w", "kappa", "sets", "cols", "rpc0", "rpc1", "blocks",
+                "count_ms", "ms/set");
     for (size_t N : o.rows) {
         if (N > (1u << 15)) {
             if (!o.allow_large_n) {
-                HPRINT("  ⚠️ N=%zu > 2^15：默认**跳过**（两进程安装帧 = 2×(13+152N) ≈ %.1f MB；"
-                       "D34 的限制：N ≥ 2^16 需分块安装，未实现）。要探测请加 `--allow-large-n`\n",
+                // 默认跳过 N > 2^15：两进程安装帧 = 2×(13+152N)；D34 的限制（N ≥ 2^16 需
+                // 分块安装，未实现）。加 `--allow-large-n` 可探测。
+                HPRINT("  skip N=%zu reason=n_gt_2^15 install_frames_mb=%.1f allow_large_n=0\n",
                        N, 2.0 * (13 + 152.0 * static_cast<double>(N)) / 1048576.0);
                 continue;
             }
-            HPRINT("  ⚠️ N=%zu > 2^15：`--allow-large-n` 已显式放开，继续跑（安装帧 ≈ %.1f MB）\n",
+            HPRINT("  large_n N=%zu allow_large_n=1 install_frames_mb=%.1f\n",
                    N, 2.0 * (13 + 152.0 * static_cast<double>(N)) / 1048576.0);
         }
         Point p(o, N, o.lambda, o.eps, o.w, servers);
@@ -1601,29 +1594,32 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
             if (o.columns == 0) r.count = bcount;  // 裸列模式保留上面实测的 popcount
         }
         HPRINT("%8zu %6zu %6zu %6llu %6llu %6llu %9llu %6llu %8llu %8llu %8llu %10.2f %12.4f\n",
-                    N, g.words_per_column, g.column_count,
-                    static_cast<unsigned long long>(g.n),
+                    N, g.entry_words, g.m,
+                    static_cast<unsigned long long>(g.m),
                     static_cast<unsigned long long>(g.w),
-                    static_cast<unsigned long long>(g.c),
+                    static_cast<unsigned long long>(g.kappa),
                     static_cast<unsigned long long>(r.queries_issued),
                     static_cast<unsigned long long>(r.columns_used),
                     static_cast<unsigned long long>(r.rpc_delta[0]),
                     static_cast<unsigned long long>(r.rpc_delta[1]),
-                    static_cast<unsigned long long>(r.queries_issued * g.c),
+                    static_cast<unsigned long long>(r.queries_issued * g.kappa),
                     r.count_ms, r.online_ms_per_query_set);
-        HPRINT("         Init = %.1f ms（HintInit %.1f ms / n=%llu ⇒ %.4f ms/entry ≈ IF⁻¹）、"
-                    "上传 %llu B、服务器存储 = %llu B（公式=实测）\n",
-                    r.init_ms, r.hint_ms, static_cast<unsigned long long>(g.n),
-                    r.hint_ms_per_entry, static_cast<unsigned long long>(r.upload_bytes),
-                    static_cast<unsigned long long>(r.server_storage_formula_padded));
-        HPRINT("         Count=%llu（= 明文基准 %llu）、hint 消耗 %llu / q=%llu、"
-                    "剩余备份 %llu；总计墙钟 %.1f ms\n",
-                    static_cast<unsigned long long>(r.count),
-                    static_cast<unsigned long long>(r.baseline_count),
-                    static_cast<unsigned long long>(r.hint_consumed),
-                    static_cast<unsigned long long>(g.q),
-                    static_cast<unsigned long long>(r.backup_remaining),
-                    r.init_ms + r.count_ms + r.sum_ms);
+        // per-row 明细（原中文说明）：Init 含 HintInit；per_entry_ms = hint_ms/n ≈ iPRF 的
+        // IF⁻¹；upload_bytes 是上传字节；server_storage_bytes 的公式=实测。
+        HPRINT("         detail init_ms=%.1f hintinit_ms=%.1f m=%llu per_entry_ms=%.4f "
+               "upload_bytes=%llu server_storage_bytes=%llu storage_formula_match=1\n",
+               r.init_ms, r.hint_ms, static_cast<unsigned long long>(g.m),
+               r.hint_ms_per_entry, static_cast<unsigned long long>(r.upload_bytes),
+               static_cast<unsigned long long>(r.server_storage_formula_padded));
+        // count 与明文基准相等；hint 消耗 / N_T；剩余备份；wall_ms = init+count+sum 墙钟。
+        HPRINT("         count count=%llu base_count=%llu hint_used=%llu N_T=%llu "
+               "backup_remaining=%llu wall_ms=%.1f\n",
+               static_cast<unsigned long long>(r.count),
+               static_cast<unsigned long long>(r.baseline_count),
+               static_cast<unsigned long long>(r.hint_consumed),
+               static_cast<unsigned long long>(g.backup_hints),
+               static_cast<unsigned long long>(r.backup_remaining),
+               r.init_ms + r.count_ms + r.sum_ms);
         rows.push_back(std::move(r));
     }
     return rows;
@@ -1635,15 +1631,16 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
 
 std::vector<Row> ExpSum(const Options& o, ServerProcesses* servers) {
     std::vector<Row> rows;
-    HPRINT("---- 实验 2：Sum/Avg 在线成本 vs 规模（%s）----\n", ModeName(o.mode));
-    HPRINT("⚠️ 两进程口径下每次 Sum 额外把 N 条 SecureMulServerSetup 下发给每台服务器"
-                "（D34）：install_bytes = 2×(13+152N) ⇒ **必须计入在线代价**\n");
+    HPRINT("exp=sum mode=%s\n", ModeName(o.mode));
+    // 两进程口径下每次 Sum 额外把 N 条 SecureMulServerSetup 下发给每台服务器（D34）：
+    // install_bytes = 2×(13+152N) ⇒ **必须计入在线代价**（该说明不再单独打印）。
     HPRINT("%8s %9s %9s %9s %9s %9s %10s %10s %10s %10s %11s %11s %10s\n", "N", "words",
-                "rounds", "messages", "wire", "rounds/台", "frame1 B", "frame2 B",
+                "rounds", "messages", "wire", "rounds_srv", "frame1 B", "frame2 B",
                 "online ms", "verify ms", "install B", "install rt", "Sum ms");
     for (size_t N : o.rows) {
         if (N > (1u << 15) && !o.allow_large_n) {
-            HPRINT("  ⚠️ N=%zu > 2^15：默认跳过（D34 的安装帧限制；`--allow-large-n` 可探测）\n",
+            // 默认跳过：D34 的安装帧限制；`--allow-large-n` 可探测。
+            HPRINT("  skip N=%zu reason=d34_install_frames allow_large_n=0\n",
                    N);
             continue;
         }
@@ -1661,7 +1658,7 @@ std::vector<Row> ExpSum(const Options& o, ServerProcesses* servers) {
         r.baseline_count = Popcount(filter);
         p.RunSum(&r, filter, 0xA0900001u + static_cast<uint64_t>(N));
         HPRINT("%8zu %9llu %9llu %9llu %9llu %9llu %10llu %10llu %10.2f %10.2f %11llu %11llu %10.2f\n",
-                    N, static_cast<unsigned long long>(g.n),
+                    N, static_cast<unsigned long long>(g.m),
                     static_cast<unsigned long long>(r.sm.rounds),
                     static_cast<unsigned long long>(r.sm.messages),
                     static_cast<unsigned long long>(r.sm.wire_messages),
@@ -1670,15 +1667,17 @@ std::vector<Row> ExpSum(const Options& o, ServerProcesses* servers) {
                     static_cast<unsigned long long>(r.sm.frame_bytes_phase2), r.sm.online_ms,
                     r.sm.verify_ms, static_cast<unsigned long long>(r.sm.install_bytes),
                     static_cast<unsigned long long>(r.sm.install_rounds), r.sum_ms);
-        HPRINT("         对照公式：messages=2N=%llu、wire=4N=%llu、帧长 6+34N=%llu / 6+58N=%llu、"
-                    "（**两进程口径下**）install=2×(13+152N)=%llu；offline_triple=%.1f ms、"
-                    "offline_setup=%.1f ms\n",
+        // 对照公式（**注释**）：messages=2N、wire=4N、帧长 6+34N / 6+58N；
+        // 两进程口径下 install = 2×(13+152N)。
+        HPRINT("formula messages=%llu wire=%llu frame1=%llu frame2=%llu install=%llu "
+               "offline_triple_ms=%.1f offline_setup_ms=%.1f\n",
                     static_cast<unsigned long long>(2 * N), static_cast<unsigned long long>(4 * N),
                     static_cast<unsigned long long>(6 + 34 * N),
                     static_cast<unsigned long long>(6 + 58 * N),
                     static_cast<unsigned long long>(2ull * (13 + 152 * N)), r.sm.offline_triple_ms,
                     r.sm.offline_setup_ms);
-        HPRINT("         Sum=%s、count=%llu、Avg=%s（明文基准 %llu / %llu %s）\n",
+        // 明文基准对照（**注释**）：count/base_count、sum/base_sum 应逐值相等，ok=1。
+        HPRINT("result sum=%s count=%llu avg=%s base_sum=%llu base_count=%llu ok=%s\n",
                     toString(r.sum).c_str(), static_cast<unsigned long long>(r.baseline_count),
                     toString(r.avg).c_str(),
                     static_cast<unsigned long long>(r.baseline_sum),
@@ -1700,8 +1699,9 @@ std::vector<Row> ExpInitW(const Options& o_in, ServerProcesses* servers) {
     //    经 Relay 账目实测复核）。
     Options oc = o_in;
     if (oc.mode != Mode::kLocal) {
-        HPRINT("  ⚠️ 本实验按 **local（进程内）** 口径运行：它只测客户端本地工作与存储公式，"
-               "不受服务器是否另起进程影响\n");
+        // 本实验测的是**客户端本地**工作与存储公式 ⇒ 强制 local 口径（与服务器是否另起
+        // 进程无关）；两进程口径下的服务器存储已由 online/sum 实验经 Relay 账目实测复核。
+        HPRINT("mode=local forced\n");
         oc.mode = Mode::kLocal;
     }
     const Options& o = oc;
@@ -1711,7 +1711,7 @@ std::vector<Row> ExpInitW(const Options& o_in, ServerProcesses* servers) {
     // ⚠️ W=1 只在 ⌈N/128⌉ = 1（N ≤ 128）时合法 ⇒ 网格按 N 给出**可行**的 w 集合，
     //    这是实测出来的**结构性约束**，不是省事。
     struct Grid {
-        size_t N;
+        size_t n;   // 记录数（= 论文的 n）
         std::vector<uint64_t> ws;
     };
     std::vector<Grid> grid;
@@ -1719,27 +1719,35 @@ std::vector<Row> ExpInitW(const Options& o_in, ServerProcesses* servers) {
         for (size_t N : o.rows) grid.push_back(Grid{N, o.w_list});
     } else {
         for (size_t N : o.rows) {
-            // ⚠️ 结构性约束（实测得出，不是省事）：
-            //   ① `w ≥ ⌈N/128⌉`（一个区块至少要装下一整列：`DerivePaddedGeometry` 的 `min_columns`）；
-            //   ② `c = n/w ≥ 2` 且为**偶数** ⇒ `w ≤ n/2`；本 schema 下 `n = 16·⌈N/128⌉`
-            //      ⇒ `w ≤ 8·⌈N/128⌉`。
-            // 于是 w=1 只在 N ≤ 128 合法；下面枚举**全部合法 w**（逐点再由库校验一次）。
-            const size_t L = (N + 127) / 128;
-            std::vector<uint64_t> ws;
-            uint64_t w = std::max<uint64_t>(1, L);
-            while (w <= 8 * L) {
-                ws.push_back(w);
-                w *= 2;
+            // ⚠️ 列粒度（D41）下的结构性约束与旧口径**完全不同**：
+            //   * 唯一有效判据是 **`2w | m`**（⇔ `w | m` 且 `kappa = m/w` 为偶数），
+            //     而 `m = ceil(levels/(2w))·2w` ⇒ **任意 `w = 2^j` 都合法**
+            //     （`w` 偏大只会多补几列，不会再无解）。
+            //   * 旧口径的 `w >= ⌈N/128⌉`（"一个区块至少要装下一整列"）**已作废**：
+            //     现在一个区块装 `w` 个**条目**，而每个条目本身就是一整列。
+            //   ⇒ 网格取 `w = 2^j`，从 **1** 到 `8·levels`，覆盖"区块 ≪ 列数"到
+            //     "区块 ≫ 列数"两侧；逐点仍由 `DerivePaddedGeometry` / `PlinkoParams::Validate`
+            //     最终判定（非法就打印原因并跳过，见下面的 try/catch）。
+            size_t levels_probe = 0;
+            try {
+                Point probe(o, N, o.lambda, o.eps, /*w_explicit=*/0, nullptr);
+                levels_probe = probe.geom().levels;
+            } catch (const std::exception&) {
+                // 探针失败 ⇒ 该 N 本身不可用；真正的报错交给下面的逐点 try/catch
             }
+            const uint64_t cap = 8 * std::max<size_t>(1, levels_probe);
+            std::vector<uint64_t> ws;
+            for (uint64_t w = 1; w <= cap; w *= 2) ws.push_back(w);
             grid.push_back(Grid{N, ws});
         }
     }
-    HPRINT("---- 实验 3：离线 Init/HintInit 成本 vs (n, w)（口径 %s；"
-                "HintInit 是**客户端本地**工作，与实际部署放置无关）----\n",
-                ModeName(o.mode));
-    HPRINT("%8s %5s %6s %7s %6s %6s %11s %12s %12s %11s %11s %11s\n", "N", "⌈N/128⌉",
-                "m", "n", "w", "c", "HintInit ms", "ms/entry", "IF⁻¹ 隐含", "Init ms",
-                "upload B", "λw+q=H");
+    // 实验 3 标题（原中文 caption）：离线 Init/HintInit 成本 vs (n, w)；HintInit 是
+    // **客户端本地**工作，与实际部署放置无关。
+    HPRINT("exp=init_w mode=%s\n", ModeName(o.mode));
+    // 表头列（裸 ASCII）：N wpr m n w c hint_ms ms_per_entry if_inv init_ms upload_B H。
+    HPRINT("%8s %6s %6s %7s %6s %6s %11s %12s %12s %11s %11s %11s\n", "n",
+                "levels", "m", "e_words", "w", "kappa", "hint_ms", "ms_per_entry",
+                "if_inv", "init_ms", "upload_B", "H");
     for (const Grid& gg : grid) {
         for (uint64_t w : gg.ws) {
             // 非法 (N, w) **不静默**：打印库给出的原因并跳过该点
@@ -1747,9 +1755,9 @@ std::vector<Row> ExpInitW(const Options& o_in, ServerProcesses* servers) {
             //  本程序不自己重写一套判据）
             std::unique_ptr<Point> pp;
             try {
-                pp = std::make_unique<Point>(o, gg.N, o.lambda, o.eps, w, nullptr);
+                pp = std::make_unique<Point>(o, gg.n, o.lambda, o.eps, w, nullptr);
             } catch (const std::exception& e) {
-                HPRINT("  跳过 (N=%zu, w=%llu)：%s\n", gg.N,
+                HPRINT("  skip N=%zu w=%llu reason=%s\n", gg.n,
                        static_cast<unsigned long long>(w), e.what());
                 continue;
             }
@@ -1777,32 +1785,34 @@ std::vector<Row> ExpInitW(const Options& o_in, ServerProcesses* servers) {
             r.chunk_count = t.chunk_count;
             r.chunk_words = t.chunk_words;
             r.hint_ms_per_entry =
-                g.n == 0 ? 0.0 : r.hint_ms / static_cast<double>(g.n);
+                g.m == 0 ? 0.0 : r.hint_ms / static_cast<double>(g.m);
             r.hint_slots_measured = p.client().hint_slot_count();
             r.hint_logical_bytes = p.client().logical_hint_bytes();
             r.hint_state_bytes = p.client().hint_state_bytes();
-            r.block_key_bytes = g.c * 32ull;
-            r.cache_bytes = g.n * 25ull;  // 16 + 1 + 8
-            r.hint_formula_task_bytes = static_cast<double>(g.H) * 16.125;
-            r.hint_formula_spec_bytes = static_cast<double>(g.H) * (16.0 + 16.125);
+            r.block_key_bytes = g.kappa * 32ull;
+            r.cache_bytes = g.m * 25ull;  // 16 + 1 + 8
+            r.hint_formula_task_bytes = static_cast<double>(g.hint_slots) * 16.125;
+            r.hint_formula_spec_bytes = static_cast<double>(g.hint_slots) * (16.0 + 16.125);
             r.backup_remaining = p.client().backup_remaining();
             HPRINT("%8zu %5zu %6zu %7llu %6llu %6llu %11.2f %12.4f %12.4f %11.2f "
                         "%11llu %11llu\n",
-                        g.N, g.words_per_column, g.column_count,
-                        static_cast<unsigned long long>(g.n),
+                        g.n, g.entry_words, g.m,
+                        static_cast<unsigned long long>(g.m),
                         static_cast<unsigned long long>(g.w),
-                        static_cast<unsigned long long>(g.c), r.hint_ms,
+                        static_cast<unsigned long long>(g.kappa), r.hint_ms,
                         r.hint_ms_per_entry, r.hint_ms_per_entry, r.init_ms,
                         static_cast<unsigned long long>(r.upload_bytes),
-                        static_cast<unsigned long long>(g.H));
-            HPRINT("         分阶段：LCTE %.1f、打包 %.1f、共享 %.1f、HintInit %.1f、"
-                        "上传 %.1f ms；hint 存储：槽位 %llu、实现口径合计 %.0f B（= %.1f B/条）、"
-                        "实际分配 %llu B；区块密钥 %llu B\n",
-                        r.lcte_ms, r.pack_ms, r.share_ms, r.hint_ms, r.upload_ms,
-                        static_cast<unsigned long long>(g.H), r.hint_logical_bytes,
-                        g.H == 0 ? 0.0 : r.hint_logical_bytes / static_cast<double>(g.H),
-                        static_cast<unsigned long long>(r.hint_state_bytes),
-                        static_cast<unsigned long long>(r.block_key_bytes));
+                        static_cast<unsigned long long>(g.hint_slots));
+            // 分阶段耗时 + hint 存储：槽位 H、实现口径合计 bytes（= bytes/条）、实际分配字节、
+            // 区块密钥字节。
+            HPRINT("         phases lcte_ms=%.1f pack_ms=%.1f share_ms=%.1f hintinit_ms=%.1f "
+                   "upload_ms=%.1f hint_slots=%llu hint_logical_bytes=%.0f "
+                   "hint_bytes_per_entry=%.1f hint_alloc_bytes=%llu block_key_bytes=%llu\n",
+                   r.lcte_ms, r.pack_ms, r.share_ms, r.hint_ms, r.upload_ms,
+                   static_cast<unsigned long long>(g.hint_slots), r.hint_logical_bytes,
+                   g.hint_slots == 0 ? 0.0 : r.hint_logical_bytes / static_cast<double>(g.hint_slots),
+                   static_cast<unsigned long long>(r.hint_state_bytes),
+                   static_cast<unsigned long long>(r.block_key_bytes));
             rows.push_back(std::move(r));
         }
     }
@@ -1820,16 +1830,20 @@ std::vector<Row> ExpStorage(const Options& o_in, ServerProcesses* servers) {
     //    经 Relay 账目实测复核）。
     Options oc = o_in;
     if (oc.mode != Mode::kLocal) {
-        HPRINT("  ⚠️ 本实验按 **local（进程内）** 口径运行：它只测客户端本地工作与存储公式，"
-               "不受服务器是否另起进程影响\n");
+        // 本实验测的是**客户端本地**工作与存储公式 ⇒ 强制 local 口径（与服务器是否另起
+        // 进程无关）；两进程口径下的服务器存储已由 online/sum 实验经 Relay 账目实测复核。
+        HPRINT("mode=local forced\n");
         oc.mode = Mode::kLocal;
     }
     const Options& o = oc;
 
-    HPRINT("---- 实验 4：存储 vs 参数（%s）----\n", ModeName(o.mode));
-    HPRINT("%8s %5s %6s %7s %5s %6s %12s %12s %10s %12s %12s %14s %14s\n", "N",
-                "⌈N/128⌉", "M", "m", "w", "c", "服务器存储", "不含补齐", "补齐占比",
-                "hint 理想 B", "hint 每条 B", "hint 实际分配 B", "客户端总计 B");
+    HPRINT("exp=storage mode=%s\n", ModeName(o.mode));
+    // 表头列（裸 ASCII）：N wpr M m w c srv_padded_B srv_unpadded_B pad_pct
+    // hint_ideal_B hint_per_entry_B hint_alloc_B client_total_B。
+    HPRINT("%8s %6s %6s %7s %5s %6s %12s %12s %10s %12s %12s %14s %14s\n", "n",
+                "levels", "m", "e_words", "w", "kappa", "srv_padded_B", "srv_unpadded_B",
+                "pad_pct", "hint_ideal_B", "hint_per_entry_B", "hint_alloc_B",
+                "client_total_B");
     for (size_t N : o.rows) {
         Point p(o, N, o.lambda, o.eps, o.w, servers);
         const Geometry& g = p.geom();
@@ -1847,14 +1861,14 @@ std::vector<Row> ExpStorage(const Options& o_in, ServerProcesses* servers) {
         r.hint_ms = p.client().timings().hint_ms;
         r.upload_bytes = p.client().upload_bytes();
         r.chunk_count = p.client().timings().chunk_count;
-        r.hint_ms_per_entry = g.n ? r.hint_ms / static_cast<double>(g.n) : 0.0;
+        r.hint_ms_per_entry = g.m ? r.hint_ms / static_cast<double>(g.m) : 0.0;
         r.hint_slots_measured = p.client().hint_slot_count();
         r.hint_logical_bytes = p.client().logical_hint_bytes();
         r.hint_state_bytes = p.client().hint_state_bytes();
-        r.block_key_bytes = g.c * 32ull;
-        r.cache_bytes = g.n * 25ull;
-        r.hint_formula_task_bytes = static_cast<double>(g.H) * 16.125;
-        r.hint_formula_spec_bytes = static_cast<double>(g.H) * (16.0 + 16.125);
+        r.block_key_bytes = g.kappa * 32ull;
+        r.cache_bytes = g.m * 25ull;
+        r.hint_formula_task_bytes = static_cast<double>(g.hint_slots) * 16.125;
+        r.hint_formula_spec_bytes = static_cast<double>(g.hint_slots) * (16.0 + 16.125);
         p.FillStorage(&r);
         const double pad_ratio = r.server_storage_formula_padded == 0
                                      ? 0.0
@@ -1865,29 +1879,31 @@ std::vector<Row> ExpStorage(const Options& o_in, ServerProcesses* servers) {
             static_cast<uint64_t>(r.hint_state_bytes) + r.block_key_bytes;
         HPRINT("%8zu %5zu %6zu %7zu %5llu %6llu %12llu %12llu %9.1f%% %12.0f %12.0f "
                     "%14llu %14llu\n",
-                    g.N, g.words_per_column, g.real_columns, g.column_count,
+                    g.n, g.entry_words, g.levels, g.m,
                     static_cast<unsigned long long>(g.w),
-                    static_cast<unsigned long long>(g.c),
+                    static_cast<unsigned long long>(g.kappa),
                     static_cast<unsigned long long>(r.server_storage_formula_padded),
                     static_cast<unsigned long long>(r.server_storage_formula_unpadded),
                     pad_ratio, r.hint_formula_task_bytes, r.hint_formula_spec_bytes,
                     static_cast<unsigned long long>(r.hint_state_bytes),
                     static_cast<unsigned long long>(client_total));
-        HPRINT("         服务器实测 = %llu B（公式=实测 ✓，含补齐；不含补齐 %llu B，"
-                    "差 %llu B = 补齐 %zu 列 × ⌈N/128⌉ × 16 B）；"
-                    "属性值 16·N·|attrs| = %llu B\n",
-                    static_cast<unsigned long long>(r.server_storage_measured[0]),
-                    static_cast<unsigned long long>(r.server_storage_formula_unpadded),
-                    static_cast<unsigned long long>(r.server_storage_formula_padded -
-                                                    r.server_storage_formula_unpadded),
-                    g.padding_columns, static_cast<unsigned long long>(r.attr_bytes));
-        HPRINT("         客户端：hint 槽位 H=%llu；公式口径 (λw+q)×16.125 = %.0f B（不含 "
-                    "parity）、(λw+q)×32.125 = %.0f B（含 16 B parity，MPRAQ_IMPL §1）；"
-                    "实现口径(每条字段) %.0f B、实际分配 %llu B（含对齐与 Q 缓存 %llu B）\n",
-                    static_cast<unsigned long long>(g.H), r.hint_formula_task_bytes,
-                    r.hint_formula_spec_bytes, r.hint_logical_bytes,
-                    static_cast<unsigned long long>(r.hint_state_bytes),
-                    static_cast<unsigned long long>(r.cache_bytes));
+        // 服务器实测（含补齐）与公式一致；差 = 补齐列数 × ⌈N/128⌉ × 16 B；
+        // attr_bytes = 16·N·|attrs|（属性值部分）。
+        HPRINT("         srv_measured bytes=%llu formula_match=1 padded=1 unpadded_bytes=%llu "
+               "pad_diff_bytes=%llu pad_cols=%zu attr_bytes=%llu\n",
+               static_cast<unsigned long long>(r.server_storage_measured[0]),
+               static_cast<unsigned long long>(r.server_storage_formula_unpadded),
+               static_cast<unsigned long long>(r.server_storage_formula_padded -
+                                               r.server_storage_formula_unpadded),
+               g.padding_columns, static_cast<unsigned long long>(r.attr_bytes));
+        // 客户端 hint：槽位 H；公式口径 (λw+q)×16.125（不含 parity）、(λw+q)×32.125
+        //（含 16 B parity，MPRAQ_IMPL §1）；实现口径（每条字段）与含对齐/Q 缓存的实分配。
+        HPRINT("         client hint_slots=%llu formula_task_bytes=%.0f "
+               "formula_spec_bytes=%.0f impl_bytes=%.0f alloc_bytes=%llu cache_bytes=%llu\n",
+               static_cast<unsigned long long>(g.hint_slots), r.hint_formula_task_bytes,
+               r.hint_formula_spec_bytes, r.hint_logical_bytes,
+               static_cast<unsigned long long>(r.hint_state_bytes),
+               static_cast<unsigned long long>(r.cache_bytes));
         rows.push_back(std::move(r));
     }
     return rows;
@@ -1904,20 +1920,21 @@ std::vector<Row> ExpTradeoff(const Options& o_in, ServerProcesses* servers) {
     //    经 Relay 账目实测复核）。
     Options oc = o_in;
     if (oc.mode != Mode::kLocal) {
-        HPRINT("  ⚠️ 本实验按 **local（进程内）** 口径运行：它只测客户端本地工作与存储公式，"
-               "不受服务器是否另起进程影响\n");
+        // 本实验测的是**客户端本地**工作与存储公式 ⇒ 强制 local 口径（与服务器是否另起
+        // 进程无关）；两进程口径下的服务器存储已由 online/sum 实验经 Relay 账目实测复核。
+        HPRINT("mode=local forced\n");
         oc.mode = Mode::kLocal;
     }
     const Options& o = oc;
 
     std::vector<Row> rows;
     const size_t N = o.rows.front();
-    HPRINT("---- 实验 5：λ / ε 的权衡（固定 N=%zu；%s）----\n", N, ModeName(o.mode));
-    HPRINT("λ = 统计安全参数：单条目覆盖失败概率 ≈ 2^-λ（PLINKO_SPEC §1）；"
-                "ε = iPRF 的 PRP 目标（D22-1）。\n");
-    HPRINT("%5s %9s %7s %6s %6s %9s %11s %12s %12s %12s %13s\n", "λ", "ε", "w", "c",
-                "⌈N/128⌉", "q=λw/2", "H=λw+q", "HintInit ms", "ms/entry(IF⁻¹)", "hint 每条 B",
-                "hint 实际 B");
+    HPRINT("exp=tradeoff N=%zu mode=%s\n", N, ModeName(o.mode));
+    // λ = 统计安全参数：单条目覆盖失败概率 ≈ 2^-λ（PLINKO_SPEC §1）；
+    // ε = iPRF 的 PRP 目标（D22-1）。以下表头为裸 ASCII 列名。
+    HPRINT("%5s %9s %7s %6s %6s %9s %11s %12s %12s %12s %13s\n", "lambda", "eps", "w", "c",
+                "wpr", "q", "H", "hint_ms", "ms_per_entry", "hint_per_entry_B",
+                "hint_alloc_B");
     for (uint32_t lam : o.lambda_list) {
         Options oo = o;
         oo.lambda = lam;
@@ -1935,35 +1952,36 @@ std::vector<Row> ExpTradeoff(const Options& o_in, ServerProcesses* servers) {
         r.has_budget = true;
         r.init_ms = p.client().timings().total_ms;
         r.hint_ms = p.client().timings().hint_ms;
-        r.hint_ms_per_entry = g.n ? r.hint_ms / static_cast<double>(g.n) : 0.0;
+        r.hint_ms_per_entry = g.m ? r.hint_ms / static_cast<double>(g.m) : 0.0;
         r.hint_slots_measured = p.client().hint_slot_count();
         r.hint_logical_bytes = p.client().logical_hint_bytes();
         r.hint_state_bytes = p.client().hint_state_bytes();
-        r.block_key_bytes = g.c * 32ull;
-        r.cache_bytes = g.n * 25ull;
-        r.hint_formula_task_bytes = static_cast<double>(g.H) * 16.125;
-        r.hint_formula_spec_bytes = static_cast<double>(g.H) * (16.0 + 16.125);
+        r.block_key_bytes = g.kappa * 32ull;
+        r.cache_bytes = g.m * 25ull;
+        r.hint_formula_task_bytes = static_cast<double>(g.hint_slots) * 16.125;
+        r.hint_formula_spec_bytes = static_cast<double>(g.hint_slots) * (16.0 + 16.125);
         r.upload_bytes = p.client().upload_bytes();
         r.chunk_count = p.client().timings().chunk_count;
         p.FillStorage(&r);
         HPRINT("%5u %9.0e %7llu %6llu %6zu %9llu %11llu %12.2f %12.4f %12.1f %13llu\n",
                     lam, o.eps, static_cast<unsigned long long>(g.w),
-                    static_cast<unsigned long long>(g.c), g.words_per_column,
-                    static_cast<unsigned long long>(g.q),
-                    static_cast<unsigned long long>(g.H), r.hint_ms, r.hint_ms_per_entry,
-                    r.hint_logical_bytes / static_cast<double>(g.H),
+                    static_cast<unsigned long long>(g.kappa), g.entry_words,
+                    static_cast<unsigned long long>(g.backup_hints),
+                    static_cast<unsigned long long>(g.hint_slots), r.hint_ms, r.hint_ms_per_entry,
+                    r.hint_logical_bytes / static_cast<double>(g.hint_slots),
                     static_cast<unsigned long long>(r.hint_state_bytes));
-        HPRINT("         失败概率 2^-λ = 2^-%u；离线 Init = %.1f ms；L14 上限 min(q,n) = %llu"
-                    " ⇒ 可检索列数 = q/⌈N/128⌉ = %llu\n",
-                    lam, r.init_ms, static_cast<unsigned long long>(b.budget),
-                    static_cast<unsigned long long>(g.q / g.words_per_column));
+        // 失败概率 2^-λ；离线 Init 耗时；L14 上限 min(q,n)；可检索列数 = q/⌈N/128⌉。
+        HPRINT("         detail fail_prob=2^-%u init_ms=%.1f budget=%llu "
+               "searchable_columns=%llu\n",
+               lam, r.init_ms, static_cast<unsigned long long>(b.budget),
+               static_cast<unsigned long long>(g.backup_hints / g.entry_words));
         rows.push_back(std::move(r));
     }
-    // ε 维度（λ 固定）
-    HPRINT("\n  ε 维度（λ=%u 固定）：ε 只影响 iPRF 的 PRP 轮数 ⇒ 只影响**离线**成本，"
-                "不影响任何在线量/存储来\n", o.lambda);
-    HPRINT("%5s %9s %12s %12s %12s\n", "λ", "ε", "HintInit ms", "Init ms",
-                "ms/entry(IF⁻¹)");
+    // ε 维度（λ 固定）：ε 只影响 iPRF 的 PRP 轮数 ⇒ 只影响**离线**成本，
+    // 不影响任何在线量/存储。
+    HPRINT("\neps_dim lambda=%u\n", o.lambda);
+    HPRINT("%5s %9s %12s %12s %12s\n", "lambda", "eps", "hint_ms", "init_ms",
+                "ms_per_entry");
     for (double eps : o.eps_list) {
         Options oo = o;
         oo.eps = eps;
@@ -1979,14 +1997,14 @@ std::vector<Row> ExpTradeoff(const Options& o_in, ServerProcesses* servers) {
         r.budget = p.Plan();
         r.init_ms = p.client().timings().total_ms;
         r.hint_ms = p.client().timings().hint_ms;
-        r.hint_ms_per_entry = g.n ? r.hint_ms / static_cast<double>(g.n) : 0.0;
+        r.hint_ms_per_entry = g.m ? r.hint_ms / static_cast<double>(g.m) : 0.0;
         r.hint_slots_measured = p.client().hint_slot_count();
         r.hint_logical_bytes = p.client().logical_hint_bytes();
         r.hint_state_bytes = p.client().hint_state_bytes();
-        r.block_key_bytes = g.c * 32ull;
-        r.cache_bytes = g.n * 25ull;
-        r.hint_formula_task_bytes = static_cast<double>(g.H) * 16.125;
-        r.hint_formula_spec_bytes = static_cast<double>(g.H) * (16.0 + 16.125);
+        r.block_key_bytes = g.kappa * 32ull;
+        r.cache_bytes = g.m * 25ull;
+        r.hint_formula_task_bytes = static_cast<double>(g.hint_slots) * 16.125;
+        r.hint_formula_spec_bytes = static_cast<double>(g.hint_slots) * (16.0 + 16.125);
         r.upload_bytes = p.client().upload_bytes();
         r.chunk_count = p.client().timings().chunk_count;
         p.FillStorage(&r);
@@ -2037,6 +2055,8 @@ int main(int argc, char** argv) {
             if (o.has_lambda) cfg.lambda = o.lambda;
             if (o.has_eps) cfg.eps = o.eps;
             if (o.has_seed) cfg.seed = o.seed;
+            // 档位（接口预留）：随规模层进入 `MpraqInitParams` → `StoreParams`（服务端校验）
+            cfg.security_mode = o.security_mode;
             g_scale.cfg = cfg;
 
             // 逐点预估 + L14 预检（**先算清楚再跑**；超预算 ⇒ 退出码 3，不跑到一半炸）
@@ -2044,32 +2064,31 @@ int main(int argc, char** argv) {
                 MpraqScaleConfig c = cfg;
                 c.rows = N;
                 const MpraqScaleEstimate est = EstimateScale(c);
-                HPRINT("\n[规模] %s\n", est.Headline().c_str());
-                HPRINT("%s", est.Report().c_str());
+                HPRINT("\nscale %s\n", est.Headline().c_str());
+                if (o.verbose) HPRINT("%s", est.Report().c_str());
                 const uint64_t planned = est.query_sets * o.repeat;
-                if (planned > est.budget_min) {
+                if (planned > est.budget) {
+                    // ⚠️ 列粒度：一次列查询 = 1 个查询集 ⇒ 计划量 = 去重列数 × repeat，
+                    //    **不再乘以 ⌈N/128⌉**；上限 = min(N_T = λw/2, m)（台账 L14）。
                     std::ostringstream oss;
-                    oss << "[mpraq_bench][L14 预算拒绝运行] 本次规模的 word 查询总数 " << planned
-                        << " = min(k, M) " << est.dedup_columns << " × ⌈N/128⌉ "
-                        << est.words_per_column << " × repeat " << o.repeat
-                        << " > 上限 min(q, n) = " << est.budget_min << "（q = λw/2 = "
-                        << est.hint_cap_q << "、n = m·⌈N/128⌉ = " << est.pool_cap_n
-                        << "；较紧的是 "
-                        << (est.pool_cap_n <= est.hint_cap_q ? "pool(n)" : "hint(q)") << "）。\n"
-                        << "  规模：N=" << est.rows << "、每属性列数="
-                        << est.columns_per_attribute << "、属性数=" << est.attributes
-                        << " ⇒ M=" << est.real_columns_M << "、m=" << est.columns_padded_m
-                        << "、k=" << est.predicates << "、λ=" << est.lambda
-                        << "、w=" << est.block_size_w << "。\n"
-                        << "  处置：减小 --predicates/--repeat，或加大 --lambda（放大 q），"
-                           "或加大 N/--columns-per-attribute（放大 n）。";
+                    oss << "[mpraq_bench][budget_rejected] planned_sets=" << planned
+                        << " dedup_columns=" << est.dedup_columns << " repeat=" << o.repeat
+                        << " limit=" << est.budget << " N_T=" << est.backup_hints
+                        << " m=" << est.pool_m << " binding="
+                        << (est.pool_m <= est.backup_hints ? "pool(m)" : "hint(N_T)")
+                        << " rows=" << est.rows << " cols_per_attr="
+                        << est.columns_per_attribute << " attrs=" << est.attributes
+                        << " levels=" << est.levels << " padded_m="
+                        << est.m << " k=" << est.predicates
+                        << " lambda=" << est.lambda << " w=" << est.w;
                     throw L14Rejected(oss.str());
                 }
-                HPRINT("        ⇒ L14 预检通过：%llu ≤ min(q=%llu, n=%llu) = %llu\n",
+                // L14 预检通过：计划 ≤ min(N_T=λw/2, m) = 上限。
+                HPRINT("        budget_precheck planned=%llu N_T=%llu m=%llu cap=%llu pass=1\n",
                        static_cast<unsigned long long>(planned),
-                       static_cast<unsigned long long>(est.hint_cap_q),
-                       static_cast<unsigned long long>(est.pool_cap_n),
-                       static_cast<unsigned long long>(est.budget_min));
+                       static_cast<unsigned long long>(est.backup_hints),
+                       static_cast<unsigned long long>(est.pool_m),
+                       static_cast<unsigned long long>(est.budget));
             }
         }
 
@@ -2090,11 +2109,11 @@ int main(int argc, char** argv) {
                         "--server0 与 --server1 不能相同（一台服务器冒充两台）");
                 }
                 servers.UseEndpoints(o.server0, o.server1);
-                HPRINT("[grpc] 使用已给出的端点：%s / %s\n", o.server0.c_str(),
+                HPRINT("grpc endpoints source=given server0=%s server1=%s\n", o.server0.c_str(),
                             o.server1.c_str());
             } else {
                 servers.Spawn(o.spawn_servers, argv[0]);
-                HPRINT("[grpc] 已自动启动两个服务器进程（pid %ld / %ld），端点 %s / %s\n",
+                HPRINT("grpc endpoints source=spawned pid0=%ld pid1=%ld server0=%s server1=%s\n",
                        static_cast<long>(servers.pid(0)), static_cast<long>(servers.pid(1)),
                        servers.addr(0).c_str(), servers.addr(1).c_str());
             }
@@ -2141,12 +2160,16 @@ int main(int argc, char** argv) {
             if (i) document += ",";
             document += RowJson(rows[i]).Dump();
         }
+        // summary.note：字段名与结构不变，值改为纯 ASCII（原中文说明移到本注释）——
+        // 查询集 / RPC / 区块访问 / 安装段四个口径互不相同，见每个点的
+        // `notes` 与 `geometry` 字段；local 与 grpc-two-process 不可直接比较。
         document += "],\"summary\":" +
                     Json()
                         .U64("points", rows.size())
                         .Str("note",
-                             "查询集/word 查询/RPC/区块访问/安装段五个口径互不相同，见每个点的 "
-                             "notes 与 geometry 字段；local 与 grpc-two-process 不可直接比较")
+                             "query_sets/word_queries/rpc/block_accesses/install are distinct "
+                             "units; see each point's notes and geometry; local and "
+                             "grpc-two-process are not comparable")
                         .Dump() +
                     "}";
 
@@ -2164,14 +2187,15 @@ int main(int argc, char** argv) {
             std::ofstream out(o.json_out);
             if (!out) throw std::runtime_error("无法写 --json-out 文件：" + o.json_out);
             out << document << "\n";
-            HPRINT("\n[完整 JSON] 已写入 %s（%zu 个点）\n", o.json_out.c_str(),
+            // `--json-out` 写的完整文档：路径与点数（原中文说明精简为裸键值）。
+            HPRINT("\njson_out path=%s points=%zu\n", o.json_out.c_str(),
                         rows.size());
         }
 
-        HPRINT("\n[结论] %zu 个实验点全部通过程序内的**确定性账目断言**"
-                    "（查询集数 = 列数×⌈N/128⌉；RPC = 查询次数；rounds=2 / messages=2N / "
-                    "wire=4N / 帧长 6+34N、6+58N；两进程 install=2×(13+152N)；"
-                    "服务器存储 = §1 公式 = 实测）\n",
+        // 结论（原中文说明移到本注释）：全部实验点通过程序内的**确定性账目断言** ——
+        // 查询集数 = 列数×⌈N/128⌉；RPC = 查询次数；rounds=2 / messages=2N / wire=4N /
+        // 帧长 6+34N、6+58N；两进程 install = 2×(13+152N)；服务器存储 = §1 公式 = 实测。
+        HPRINT("\nresult points=%zu all_accounting_assertions_passed=1\n",
                     rows.size());
         if (servers.spawned() && !o.keep_servers) servers.Stop();
         return EXIT_SUCCESS;

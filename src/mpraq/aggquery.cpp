@@ -31,12 +31,12 @@ double MsSince(const std::chrono::steady_clock::time_point& t0) {
 //   * 属性的 `window_size` 允许为 0（"未声明"）⇒ 退回到 `Init` 实际用的记录数。
 size_t ResolveNumRecords(const Schema& schema, const PredicatePlan& plan,
                          const MpraqClient& client) {
-    if (plan.num_records != 0) return plan.num_records;
-    const size_t n = client.store_params().num_records;
+    if (plan.n != 0) return plan.n;
+    const size_t n = client.store_params().n;
     if (n == 0) {
         throw std::invalid_argument(
-            "MPRAQ Count: 无法确定记录数 N（`PredicatePlan::num_records` = 0，"
-            "且客户端的 `store_params().num_records` 也为 0）");
+            "MPRAQ Count: 无法确定记录数 n（`PredicatePlan::num_records` = 0，"
+            "且客户端的 `store_params().n` 也为 0）");
     }
     return n;
 }
@@ -60,21 +60,20 @@ void ValidatePlanColumns(const Schema& schema, const PredicatePlan& plan) {
     }
 }
 
-// ③ 把 `⌈N/128⌉` 个重建出的 word 展开成 `N` 位。
-// ⚠️ **尾部填充位必须被忽略**：`N` 不是 128 的倍数时，最后一个 word 里
-// `j >= N` 的位按 `MPRAQ_IMPL.md` §1 恒为 0，但"恒为 0"是**契约**而不是可依赖的巧合 ——
-// 展开时只取 `j < N`，把契约变成结构上的保证。
-std::vector<uint8_t> ExpandWordsToBits(const std::vector<uint128_t>& words, size_t base,
-                                       size_t num_records) {
-    const size_t words_needed = (num_records + 127) / 128;
-    if (base + words_needed > words.size()) {
+// ③ 把一个重建出的**整列**（entry_words 个字）展开成**恰好 n 位**。
+// ⚠️ 不变量 I3：**尾部填充位必须被忽略** —— `n` 不是 128 的倍数时，最后一个 word 里
+// `j >= n` 的位按不变量 I2 恒为 0，但"恒为 0"是**契约**而不是可依赖的巧合 ——
+// 展开时只取 `j < n`，把契约变成结构上的保证。
+std::vector<uint8_t> ExpandEntryToBits(const PlinkoEntry& entry, size_t n) {
+    const size_t need = (n + 127) / 128;
+    if (entry.size() < need) {
         throw std::logic_error(
-            "MPRAQ Count: 重建出的 word 个数不足（需要第 " + Num(base) + ".." +
-            Num(base + words_needed) + " 个，实际只有 " + Num(words.size()) + " 个）");
+            "MPRAQ Count: 重建出的整列宽度不足（需要 ⌈n/128⌉ = " + Num(need) +
+            " 个字，实际 " + Num(entry.size()) + " 个）—— 不变量 I1/I4 被破坏");
     }
-    std::vector<uint8_t> bits(num_records, 0);
-    for (size_t j = 0; j < num_records; ++j) {
-        const uint128_t word = words[base + j / 128];
+    std::vector<uint8_t> bits(n, 0);
+    for (size_t j = 0; j < n; ++j) {
+        const uint128_t word = entry[j / 128];
         bits[j] = static_cast<uint8_t>((word >> (j % 128)) & static_cast<uint128_t>(1));
     }
     return bits;
@@ -98,25 +97,24 @@ std::vector<uint8_t> RetrieveColumnBits(MpraqClient& client, const Schema& schem
             "RetrieveColumnBits: 属性 " + Num(attr_id) + "(\"" + attr.name +
             "\") 的列索引越界：" + Num(column) + " >= m = " + Num(attr.lcte.range_size));
     }
-    const size_t num_records = ResolveNumRecords(schema, PredicatePlan{}, client);
-    const size_t words_per_column = client.ColumnWordCount();
-    if (words_per_column != (num_records + 127) / 128) {
-        throw std::logic_error(
-            "RetrieveColumnBits: 客户端的 ⌈N/128⌉ = " + Num(words_per_column) +
-            " 与记录数 N = " + Num(num_records) + " 不符");
+    const size_t n = ResolveNumRecords(schema, PredicatePlan{}, client);
+    const size_t entry_words = client.entry_words();
+    if (entry_words != (n + 127) / 128) {
+        throw std::logic_error("RetrieveColumnBits: 客户端的 entry_words = " +
+                               Num(entry_words) + " 与记录数 n = " + Num(n) + " 不符");
     }
 
-    // ② 一个整列的 `⌈N/128⌉` 个 word ⇒ **一个**批次（= 一次 RPC，Q5/D24）
-    std::vector<ColumnWord> targets;
-    targets.reserve(words_per_column);
-    for (size_t w = 0; w < words_per_column; ++w) {
-        targets.push_back(ColumnWord{attr_id, column, w});
-    }
+    // ② **一次列查询 = 1 个查询集**（一个条目 = 一整列）⇒ 一次 RPC（Q5）
+    std::vector<ColumnEntry> targets;
+    targets.push_back(ColumnEntry{attr_id, column});
     MpraqQueryBatch batch = client.CreateQueries(targets);
-    const std::vector<uint128_t> words = client.RunBatch(batch);
+    std::vector<PlinkoEntry> cols = client.RunBatch(batch);
+    if (cols.size() != 1) {
+        throw std::logic_error("RetrieveColumnBits: 期望重建出恰好 1 个整列");
+    }
 
-    // ④ 重建出的 word → 该列的 N 位比特
-    return ExpandWordsToBits(words, 0, num_records);
+    // ④ 重建出的整列 → 该列的恰好 n 位比特（I3）
+    return ExpandEntryToBits(cols[0], n);
 }
 
 // ---------------------------------------------------------------------------
@@ -127,11 +125,11 @@ CountResult CountPlan(MpraqClient& client, const Schema& schema, const Predicate
     ValidatePlanColumns(schema, plan);
 
     const size_t num_records = ResolveNumRecords(schema, plan, client);
-    const size_t words_per_column = client.ColumnWordCount();
-    if (words_per_column != (num_records + 127) / 128) {
+    const size_t entry_words = client.entry_words();
+    if (entry_words != (num_records + 127) / 128) {
         throw std::logic_error(
-            "MPRAQ Count: 客户端的 ⌈N/128⌉ = " + Num(words_per_column) +
-            " 与记录数 N = " + Num(num_records) +
+            "MPRAQ Count: 客户端的 entry_words = " + Num(entry_words) +
+            " 与记录数 n = " + Num(num_records) +
             " 不符（plan 与 client 不是同一份数据/几何？）");
     }
 
@@ -145,18 +143,13 @@ CountResult CountPlan(MpraqClient& client, const Schema& schema, const Predicate
 
     const auto t_retrieve = std::chrono::steady_clock::now();
 
-    // ---- ② 全部列的全部 word → 一个批次（一次 RPC；每台服务器 1 次 ServerResp）----
-    // ⚠️ 查询顺序必须与展开顺序**严格一致**：按 `plan.columns` 的（已去重升序）顺序，
-    //    每列内按 word 号升序 ⇒ `column_word_base[i]` 就是第 i 列在返回数组里的起点。
-    std::vector<ColumnWord> targets;
-    targets.reserve(plan.columns.size() * words_per_column);
-    std::vector<size_t> column_word_base;
-    column_word_base.reserve(plan.columns.size());
+    // ---- ② 全部列 → 一个批次（一次 RPC；每台服务器 1 次 ServerRespBatch）----
+    // ⚠️ **一个条目 = 一整列**（1 个查询集），查询顺序与返回顺序**严格一致**：
+    //    第 i 列就是返回数组的第 i 个元素。
+    std::vector<ColumnEntry> targets;
+    targets.reserve(plan.columns.size());
     for (const LcteColumnRef& ref : plan.columns) {
-        column_word_base.push_back(targets.size());
-        for (size_t w = 0; w < words_per_column; ++w) {
-            targets.push_back(ColumnWord{ref.attribute_id, ref.column, w});
-        }
+        targets.push_back(ColumnEntry{ref.attribute_id, ref.column});
     }
     if (targets.empty()) {
         throw std::invalid_argument(
@@ -164,18 +157,17 @@ CountResult CountPlan(MpraqClient& client, const Schema& schema, const Predicate
             "—— 请检查谓词解析结果");
     }
 
-    // ③④ 服务器应答（每台在自己的 XOR 共享上）+ 客户端逐 word 重建 + 位展开
+    // ③④ 服务器应答（每台在自己的 XOR 共享上）+ 客户端逐列重建 + 位展开（I3 截断）
     MpraqQueryBatch batch = client.CreateQueries(targets);
     res.queries_issued = static_cast<uint64_t>(batch.size());
-    const std::vector<uint128_t> words = client.RunBatch(batch);
+    std::vector<PlinkoEntry> cols = client.RunBatch(batch);
 
     std::vector<std::vector<uint8_t>> column_bits;
     column_bits.reserve(plan.columns.size());
     for (size_t i = 0; i < plan.columns.size(); ++i) {
         const LcteColumnRef& ref = plan.columns[i];
         res.columns.emplace_back(ref.attribute_id, ref.column);
-        column_bits.push_back(
-            ExpandWordsToBits(words, column_word_base[i], num_records));
+        column_bits.push_back(ExpandEntryToBits(cols[i], num_records));
     }
 
     res.retrieve_ms = MsSince(t_retrieve);

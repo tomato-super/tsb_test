@@ -7,33 +7,32 @@
 // （测试、单机仿真），也能跑在真实 gRPC 上（MPA-08 demo）。
 //
 // ===========================================================================
-// 1. 数据布局（`doc/design/MPRAQ_IMPL.md` §1；D19-6 / D24④）
+// 1. 数据布局（符号向论文看齐；一个 PIR 条目 = **一整列向量**）
 // ===========================================================================
 // **表 1：特征表（LCTE，XOR 共享）**
-//   * 语义：`N` 条记录 × `columns` 列，每个单元 1 bit（`LCTE(x) = ([x < r_i])`）。
-//   * 打包：**每列**按记录顺序打包成 `words_per_column = ⌈N/128⌉` 个 128 位 word，
+//   * 语义：`n` 条记录 × `levels` 列（LCTE 层），每个单元 1 bit（`LCTE(x) = ([x < r_i])`）。
+//   * 打包：**每列**按记录顺序打包成 `entry_words = ⌈n/128⌉` 个 128 位 word，
 //     word 的第 `j` 位 = 第 `j` 条记录。
-//   * 展平（**列主序**）：第 `c` 列第 `w` 个 word 的条目号 = `c · ⌈N/128⌉ + w`
-//     ⇒ **`flat(c, w) = c * words_per_column + w`**（`ColWordIndex()` 是唯一入口）。
-//     这样一来"取一整列"就是一段**连续**条目，便于批量检索与段式接口。
-//   * 条目总数 **`n = columns · words_per_column`** —— ⚠️ 这就是 PIR 的 `n`（**word 数**，
-//     **不是记录数 `N`**，D24④ / D19-6）。`ServerResp` 每个区块的步长因此必须是
-//     "**每区块的 word 数**" `w`（`PlinkoQuery::block_size`），写错会**静默错 128 倍**。
-//   * 记录数不是 128 的倍数时，`⌈N/128⌉` 个 word 的**尾部填充位必须是 0 且两台一致**
-//     （否则 parity 不一致 ⇒ 静默错值）。
-//   * 共享：每个 word **独立 XOR 共享**（`s0 ⊕ s1 = word`，D3/D12 —— 绝不用加法共享）。
+//   * **一个 PIR 条目 = 一整列**：条目 i（= 全局列号 i）就是列 `C_i`，占
+//     `entry_words` 个连续 word。⇒ **条目数 = 列数 `m`**（不再是 `列数 × ⌈n/128⌉`）。
+//     ⚠️ 于是 **PIR 的 index 就是列索引**，**一次列查询 = 1 个查询集**
+//     （旧口径"每条 word 一个条目、一列要 ⌈n/128⌉ 次查询"已作废）。
+//   * 补齐（列级）：为满足 Plinko 几何（`m = κ·w`、κ 偶数）追加的**全零列**，
+//     条目号 `≥ levels`；明文与两台共享上**恒为 0**，几何公开 ⇒ 不泄露。
+//   * 位级补齐：`n` 不是 128 的倍数时，末字的尾部填充位**必须两台恒 0**
+//     （不变量 I2）；对外只暴露 `n` bit（不变量 I3）。
+//   * 共享：每个条目**整列 XOR 共享**（`s0 ⊕ s1 = 列`，D3/D12 —— 绝不用加法共享）。
 //
-// **表 2：属性值（每个属性一条长度 `N` 的向量，`mod q` 加法共享）**
-//   * `q = 2^127 − 1`（`kMpraqModulus`，D11/D14/D24）；每台服务器存 `N × |attrs|` 个
+// **表 2：属性值（每个属性一条长度 `n` 的向量，`mod q` 加法共享）**
+//   * `q = 2^127 − 1`（`kMpraqModulus`，D11/D14/D24）；每台服务器存 `n × |attrs|` 个
 //     16 字节元素。
 //   * ⚠️ 属性值是**加法共享**、特征比特是 **XOR 共享**：本文件用 `ModShare` 与裸
 //     `uint128_t`（XOR 分量）两种类型把两者分开，混用在编译期就会报错（D12）。
 //
-// **存储公式**（`MPRAQ_IMPL.md` §1，本实现口径）：
-//     每服务器 = 16 · columns · ⌈N/128⌉  （特征表，**含补齐**）
-//              + 16 · N · |attrs|          （属性值）
-//   ⚠️ 公式里的 `m` 是**补齐后**的列数 `columns`（补齐口径见 `node.cpp` 的
-//   `ResolvePadding()` 与 `init.hpp` 的文件头）。`StorageBytes()` 据此计算。
+// **存储公式**（本实现口径）：
+//     每服务器 = 16 · m · entry_words     （特征表，**含补齐列**）
+//              + 16 · n · |attrs|          （属性值）
+//   `StorageBytes()` 据此计算；`levels` 与 `m` **必须双报**（补齐前后）。
 //
 // ===========================================================================
 // 2. 范围校验（历史缺陷的反面教材）
@@ -52,6 +51,7 @@
 
 #include "core/field.hpp"
 #include "mpraq/lcte.hpp"
+#include "mpraq/security_mode.hpp"
 #include "pir/plinko.hpp"
 #include "shared/secret_sharing.hpp"
 
@@ -95,33 +95,35 @@ struct StoreAttribute {
 // 不复用全局条目号。
 
 struct StoreParams {
-    // ---- 几何 ----
-    size_t num_records = 0;        // N
-    size_t words_per_column = 0;   // ℓ = ⌈N/128⌉
-    size_t column_count = 0;       // **补齐后**的总列数（= PIR 的 m；MPRAQ_IMPL.md §1）
-    size_t real_column_count = 0;  // 真实（未补齐）的总列数 Σ_a m_a
-    // PIR 参数。**必须**满足 `n = c·w`、`c` 偶数、`w` 为 2 的幂（D21/D15(a)），
-    // 由上层（`init.cpp`）补齐条目数后再 `Derive`。
+    // ---- 几何（符号向论文看齐）----
+    size_t n = 0;             // 记录数 = 列长（bit）
+    size_t entry_words = 0;   // 条目宽度（字）= ⌈n/128⌉
+    size_t m = 0;             // PIR 条目数 = **补齐后**的 LCTE 层数（一个条目 = 一整列）
+    size_t levels = 0;        // 真实（未补齐）的 LCTE 层数 = Σ_a m_a
+    // PIR 参数。**必须**满足 `m = κ·w`、`κ` 为偶数、`w` 为 2 的幂（D21/D15(a)）；
+    // 且 `plinko.m == m`、`plinko.entry_words == entry_words`（Validate 交叉校验）。
     PlinkoParams plinko;
 
     // ---- 属性 ----
     std::vector<StoreAttribute> attrs;
 
+    // ---- 运行方式（**接口预留**：本 gate 只把它上线做校验，不改变行为）----
+    // 服务端据此**显式校验**客户端与服务端的档位是否一致，不一致即拒绝 ——
+    // 这是唯一会静默降级安全性的失败模式（见 `mpraq/security_mode.hpp`）。
+    MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
+
     // ---- 派生量 ----
     size_t num_attributes() const { return attrs.size(); }
-    uint64_t entry_count() const {  // n = m · ⌈N/128⌉（**word 数**，D24④）
-        return static_cast<uint64_t>(column_count) *
-               static_cast<uint64_t>(words_per_column);
-    }
-    size_t padding_columns() const { return column_count - real_column_count; }
-    bool is_padded_column(size_t column) const { return column >= real_column_count; }
+    uint64_t entry_count() const { return static_cast<uint64_t>(m); }  // PIR 条目数 = m
+    size_t padding_columns() const { return m - levels; }
+    bool is_padded_column(size_t column) const { return column >= levels; }
 
     // 某个属性第 `column` 列在**全局列号**里的基址：Σ_{a < attr_id} m_a
     size_t column_base(uint32_t attr_id) const;
     size_t global_column(uint32_t attr_id, uint32_t column) const;
-    // ⚠️ 唯一的展平入口：**列主序**，条目号 = 全局列号 · ℓ + word 序号
-    uint64_t ColWordIndex(uint32_t attr_id, uint32_t column, size_t word) const;
-    uint64_t ColWordIndex(size_t global_column, size_t word) const;
+    // ⚠️ 一列 = 一个条目：条目号就是全局列号（**不再有 word 维度的展平**）
+    uint64_t EntryIndex(uint32_t attr_id, uint32_t column) const;
+    uint64_t EntryIndex(size_t global_column) const;
 
     void Validate() const;
 };
@@ -134,8 +136,16 @@ class MpraqNode {
 public:
     MpraqNode() = default;
 
-    // 按 schema 分配存储（条目数 = `params.entry_count()`，**含补齐列**）
+    // 按 schema 分配存储（条目数 = `params.entry_count()`，**含补齐列**）。
+    // ⚠️ **档位一致性闸门**：若客户端在 `params.security_mode` 里报的档位与本机
+    //    配置的档位不同，**直接拒绝**（`std::invalid_argument`）——
+    //    这是唯一会**静默降级安全性**的失败模式（客户端以为在跑恶意档、
+    //    服务器按半诚实档应答，或反之），必须在装载阶段就 fail-loudly。
     void InitTable(const StoreParams& params);
+
+    // 本机配置的运行方式（安全档位）。默认恶意档。
+    void SetSecurityMode(MpraqSecurityMode m) { configured_security_mode_ = m; }
+    MpraqSecurityMode security_mode() const { return configured_security_mode_; }
 
     // 写入一段**本方**特征 word 共享（XOR 分量）。分块上传由客户端负责。
     // 越界一律抛 std::out_of_range；`words` 长度必须等于 `count`。
@@ -154,18 +164,18 @@ public:
     // 两个 parity 分别是"分组 0 / 分组 1"区块上的 XOR 累加；客户端把两台服务器的
     // 应答 XOR 起来即得明文应答（⊕ 与 XOR 共享线性相容，D12/D3）。
     //
-    // ⚠️ `ServerResp` 是**标量**接口：一次调用 = 一个查询集。**批量路径**请用
-    //    `ServerRespBatch`（一次调用处理整批，对应一次网络往返；Q5/D24④ 口径）。
+    // ⚠️ `ServerResp` 是**标量**接口：一次调用 = 一个查询集 = **一整列**。
+    //    **批量路径**请用 `ServerRespBatch`（一次调用处理整批，对应一次网络往返）。
     //    两者都在返回前完成几何/格式校验；`queries_served()` / `words_read()` 的口径相同。
     PlinkoAnswer ServerResp(const PlinkoQuery& q) const;
 
     // **批量应答**：一次调用处理整批查询集。返回的答案与 `qs` 一一对应（同序同长）。
     //
     // 本地节点语义：循环调用上面的标量实现（进程内没有"往返"可省）。
-    // 远程通道语义：**必须**只发**一次** RPC 携带整批查询集（`MPA-08` 的
-    // `proto/mpraq.proto` 请求里就是 `repeated` 查询集）—— 这是 Q5
-    // （"全部查询集一次 RPC"）与 `MPRAQ_IMPL.md` §3 的硬要求：
-    // 逐条发 RPC 会让 `N = 2^14` 的一列（128 个 word）变成 128 个往返。
+    // 远程通道语义：**必须**只发**一次** RPC 携带整批查询集（`proto/mpraq.proto`
+    // 请求里就是 `repeated` 查询集）—— 这是 Q5（"全部查询集一次 RPC"）与 `MPRAQ_IMPL.md`
+    // §3 的硬要求：逐条发 RPC 会让一次多谓词查询变成"每个列 × 每个查询集"个往返。
+    // ⚠️ 一次列查询 = **1 个查询集**（一个条目 = 一整列），不再有 word 维度的展开。
     //
     // ⚠️ 校验语义：**先在整批上做几何/格式校验**（与标量路径同一套检查），
     //    再逐条应答 ⇒ 非法批次要么整批 abort、要么整批成功（绝不半途返回部分结果）。
@@ -174,15 +184,19 @@ public:
 
     bool initialized() const { return inited_; }
     const StoreParams& params() const { return params_; }
-    uint64_t num_entries() const { return static_cast<uint64_t>(words_.size()); }
+    // PIR 条目数 = m（一个条目 = 一整列）
+    uint64_t num_entries() const { return params_.entry_count(); }
 
-    // 读取单个特征 word 共享（本服务器的 XorBit 家族分量）。
+    // 读取某个条目的第 `word` 个 XOR 分量（本服务器的 XorBit 家族分量）。
     // ⚠️ **按值返回**：绝不返回内部缓冲区的引用（见文件头 §2 的历史缺陷）。
-    uint128_t FeatureWord(uint64_t i) const;
+    uint128_t FeatureEntryWord(uint64_t entry, size_t word) const;
+    // 某条目整列的起始指针（entry_words 个连续 word）—— 供 `ServerRespShared` 使用。
+    // ⚠️ 生命周期与节点绑定；调用方不得持有超过本次调用。
+    const uint128_t* FeatureEntryData(uint64_t entry) const;
     // 读取某属性某记录的共享分量
     ModShare AttributeShare(uint32_t attr_id, size_t record) const;
 
-    // 存储口径（`MPRAQ_IMPL.md` §1）：16·columns·⌈N/128⌉ + 16·N·|attrs|
+    // 存储口径：16·m·entry_words + 16·n·|attrs|
     // ⚠️ **含补齐列**（补齐列是 PIR 数据库的一部分，服务器必须真的存）。
     uint64_t StorageBytes() const;
     uint64_t FeatureStorageBytes() const;    // 特征表部分（含补齐）
@@ -209,6 +223,8 @@ private:
     PlinkoAnswer AnswerOne(const PlinkoQuery& q) const;
 
     bool inited_ = false;
+    // 本机（服务器进程）配置的档位；`InitTable` 用它做一致性校验（防静默降级）。
+    MpraqSecurityMode configured_security_mode_ = kDefaultMpraqSecurityMode;
     StoreParams params_;
     std::vector<uint128_t> words_;                          // 特征表（列主序，含补齐列）
     std::vector<std::vector<ModShare>> attr_shares_;        // 每属性一条长度 N 的向量

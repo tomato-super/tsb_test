@@ -11,20 +11,28 @@
 //   * 裁决：D8（**不做**数据库更新 / 摊销式离线）、D17（hint 生命周期）、D19-6（entry = 128 位
 //     word）、D21/D22（iPRF 口径）、**D6**（确定性随机源下的期望值测试）
 //
-// ============================ 1. 参数几何（PLINKO_SPEC §1，勘误 ④）============================
+// ============================ 1. 参数几何（符号向论文看齐）============================
 //
-//   n  数据库条目数（按位打包后的 word 数，D19-6 的 entry 粒度）
-//   w  **区块大小**（w 条连续记录一块），必须是 2 的幂（D21 硬约束）
-//   c  **区块数** c := n/w —— ⚠️ 论文的 `r` 只表示"客户端存储位数"（Thm 5.3），
-//      区块数一律写 c（勘误 ④：`MPARQ.tex` 存在 r 的符号冲突）
-//   λ  安全参数（论文部署值 80）
-//   λw **常规（主）hint 数** M；q **备份 hint 数** = λw/2（本项目取，与 `MPARQ.tex` 一致）
-//   H  := λw + q —— iPRF 的定义域 `[H)`；常规与备份**共用同一张下标空间**：
-//      槽位 0..λw-1 = 常规 hint，λw..λw+q-1 = 备份 hint（提升后**保留下标**）
-//   每条常规 hint 选 c/2+1 个区块，每条备份 hint 选 c/2 个区块
+//   m   **PIR 条目数** = LCTE 层数（一个条目 = **一整列向量**，n bit）
+//       ⚠️ 这是 Plinko 原文的 DB 大小 `n`；本仓库向论文看齐，一律写 `m`。
+//   n   记录数 = 列长（bit）。**Plinko 层不需要 n**，只需要条目宽度 `entry_words = ⌈n/128⌉`
+//       （`n` 由 MPRAQ 层持有，避免与 Plinko 原文的 `n` 撞名）。
+//   entry_words  条目宽度（128 位字数）—— 一个条目 = 一整列 = entry_words 个字
+//   w   **区块大小**（w 个连续**条目**一块），必须是 2 的幂（D21 硬约束）
+//   κ   **区块数** κ := m/w —— ⚠️ 论文的 `r` 只表示"客户端存储位数"，
+//       区块数一律写 κ（勘误 ④：`MPRAQ.tex` 存在 r 的符号冲突）
+//   λ   安全参数（论文部署值 80）
+//   λw  **常规（主）hint 数**；N_T **备份 hint 数** = λw/2（本项目取，与 `MPRAQ.tex` 一致）
+//   H  := λw + N_T —— iPRF 的定义域 `[H)`；常规与备份**共用同一张下标空间**：
+//       槽位 0..λw-1 = 常规 hint，λw..λw+N_T-1 = 备份 hint（提升后**保留下标**）
+//   每条常规 hint 选 κ/2+1 个区块，每条备份 hint 选 κ/2 个区块
 //
-//   ⚠️ **c 必须是偶数**：`c/2+1` 与补集 `[c]\(P_j\{α})` 的规模只有在 c 为偶数时才相等
-//      （`|P_j\{α}| = c/2`、`|[c]\(P_j\{α})| = c/2`），这是 §5.5 的对称性硬要求。
+//   ⚠️ **κ 必须是偶数**：`κ/2+1` 与补集 `[κ]\(P_j\{α})` 的规模只有在 κ 为偶数时才相等
+//      （`|P_j\{α}| = κ/2`、`|[κ]\(P_j\{α})| = κ/2`），这是 §5.5 的对称性硬要求。
+//
+//   ⚠️ **一次列查询 = 1 个查询集**：PIR 的 index 就是**列索引**（∈ [0,m)），
+//      服务器对该条目（整列 entry_words 个字）逐字 XOR 累加，客户端逐字重建。
+//      不变量 I1：条目恰好 entry_words 个字（不多不少）；I4：宽度不符即拒绝。
 //
 // ============================ 2. 数据结构（PLINKO_SPEC §2）============================
 //
@@ -144,31 +152,52 @@ public:
 // ---------------------------------------------------------------------------
 
 struct PlinkoParams {
-    uint64_t n = 0;              // 数据库条目数（word 数，D19-6）
-    uint64_t w = 0;              // 区块大小：**必须是 2 的幂**（D21）
+    uint64_t m = 0;              // PIR 条目数 = LCTE 层数（一个条目 = 一整列向量）
+    uint64_t entry_words = 1;    // 条目宽度（128 位字数）= ⌈n/128⌉（n = 记录数 = 列长 bit）
+    uint64_t w = 0;              // 区块大小（w 个连续**条目**一块）：**必须是 2 的幂**（D21）
     uint32_t lambda = 80;        // 安全参数
     double prp_epsilon = 1e-10;  // iPRF 的 PRP 目标 ε（D22-1：默认 1e-10；测试可调小）
 
-    // 按 PLINKO_SPEC §1 的默认口径派生：w = 2^⌈log₂√n⌉、λw 条主 hint、q = λw/2 条备份。
-    // ⚠️ 要求 `n = c·w` 且 c 为偶数；不满足时抛 std::invalid_argument 并给出"应补齐到多少"。
-    //    （补齐数据库是**上层**的事，见 D15(a)，本层不偷偷改 n。）
-    static PlinkoParams Derive(uint64_t n, uint32_t lambda = 80, double prp_epsilon = 1e-10);
+    // 按 §1 的默认口径派生：w = 2^⌈log₂√m⌉、λw 条主 hint、N_T = λw/2 条备份。
+    // ⚠️ 要求 `m = κ·w` 且 κ 为偶数；不满足时抛 std::invalid_argument 并给出"应补齐到多少"。
+    //    （补齐条目是**上层**的事，见 D15(a)，本层不偷偷改 m。）
+    static PlinkoParams Derive(uint64_t m, uint32_t lambda = 80, double prp_epsilon = 1e-10,
+                               uint64_t entry_words = 1);
 
-    // 校验：n ≥ 1、w 为 2 的幂、n % w == 0、c = n/w ≥ 2 且**为偶数**、λ ≥ 1、
-    //       ε ∈ (0,1)、H = 3λw/2 ≤ 2³²（iPRF 定义域上界）。违反时抛 std::invalid_argument。
+    // 校验：m ≥ 1、entry_words ≥ 1、w 为 2 的幂、m % w == 0、κ = m/w ≥ 2 且**为偶数**、
+    //       λ ≥ 1、ε ∈ (0,1)、H = 3λw/2 ≤ 2³²（iPRF 定义域上界）。违反时抛 std::invalid_argument。
     void Validate() const;
 
-    uint64_t block_count() const { return w == 0 ? 0 : n / w; }                     // c
-    uint64_t main_hints() const { return static_cast<uint64_t>(lambda) * w; }        // λw = M
-    uint64_t backup_hints() const { return main_hints() / 2; }                       // q
-    uint64_t hint_slots() const { return main_hints() + backup_hints(); }            // H = λw+q
-    uint64_t main_hint_blocks() const { return block_count() / 2 + 1; }              // c/2+1
-    uint64_t backup_hint_blocks() const { return block_count() / 2; }                // c/2
+    uint64_t blocks() const { return w == 0 ? 0 : m / w; }                          // κ
+    uint64_t main_hints() const { return static_cast<uint64_t>(lambda) * w; }        // λw
+    uint64_t backup_hints() const { return main_hints() / 2; }                       // N_T
+    uint64_t hint_slots() const { return main_hints() + backup_hints(); }            // H = λw+N_T
+    uint64_t main_hint_blocks() const { return blocks() / 2 + 1; }                    // κ/2+1
+    uint64_t backup_hint_blocks() const { return blocks() / 2; }                      // κ/2
     uint64_t block_of(uint64_t index) const { return index / w; }                    // α
     uint64_t offset_of(uint64_t index) const { return index % w; }                   // β
     // 交给 core/iprf 的参数：domain = H（hint 下标空间）、range = w（区块大小）
     IprfParams iprf() const;
 };
+
+// ---------------------------------------------------------------------------
+// 条目（= 一整列向量）：128 位字打包，长度恒为 entry_words
+// ---------------------------------------------------------------------------
+
+using PlinkoEntry = std::vector<uint128_t>;   // size() == m 条目的 entry_words == ⌈n/128⌉
+
+// 逐字 XOR：dst[i] ⊕= src[i]（长度必须相同）。这是"整列一次 XOR"的类型级操作。
+inline void XorInto(PlinkoEntry& dst, const uint128_t* src) {
+    for (size_t i = 0; i < dst.size(); ++i) {
+        dst[i] = static_cast<uint128_t>(dst[i] ^ src[i]);
+    }
+}
+inline void XorInto(PlinkoEntry& dst, const PlinkoEntry& src) { XorInto(dst, src.data()); }
+inline PlinkoEntry XorEntries(const PlinkoEntry& a, const PlinkoEntry& b) {
+    PlinkoEntry out(a.size());
+    for (size_t i = 0; i < a.size(); ++i) out[i] = static_cast<uint128_t>(a[i] ^ b[i]);
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // hint 槽位（主/备共用一张下标空间 H[λw+q]）
@@ -183,9 +212,10 @@ enum class PlinkoSlotKind : uint8_t {
 
 struct PlinkoHintSlot {
     PlinkoSlotKind kind = PlinkoSlotKind::kEmpty;
-    uint128_t parity = 0;              // 常规 / 提升：有效区块集上的 parity
-    uint128_t backup_parity_in = 0;    // ℓ_j：B_j 上的 parity（仅 kBackup）
-    uint128_t backup_parity_out = 0;   // r_j：([c]\B_j) 上的 parity（仅 kBackup）
+    // ⚠️ parity 是**整列**：长度 entry_words（一个条目 = 一整列 = n bit）
+    PlinkoEntry parity;                // 常规 / 提升：有效区块集上的 parity
+    PlinkoEntry backup_parity_in;      // ℓ_j：B_j 上的 parity（仅 kBackup）
+    PlinkoEntry backup_parity_out;     // r_j：([κ]\B_j) 上的 parity（仅 kBackup）
     uint8_t eta = 0;                   // η ∈ {0,1}（仅 kPromoted）
     uint64_t promoted_index = kPlinkoNoIndex;  // x：被提升进来的查询索引（仅 kPromoted）
     // QueryGen 已**预留**、等待 ClientRecon 消费：预留期间该槽位不可再被选中
@@ -204,9 +234,9 @@ struct PlinkoHintSelection {
     bool found = false;
     size_t slot = kPlinkoNoSlot;       // 命中的槽位下标（提升后保留下标）
     bool promoted = false;             // 是否为提升过的备份 hint
-    uint128_t parity = 0;              // p
-    std::vector<uint64_t> blocks;      // **有效**区块集 E（升序；c/2+1 个）
-    std::vector<uint64_t> offsets;     // o_0..o_{c-1}：每个区块的偏移（提升 hint 已打补丁）
+    PlinkoEntry parity;                // p（整列，长度 entry_words）
+    std::vector<uint64_t> blocks;      // **有效**区块集 E（升序；κ/2+1 个）
+    std::vector<uint64_t> offsets;     // o_0..o_{κ-1}：每个区块的偏移（提升 hint 已打补丁）
     // 诊断（PLINKO_SPEC §7.3 的"候选检查"回归用例）：|IF⁻¹| 与其中真正包含 α 的个数
     uint64_t candidates_examined = 0;
     uint64_t candidates_containing = 0;
@@ -216,17 +246,20 @@ struct PlinkoHintSelection {
 // 查询 / 应答
 // ---------------------------------------------------------------------------
 
-// ⚠️ **服务器可见的全部信息**：c 个区块各自的分组比特与偏移，别的一律不含
+// ⚠️ **服务器可见的全部信息**：κ 个区块各自的分组比特与偏移，别的一律不含
 // （不含目标索引、不含命中的 hint 槽位、不含 parity —— 它们都在 handle 里）。
 struct PlinkoQuery {
-    std::vector<uint64_t> offsets;  // 长度 c，每个 ∈ [0,w)
-    std::vector<uint8_t> groups;    // 长度 c，0/1：该区块归入累加器 r0 / r1
-    // 几何（服务器本来就知道 n 与 w；写进查询里使 ServerResp 自足，也便于校验）
-    uint64_t blocks = 0;            // c
-    uint64_t block_size = 0;        // w
+    std::vector<uint64_t> offsets;  // 长度 κ，每个 ∈ [0,w)
+    std::vector<uint8_t> groups;    // 长度 κ，0/1：该区块归入累加器 r0 / r1
+    // 几何（服务器本来就知道 m 与 w；写进查询里使 ServerResp 自足，也便于校验）
+    uint64_t blocks = 0;            // κ
+    uint64_t block_size = 0;        // w（**条目**/块，不是字/块）
+    // 条目宽度（字）。⚠️ 不变量 I4：服务端据此校验应答宽度，不符即拒绝（防"静默错 128 倍"）
+    uint64_t entry_words = 1;
 
     bool well_formed() const {
         if (offsets.size() != blocks || groups.size() != blocks) return false;
+        if (entry_words < 1) return false;
         for (uint64_t o : offsets) {
             if (o >= block_size) return false;
         }
@@ -237,9 +270,11 @@ struct PlinkoQuery {
     }
 };
 
+// 应答：两个累加器，各自是**整列**（长度 entry_words 个字）。
+// ⚠️ 两个 parity（S 与补集）是**隐私所必需**的，不属于"多余"。
 struct PlinkoAnswer {
-    uint128_t r0 = 0;
-    uint128_t r1 = 0;
+    PlinkoEntry r0;
+    PlinkoEntry r1;
 };
 
 // 客户端私有的查询句柄 h = (i', i, b) + 内部簿记
@@ -249,7 +284,7 @@ struct PlinkoQueryHandle {
     uint64_t requested = 0;            // i'：调用方请求的索引（重复查询时 ≠ i）
     uint8_t b = 0;                     // 累加器选择位：a = p ⊕ r_b
     size_t hint_slot = kPlinkoNoSlot;  // 命中的槽位（已被预留）
-    uint128_t hint_parity = 0;         // p（缓存下来，ClientRecon 不再重跑 GetHint）
+    PlinkoEntry hint_parity;           // p（整列，长度 entry_words；ClientRecon 不再重跑 GetHint）
     bool cache_hit = false;            // true ⇒ i' 早已答复，本次结果取自缓存 Q[i']
     bool consumed = false;             // ClientRecon 是否已完成（防止重复重建）
     // ---- 以下由 ClientRecon 回填（诊断/测试用）----
@@ -284,13 +319,15 @@ public:
 
     // ======================= 算法 1：HintInit（离线）=======================
     //
-    // **只用 IF⁻¹**：流式扫一遍 DB，每条记录 1 次求逆，把该记录 XOR 进所有
-    // "在该区块取该偏移"的 hint 的 parity（PLINKO_SPEC §3.1）。
-    // 复杂度 O(λn)（每条记录 ≈ H/w ≈ 1.5λ 个候选）；实测瓶颈是 IF⁻¹（≈1.0 ms/次）。
+    // **只用 IF⁻¹**：流式扫一遍 DB，每条**条目**（= 一整列）1 次求逆，把该条目
+    // XOR 进所有"在该区块取该偏移"的 hint 的 parity（PLINKO_SPEC §3.1）。
+    // ⚠️ 数据库是**扁平**的：`db.size() == m * entry_words`，条目 i 占
+    //    `[i*entry_words, (i+1)*entry_words)`；parity 是整列 XOR（逐字）。
+    // 复杂度 O(λm)。
     void HintInit(const std::vector<uint128_t>& db);
 
     // 同上，但区块密钥由外部提供（真实部署：`HintInit` 跑在持有 DB 的 **offline server** 上，
-    // 由它生成 K[c] 并发给客户端；两种做法产出的 hint 完全相同）。
+    // 由它生成 K[κ] 并发给客户端；两种做法产出的 hint 完全相同）。
     void HintInitWithKeys(const std::vector<uint128_t>& db,
                           const std::vector<IprfKey>& block_keys);
 
@@ -319,20 +356,24 @@ public:
     // ======================= 算法 4：ServerResp(q; D) =======================
     //
     // 按分组累加：分组为 1 的区块进 r1，其余进 r0（PLINKO_SPEC §3.4）。
+    // ⚠️ 每次读的是**整条目**（entry_words 个字），逐字 XOR 累加。
+    // `db` 必须是扁平的 m*entry_words 个字。
     static PlinkoAnswer ServerResp(const PlinkoQuery& q, const std::vector<uint128_t>& db);
 
-    // XOR 共享版本（MPRAQ 的双服务器实例化）：`entry(i)` 返回第 i 条 entry 的**一个共享分量**。
+    // XOR 共享版本（MPRAQ 的双服务器实例化）：`entry(i)` 返回第 i 条 entry 的
+    // **一个共享分量**的起始指针（指向 entry_words 个连续 word）。
     // 共享是 XOR ⇒ `ServerRespShared(q, s0) ⊕ ServerRespShared(q, s1) == ServerResp(q, 明文)`。
     template <typename Fn>
-    static PlinkoAnswer ServerRespShared(const PlinkoQuery& q, Fn&& entry) {
+    static PlinkoAnswer ServerRespShared(const PlinkoQuery& q, Fn&& entry, size_t entry_words) {
         PlinkoAnswer a;
+        a.r0.assign(entry_words, 0);
+        a.r1.assign(entry_words, 0);
         for (size_t i = 0; i < q.offsets.size(); ++i) {
-            const uint128_t v =
-                static_cast<uint128_t>(entry(q.offsets[i] + static_cast<uint64_t>(i) * q.block_size));
-            if (q.groups[i]) {
-                a.r1 = static_cast<uint128_t>(a.r1 ^ v);
-            } else {
-                a.r0 = static_cast<uint128_t>(a.r0 ^ v);
+            const uint64_t idx = q.offsets[i] + static_cast<uint64_t>(i) * q.block_size;
+            const uint128_t* v = entry(idx);
+            PlinkoEntry& acc = q.groups[i] ? a.r1 : a.r0;
+            for (size_t j = 0; j < entry_words; ++j) {
+                acc[j] = static_cast<uint128_t>(acc[j] ^ v[j]);
             }
         }
         return a;
@@ -341,17 +382,17 @@ public:
     // 两台服务器的应答合并（⊕ 与 XOR 共享线性相容，D12/D3），随后直接送 ClientRecon。
     static PlinkoAnswer XorAnswers(const PlinkoAnswer& a, const PlinkoAnswer& b) {
         PlinkoAnswer out;
-        out.r0 = static_cast<uint128_t>(a.r0 ^ b.r0);
-        out.r1 = static_cast<uint128_t>(a.r1 ^ b.r1);
+        out.r0 = XorEntries(a.r0, b.r0);
+        out.r1 = XorEntries(a.r1, b.r1);
         return out;
     }
 
     // ======================= 算法 5：ClientRecon(h, r) =======================
     //
-    // a = p ⊕ r_b；消费被用的 hint；提升一条备份 hint（下标保留，η 记录并入哪一半）；
-    // 维护重复查询缓存 Q。返回本次查询的值（重复查询时是缓存里的值）。
+    // a = p ⊕ r_b（整列逐字 XOR）；消费被用的 hint；提升一条备份 hint（下标保留，
+    // η 记录并入哪一半）；维护重复查询缓存 Q。返回本次查询的整列值。
     // 抛出：`PlinkoBackupsExhausted`（备份用尽）。
-    uint128_t ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r);
+    PlinkoEntry ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r);
 
     // ======================= 算法 6：Verify =======================
     //
@@ -373,7 +414,7 @@ public:
     bool hint_covers(size_t slot, uint64_t index) const;
     // 槽位覆盖的全部索引（每个区块一条；提升 hint 的 α' 块用补丁偏移 β'）
     std::vector<uint64_t> covered_indices(size_t slot) const;
-    // 全量覆盖掩码（长度 n）：成本 = H×c 次 IF（比 n 次 IF⁻¹ 便宜得多）
+    // 全量覆盖掩码（长度 m）：成本 = H×κ 次 IF（比 m 次 IF⁻¹ 便宜得多）
     std::vector<uint8_t> coverage_mask() const;
 
     size_t regular_hint_count() const;   // 槽位 j < λw 且仍为常规 hint 的个数
@@ -400,7 +441,7 @@ public:
 
     // 重复查询缓存 Q
     bool cached(uint64_t index) const;
-    uint128_t cached_value(uint64_t index) const;
+    PlinkoEntry cached_value(uint64_t index) const;
     size_t cached_slot(uint64_t index) const;
     uint64_t answered_count() const { return answered_; }
 
@@ -442,8 +483,8 @@ private:
     size_t subset_words_ = 0;
     std::vector<uint64_t> scratch_;                  // 子集采样/候选枚举的复用缓冲
 
-    // Q：重复查询缓存
-    std::vector<uint128_t> cache_value_;
+    // Q：重复查询缓存（每条目一整列）
+    std::vector<PlinkoEntry> cache_value_;
     std::vector<uint8_t> cache_valid_;
     std::vector<uint64_t> cache_slot_;
     uint64_t answered_ = 0;

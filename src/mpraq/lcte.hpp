@@ -188,13 +188,13 @@ PlainTable BuildLcteTable(const std::vector<int64_t>& values, const LcteParams& 
 // 明文表 → 逐列比特（m 个长度 N 的 0/1 向量），列优先视图
 std::vector<std::vector<uint8_t>> LcteColumnBits(const PlainTable& table);
 
-// 明文表 → 逐列 128 位打包（m 列 × ⌈N/128⌉ 个 word）。
+// 明文表 → 逐列 128 位打包（`m` 列 × `entry_words = ⌈n/128⌉` 个 word）。
 // 复用 `PackBitsToRing`，与 VMPQ 的按位打包口径一致。
 // 第 c 列的第 r 位落在 words[c][r/128] 的第 (r%128) 位上。
 std::vector<std::vector<uint128_t>> PackLcteColumns(const PlainTable& table);
 
 // 明文 LCTE 表 → LCTE 打包表（PIR 友好布局）：
-//   rows    = ⌈N/128⌉（word 序号）
+//   rows    = entry_words（= ⌈n/128⌉，word 序号）
 //   columns = m（LCTE 列序号）
 //   entry(w, c) = 第 c 列第 w 个 128 位 word
 // 这样 (word, 列) 恰好是 PIR 的一个 entry，而 `ShareTable::ColumnXor(c)`
@@ -207,12 +207,13 @@ PlainTable BuildLctePackedTable(const std::vector<int64_t>& values,
 // ---------------------------------------------------------------------------
 
 // 一批记录经 LCTE 编码、按列 128 位打包、再按 word 做 XOR 分片的结果。
+// ⚠️ 这个扁平布局**就是** PIR 的条目布局（一个条目 = 一整列 = `entry_words` 个字）。
 // 两台服务器各持 words0 / words1 之一；重建必须 XOR。
 struct XorShardedLcte {
     LcteParams params;
-    size_t num_records = 0;       // N
-    size_t words_per_column = 0;  // ⌈N/128⌉
-    // 列优先扁平布局：words_s[c * words_per_column + w]
+    size_t n = 0;              // 记录数 = 列长（bit）
+    size_t entry_words = 0;    // ⌈n/128⌉：一个条目（= 一整列）的宽度（字）
+    // 一列 = 一个条目：words_s[c * entry_words + w]
     std::vector<uint128_t> words0;
     std::vector<uint128_t> words1;
 };
@@ -224,7 +225,7 @@ XorShardedLcte XorShareLcte(const std::vector<int64_t>& values,
                             const LcteParams& params);
 
 // 取某台服务器（server = 0 或 1）的分片，整形成 ShareTable：
-//   rows = words_per_column，columns = m，entry(w, c) = 该 word 的 XOR 共享
+//   rows = entry_words，columns = m，entry(w, c) = 该 word 的 XOR 共享
 // ⚠️ 表内 RingShare 只是**位容器**，承载的是 XOR 共享；重建必须 XOR，
 // 绝不能喂给 `ReconstructRing` / `ReconstructTable`（那是加法共享的重建）。
 ShareTable LcteShareTable(const XorShardedLcte& sharded, int server);
@@ -233,9 +234,9 @@ ShareTable LcteShareTable(const XorShardedLcte& sharded, int server);
 PlainTable ReconstructLctePlain(const XorShardedLcte& sharded);
 
 // 由两台服务器的打包共享表重建明文 LCTE 比特表（同上，输入是 ShareTable 形式）。
-// num_records 是原始记录数 N（打包容量 ⌈N/128⌉×128 可能大于 N，故必须显式给出）。
+// `n` 是记录数（打包容量 ⌈n/128⌉×128 可能大于 n，故必须显式给出）。
 PlainTable ReconstructLcteFromShares(const ShareTable& a, const ShareTable& b,
-                                     size_t num_records);
+                                     size_t n);
 
 // ---------------------------------------------------------------------------
 // 取值域覆盖检查（Q6 的"装载期校验"）

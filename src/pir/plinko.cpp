@@ -47,8 +47,13 @@ std::string Num(uint64_t v) { return std::to_string(v); }
 // ---------------------------------------------------------------------------
 
 void PlinkoParams::Validate() const {
-    if (n < 1) {
-        throw std::invalid_argument("PlinkoParams: n 必须 >= 1（实际 " + Num(n) + "）");
+    if (m < 1) {
+        throw std::invalid_argument("PlinkoParams: m（PIR 条目数 = LCTE 层数）必须 >= 1（实际 " +
+                                    Num(m) + "）");
+    }
+    if (entry_words < 1) {
+        throw std::invalid_argument("PlinkoParams: entry_words（条目宽度 = ⌈n/128⌉ 个字）必须 >= 1"
+                                    "（实际 " + Num(entry_words) + "）");
     }
     if (w < 1) {
         throw std::invalid_argument("PlinkoParams: w 必须 >= 1（实际 " + Num(w) + "）");
@@ -60,30 +65,29 @@ void PlinkoParams::Validate() const {
             "PlinkoParams: w 必须是 2 的幂（决策 D21：w 是 iPRF 的值域，非 2 的幂会让 PMNS 退化，"
             "核心底座 core/iprf 会拒绝该输入）。实际 w = " + Num(w));
     }
-    if (n % w != 0) {
-        // 给出"补齐到多少"的建议：补齐由**上层**负责（D15(a)：数据库补齐到 2 的幂），
-        // 本层绝不偷偷改 n。
-        const uint64_t c_up = (n + w - 1) / w;
-        const uint64_t c_even = (c_up + 1) & ~static_cast<uint64_t>(1);
+    if (m % w != 0) {
+        // 给出"补齐到多少"的建议：补齐由**上层**负责（D15(a)），本层绝不偷偷改 m。
+        const uint64_t k_up = (m + w - 1) / w;
+        const uint64_t k_even = (k_up + 1) & ~static_cast<uint64_t>(1);
         throw std::invalid_argument(
-            "PlinkoParams: n 必须是 w 的整数倍（n = c·w，c = 区块数）。实际 n = " + Num(n) +
-            "、w = " + Num(w) + "；建议由上层把条目数补齐到 " + Num(c_even * w) +
+            "PlinkoParams: m 必须是 w 的整数倍（m = κ·w，κ = 区块数）。实际 m = " + Num(m) +
+            "、w = " + Num(w) + "；建议由上层把条目数补齐到 " + Num(k_even * w) +
             "（补齐口径见 D15(a)）。");
     }
-    const uint64_t c = n / w;
-    if (c < 2) {
+    const uint64_t kappa = m / w;
+    if (kappa < 2) {
         throw std::invalid_argument(
-            "PlinkoParams: c = n/w 必须 >= 2（实际 c = " + Num(c) +
-            "）。n = w（c = 1）是退化几何：每条 hint 要选 c/2+1 个区块、补集要与其对称，"
-            "c = 1 时两者不可能同时成立。");
+            "PlinkoParams: κ = m/w 必须 >= 2（实际 κ = " + Num(kappa) +
+            "）。m = w（κ = 1）是退化几何：每条 hint 要选 κ/2+1 个区块、补集要与其对称，"
+            "κ = 1 时两者不可能同时成立。");
     }
-    if (c % 2 != 0) {
-        // PLINKO_SPEC §5.5：|E\{α}| = c/2 必须与补集 c/2 严格相等 ⇒ c 必须是偶数
-        // （否则 c/2+1 个区块的主 hint 去掉 α 后是 ⌊c/2⌋ 个，与补集不对称，两半规模不等 ⇒ 隐私破）。
+    if (kappa % 2 != 0) {
+        // §5.5：|E\{α}| = κ/2 必须与补集 κ/2 严格相等 ⇒ κ 必须是偶数
+        // （否则 κ/2+1 个区块的主 hint 去掉 α 后是 ⌊κ/2⌋ 个，与补集不对称，两半规模不等 ⇒ 隐私破）。
         throw std::invalid_argument(
-            "PlinkoParams: c = n/w 必须是**偶数**（PLINKO_SPEC §5.5：c/2+1 个区块的主 hint 去掉 α 后"
-            "必须与补集同为 c/2 个）。实际 c = " + Num(c) + "；建议由上层把条目数补齐到 " +
-            Num((c + 1) * w) + "。");
+            "PlinkoParams: κ = m/w 必须是**偶数**（§5.5：κ/2+1 个区块的主 hint 去掉 α 后"
+            "必须与补集同为 κ/2 个）。实际 κ = " + Num(kappa) + "；建议由上层把条目数补齐到 " +
+            Num((kappa + 1) * w) + "。");
     }
     if (lambda == 0) {
         throw std::invalid_argument("PlinkoParams: lambda 必须 >= 1");
@@ -101,33 +105,35 @@ void PlinkoParams::Validate() const {
         throw std::invalid_argument("PlinkoParams: λw 过大/溢出（λ = " + Num(lam) + "、w = " + Num(w) +
                                     "）");
     }
-    const uint64_t m = lam * w;
-    if (m / 2 < 1) {
-        throw std::invalid_argument("PlinkoParams: q = λw/2 必须 >= 1（需要 λw >= 2）");
+    const uint64_t lw = lam * w;
+    if (lw / 2 < 1) {
+        throw std::invalid_argument("PlinkoParams: N_T = λw/2 必须 >= 1（需要 λw >= 2）");
     }
-    const uint64_t h = m + m / 2;
+    const uint64_t h = lw + lw / 2;
     if (h > kMaxIprfDomain) {
         throw std::invalid_argument(
-            "PlinkoParams: H = λw + q = " + Num(h) +
+            "PlinkoParams: H = λw + N_T = " + Num(h) +
             " 超过 2^32 —— iPRF 的定义域是 [H)，受 AES 输入块的 32 位字宽限制（见 core/iprf）。"
             "请减小 λ 或 w。");
     }
 }
 
-PlinkoParams PlinkoParams::Derive(uint64_t n, uint32_t lambda, double prp_epsilon) {
-    if (n < 4) {
+PlinkoParams PlinkoParams::Derive(uint64_t m, uint32_t lambda, double prp_epsilon,
+                                  uint64_t entry_words) {
+    if (m < 4) {
         throw std::invalid_argument(
-            "PlinkoParams::Derive: n 必须 >= 4（最小合法几何是 n = 4, w = 2, c = 2）");
+            "PlinkoParams::Derive: m 必须 >= 4（最小合法几何是 m = 4, w = 2, κ = 2）");
     }
-    // PLINKO_SPEC §1：默认 w = 2^⌈log₂√n⌉（此时 λw = λ√n，与 MPARQ.tex 的 M 一致）
+    // §1：默认 w = 2^⌈log₂√m⌉（此时 λw = λ√m，与 MPARQ.tex 的 M 一致）
     uint64_t w = 1;
-    while (w < (static_cast<uint64_t>(1) << 31) && w * w < n) w *= 2;
+    while (w < (static_cast<uint64_t>(1) << 31) && w * w < m) w *= 2;
     PlinkoParams p;
-    p.n = n;
+    p.m = m;
+    p.entry_words = entry_words == 0 ? 1 : entry_words;
     p.w = w;
     p.lambda = lambda;
     p.prp_epsilon = prp_epsilon;
-    p.Validate();  // n 不是 w 的整数倍 / c 为奇数时抛出并给出补齐建议
+    p.Validate();  // m 不是 w 的整数倍 / κ 为奇数时抛出并给出补齐建议
     return p;
 }
 
@@ -155,12 +161,12 @@ PlinkoClient::PlinkoClient(const PlinkoParams& params,
       csprng_block_keys_(csprng_block_keys) {
     rng_ = std::make_unique<random::DeterministicPrng>(stream_key_, nonce_);
     owner_id_ = static_cast<uint64_t>(rng_->Next());  // 句柄归属标识（防跨客户端误用）
-    subset_words_ = BitmapWordsFor(p_.block_count());
+    subset_words_ = BitmapWordsFor(p_.blocks());
     slots_.assign(static_cast<size_t>(p_.hint_slots()), PlinkoHintSlot{});
     subsets_.assign(static_cast<size_t>(p_.hint_slots()) * subset_words_, 0);
-    cache_value_.assign(static_cast<size_t>(p_.n), 0);
-    cache_valid_.assign(static_cast<size_t>(p_.n), 0);
-    cache_slot_.assign(static_cast<size_t>(p_.n), kPlinkoNoSlot);
+    cache_value_.assign(static_cast<size_t>(p_.m), PlinkoEntry(static_cast<size_t>(p_.entry_words), 0));
+    cache_valid_.assign(static_cast<size_t>(p_.m), 0);
+    cache_slot_.assign(static_cast<size_t>(p_.m), kPlinkoNoSlot);
     next_backup_ = static_cast<size_t>(p_.main_hints());
 }
 
@@ -172,9 +178,9 @@ PlinkoClient PlinkoClient::Deployed(const PlinkoParams& params) {
 }
 
 void PlinkoClient::InitializeEvaluators(const std::vector<IprfKey>& keys) {
-    if (keys.size() != p_.block_count()) {
+    if (keys.size() != p_.blocks()) {
         throw std::invalid_argument(
-            "PlinkoClient: 区块密钥数必须恰为 c = " + Num(p_.block_count()) + "（论文 Fig 7："
+            "PlinkoClient: 区块密钥数必须恰为 κ = " + Num(p_.blocks()) + "（论文 Fig 7："
             "**每区块一把**密钥，见勘误 ①/⑤）。实际 " + Num(keys.size()) + " 把。");
     }
     const IprfParams ip = p_.iprf();
@@ -188,30 +194,33 @@ void PlinkoClient::InitializeEvaluators(const std::vector<IprfKey>& keys) {
 
 void PlinkoClient::InitializeHintTables() {
     const uint64_t h = p_.hint_slots();
-    const uint64_t m = p_.main_hints();
+    const uint64_t lw = p_.main_hints();   // λw 条常规 hint（不变量：H 中可用 hint 恒为 λw）
     slots_.assign(static_cast<size_t>(h), PlinkoHintSlot{});
     subsets_.assign(static_cast<size_t>(h) * subset_words_, 0);
-    // 常规 hint：均匀随机选 c/2+1 个区块；备份 hint：均匀随机选 c/2 个区块
-    for (uint64_t j = 0; j < m; ++j) {
+    // 常规 hint：均匀随机选 κ/2+1 个区块；备份 hint：均匀随机选 κ/2 个区块
+    for (uint64_t j = 0; j < lw; ++j) {
         slots_[j].kind = PlinkoSlotKind::kRegular;
+        slots_[j].parity.assign(static_cast<size_t>(p_.entry_words), 0);
         RandomSubset(static_cast<size_t>(j), p_.main_hint_blocks());
     }
-    for (uint64_t j = m; j < h; ++j) {
+    for (uint64_t j = lw; j < h; ++j) {
         slots_[j].kind = PlinkoSlotKind::kBackup;
+        slots_[j].backup_parity_in.assign(static_cast<size_t>(p_.entry_words), 0);
+        slots_[j].backup_parity_out.assign(static_cast<size_t>(p_.entry_words), 0);
         RandomSubset(static_cast<size_t>(j), p_.backup_hint_blocks());
     }
     std::fill(cache_valid_.begin(), cache_valid_.end(), 0);  // 离线完成 ⇒ Q 清空（论文 Fig 7）
-    std::fill(cache_value_.begin(), cache_value_.end(), 0);
+    for (PlinkoEntry& v : cache_value_) v.assign(static_cast<size_t>(p_.entry_words), 0);
     std::fill(cache_slot_.begin(), cache_slot_.end(), kPlinkoNoSlot);
     answered_ = 0;
-    next_backup_ = static_cast<size_t>(m);
+    next_backup_ = static_cast<size_t>(lw);
     eta0_ = 0;
     eta1_ = 0;
     query_count_ = 0;
 }
 
 void PlinkoClient::RandomSubset(size_t slot, uint64_t count) {
-    const uint64_t c = p_.block_count();
+    const uint64_t c = p_.blocks();
     scratch_.resize(static_cast<size_t>(c));
     std::iota(scratch_.begin(), scratch_.end(), uint64_t{0});
     // 部分 Fisher–Yates：均匀随机取 count 个互不相同的区块（每条 hint 独立采样）
@@ -254,51 +263,53 @@ uint64_t PlinkoClient::bit_count(size_t slot) const {
 // ---------------------------------------------------------------------------
 
 void PlinkoClient::HintInit(const std::vector<uint128_t>& db) {
-    if (db.size() < p_.n) {
-        throw std::invalid_argument("PlinkoClient::HintInit: 数据库长度不足 n（需要 " + Num(p_.n) +
-                                    "，实际 " + Num(db.size()) + "）");
+    const uint64_t need = p_.m * p_.entry_words;
+    if (db.size() < need) {
+        throw std::invalid_argument("PlinkoClient::HintInit: 数据库长度不足（需要 m*entry_words = " +
+                                    Num(need) + " 个字，实际 " + Num(db.size()) + "）");
     }
-    // 论文 Fig 7：K[i] ← iF.Gen，i = 1..c —— **每个区块一把**（勘误 ①/⑤）
+    // 论文 Fig 7：K[i] ← iF.Gen，i = 1..κ —— **每个区块一把**（勘误 ①/⑤）
     const std::vector<IprfKey> keys = Iprf::GenBlockKeys(
-        static_cast<size_t>(p_.block_count()), csprng_block_keys_, nonce_);
+        static_cast<size_t>(p_.blocks()), csprng_block_keys_, nonce_);
     HintInitWithKeys(db, keys);
 }
 
 void PlinkoClient::HintInitWithKeys(const std::vector<uint128_t>& db,
                                     const std::vector<IprfKey>& block_keys) {
-    if (db.size() < p_.n) {
-        throw std::invalid_argument("PlinkoClient::HintInitWithKeys: 数据库长度不足 n（需要 " +
-                                    Num(p_.n) + "，实际 " + Num(db.size()) + "）");
+    const uint64_t need = p_.m * p_.entry_words;
+    if (db.size() < need) {
+        throw std::invalid_argument("PlinkoClient::HintInitWithKeys: 数据库长度不足（需要 " +
+                                    Num(need) + " 个字，实际 " + Num(db.size()) + "）");
     }
-    InitializeEvaluators(block_keys);  // c 个求值器（长期持有）
+    InitializeEvaluators(block_keys);  // κ 个求值器（长期持有）
     InitializeHintTables();            // 随机子集 + parity 清零
 
     const uint64_t w = p_.w;
-    const uint64_t m = p_.main_hints();
+    const uint64_t lw = p_.main_hints();
     std::vector<uint64_t> cand;
-    // 流式扫一遍 DB：每条记录**恰好 1 次 IF⁻¹**，把该记录 XOR 进所有"在该区块取该偏移"的 hint。
-    // ⚠️ 复杂度 O(λn)：候选数 ≈ H/w ≈ 1.5λ；实测瓶颈是 IF⁻¹（≈1.0 ms/次，D22-1）。
+    // 流式扫一遍 DB：每条**条目**（= 一整列）恰好 1 次 IF⁻¹，把该条目 XOR 进所有
+    // "在该区块取该偏移"的 hint 的 parity（**整列逐字 XOR**）。
+    // ⚠️ 复杂度 O(λm)：候选数 ≈ H/w ≈ 1.5λ；实测瓶颈是 IF⁻¹（≈1.0 ms/次，D22-1）。
     // ⚠️ 论文说按随机顺序遍历候选，本实现按升序（core/iprf::Inverse 的输出是升序）：
     //    parity 是 XOR 累加，**与顺序无关** ⇒ 随机顺序对结果没有任何影响。
-    for (uint64_t i = 0; i < p_.n; ++i) {
-        const uint128_t d = db[static_cast<size_t>(i)];
+    for (uint64_t i = 0; i < p_.m; ++i) {
+        const uint128_t* d = db.data() + i * p_.entry_words;
         const uint64_t alpha = i / w;
         const uint64_t beta = i - alpha * w;
         block_iprf_[static_cast<size_t>(alpha)]->Inverse(beta, cand);
         for (uint64_t j : cand) {
-            if (j < m) {
+            if (j < lw) {
                 // 常规 hint：只有 α ∈ P_j 才计入 parity（Fig 7 的 `If α ∈ P`）
                 if (bit_test(static_cast<size_t>(j), alpha)) {
-                    slots_[static_cast<size_t>(j)].parity =
-                        static_cast<uint128_t>(slots_[static_cast<size_t>(j)].parity ^ d);
+                    XorInto(slots_[static_cast<size_t>(j)].parity, d);
                 }
             } else {
                 // 备份 hint：α ∈ B_j ⇒ 计入 ℓ_j，否则计入 r_j（r_j 是**补集**上的 parity）
                 PlinkoHintSlot& t = slots_[static_cast<size_t>(j)];
                 if (bit_test(static_cast<size_t>(j), alpha)) {
-                    t.backup_parity_in = static_cast<uint128_t>(t.backup_parity_in ^ d);
+                    XorInto(t.backup_parity_in, d);
                 } else {
-                    t.backup_parity_out = static_cast<uint128_t>(t.backup_parity_out ^ d);
+                    XorInto(t.backup_parity_out, d);
                 }
             }
         }
@@ -310,7 +321,7 @@ void PlinkoClient::HintInitWithKeys(const std::vector<uint128_t>& db,
 // ---------------------------------------------------------------------------
 
 bool PlinkoClient::slot_contains_block(size_t slot, uint64_t block) const {
-    if (slot >= slots_.size() || block >= p_.block_count()) return false;
+    if (slot >= slots_.size() || block >= p_.blocks()) return false;
     const PlinkoHintSlot& s = slots_[slot];
     if (s.kind == PlinkoSlotKind::kEmpty) return false;
     bool in = bit_test(slot, block);
@@ -329,7 +340,7 @@ PlinkoHintSelection PlinkoClient::SelectFromSlot(size_t slot, uint64_t alpha, ui
     const PlinkoHintSlot& s = slots_[slot];
     if (!s.in_hint_table()) return sel;  // ⊥ 或"未提升的备份 hint"（T[j] 不在 H 中，不可被查询选中）
 
-    const uint64_t c = p_.block_count();
+    const uint64_t c = p_.blocks();
     const bool promoted = (s.kind == PlinkoSlotKind::kPromoted);
     const uint64_t alpha_prime = promoted ? p_.block_of(s.promoted_index) : kPlinkoNoIndex;
     const uint64_t beta_prime = promoted ? p_.offset_of(s.promoted_index) : 0;
@@ -366,8 +377,8 @@ PlinkoHintSelection PlinkoClient::GetHint(uint64_t alpha, uint64_t beta) const {
     if (block_iprf_.empty()) {
         throw std::logic_error("PlinkoClient::GetHint: 尚未调用 HintInit（求值器未构造）");
     }
-    if (alpha >= p_.block_count()) {
-        throw std::out_of_range("PlinkoClient::GetHint: α 越界（要求 < c = " + Num(p_.block_count()) +
+    if (alpha >= p_.blocks()) {
+        throw std::out_of_range("PlinkoClient::GetHint: α 越界（要求 < c = " + Num(p_.blocks()) +
                                 "，实际 " + Num(alpha) + "）");
     }
     if (beta >= p_.w) {
@@ -402,7 +413,7 @@ std::vector<uint64_t> PlinkoClient::candidates(uint64_t alpha, uint64_t beta) co
     if (block_iprf_.empty()) {
         throw std::logic_error("PlinkoClient::candidates: 尚未调用 HintInit");
     }
-    if (alpha >= p_.block_count() || beta >= p_.w) {
+    if (alpha >= p_.blocks() || beta >= p_.w) {
         throw std::out_of_range("PlinkoClient::candidates: (α, β) 越界");
     }
     std::vector<uint64_t> out;
@@ -411,7 +422,7 @@ std::vector<uint64_t> PlinkoClient::candidates(uint64_t alpha, uint64_t beta) co
 }
 
 bool PlinkoClient::hint_covers(size_t slot, uint64_t index) const {
-    if (index >= p_.n || slot >= slots_.size()) return false;
+    if (index >= p_.m || slot >= slots_.size()) return false;
     const PlinkoHintSlot& s = slots_[slot];
     if (!s.in_hint_table()) return false;
     const uint64_t alpha = p_.block_of(index);
@@ -433,7 +444,7 @@ std::vector<uint64_t> PlinkoClient::covered_indices(size_t slot) const {
     std::vector<uint64_t> out;
     const PlinkoHintSlot& s = slots_[slot];
     if (!s.in_hint_table()) return out;  // ⊥ / 未提升的备份 hint：不覆盖任何记录
-    const uint64_t c = p_.block_count();
+    const uint64_t c = p_.blocks();
     const uint64_t w = p_.w;
     for (uint64_t b = 0; b < c; ++b) {
         if (!slot_contains_block(slot, b)) continue;
@@ -447,7 +458,7 @@ std::vector<uint64_t> PlinkoClient::covered_indices(size_t slot) const {
 }
 
 std::vector<uint8_t> PlinkoClient::coverage_mask() const {
-    std::vector<uint8_t> mask(static_cast<size_t>(p_.n), 0);
+    std::vector<uint8_t> mask(static_cast<size_t>(p_.m), 0);
     for (size_t slot = 0; slot < slots_.size(); ++slot) {
         const PlinkoHintSlot& s = slots_[slot];
         if (!s.in_hint_table() || s.reserved) continue;
@@ -457,7 +468,7 @@ std::vector<uint8_t> PlinkoClient::coverage_mask() const {
 }
 
 std::vector<size_t> PlinkoClient::covering_slots(uint64_t index) const {
-    if (index >= p_.n) throw std::out_of_range("PlinkoClient::covering_slots: 索引越界");
+    if (index >= p_.m) throw std::out_of_range("PlinkoClient::covering_slots: 索引越界");
     std::vector<size_t> out;
     for (size_t slot = 0; slot < slots_.size(); ++slot) {
         if (slots_[slot].reserved) continue;
@@ -482,7 +493,7 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::BuildQuery(const PlinkoH
             "PlinkoClient::BuildQuery: 槽位已被预留/已消费 —— 同一条 hint 不得被两条查询复用"
             "（PLINKO_SPEC §0 的 hint 生命周期）");
     }
-    const uint64_t c = p_.block_count();
+    const uint64_t c = p_.blocks();
     const uint64_t w = p_.w;
     const uint64_t alpha = p_.block_of(target);
     const uint64_t beta = p_.offset_of(target);
@@ -493,6 +504,7 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::BuildQuery(const PlinkoH
     PlinkoQuery q;
     q.blocks = c;
     q.block_size = w;
+    q.entry_words = p_.entry_words;   // I4：服务端据此校验应答宽度
     q.offsets.assign(static_cast<size_t>(c), 0);
     q.groups.assign(static_cast<size_t>(c), 0);
 
@@ -534,8 +546,8 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::BuildQuery(const PlinkoH
 }
 
 std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::QueryGen(uint64_t index) {
-    if (index >= p_.n) {
-        throw std::out_of_range("PlinkoClient::QueryGen: 索引越界（要求 < n = " + Num(p_.n) +
+    if (index >= p_.m) {
+        throw std::out_of_range("PlinkoClient::QueryGen: 索引越界（要求 < n = " + Num(p_.m) +
                                 "，实际 " + Num(index) + "）");
     }
     if (block_iprf_.empty()) {
@@ -553,15 +565,15 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::QueryGen(uint64_t index)
     const uint64_t requested = index;
     uint64_t target = index;
     if (cached(target)) {
-        if (answered_ >= p_.n) {
+        if (answered_ >= p_.m) {
             throw std::runtime_error(
                 "PlinkoClient::QueryGen: 全部 n 个索引都已答复过，无法再为重复查询选取新索引"
                 "（应当重跑离线阶段）");
         }
         uint64_t guard = 0;
-        const uint64_t max_attempts = 128 + 8 * p_.n;
+        const uint64_t max_attempts = 128 + 8 * p_.m;
         do {
-            target = static_cast<uint64_t>(rng_->Below(p_.n));
+            target = static_cast<uint64_t>(rng_->Below(p_.m));
         } while (cached(target) && ++guard < max_attempts);
         if (cached(target)) {
             throw std::runtime_error("PlinkoClient::QueryGen: 拒绝采样未能取到未答复的索引");
@@ -579,7 +591,7 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::QueryGen(uint64_t index)
 }
 
 std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::QueryViaSlot(size_t slot, uint64_t index) {
-    if (index >= p_.n) {
+    if (index >= p_.m) {
         throw std::out_of_range("PlinkoClient::QueryViaSlot: 索引越界");
     }
     if (slot >= slots_.size()) {
@@ -617,27 +629,24 @@ PlinkoAnswer PlinkoClient::ServerResp(const PlinkoQuery& q, const std::vector<ui
     if (!q.well_formed()) {
         throw std::invalid_argument("PlinkoClient::ServerResp: 查询格式非法（长度/偏移越界）");
     }
-    if (db.size() < q.blocks * q.block_size) {
-        throw std::invalid_argument("PlinkoClient::ServerResp: 数据库长度不足 n");
+    // ⚠️ 条目 = 一整列（entry_words 个字）⇒ 需要 κ·w·entry_words 个字（I1/I4：宽度自洽）
+    const uint64_t need = q.blocks * q.block_size * q.entry_words;
+    if (db.size() < need) {
+        throw std::invalid_argument("PlinkoClient::ServerResp: 数据库长度不足（需要 " + Num(need) +
+                                    " 个字，实际 " + Num(db.size()) + "）");
     }
-    PlinkoAnswer a;
-    for (uint64_t i = 0; i < q.blocks; ++i) {
-        const uint64_t idx = i * q.block_size + q.offsets[static_cast<size_t>(i)];
-        const uint128_t v = db[static_cast<size_t>(idx)];
-        if (q.groups[static_cast<size_t>(i)]) {
-            a.r1 = static_cast<uint128_t>(a.r1 ^ v);
-        } else {
-            a.r0 = static_cast<uint128_t>(a.r0 ^ v);
-        }
-    }
-    return a;
+    const uint64_t ew = q.entry_words;
+    return ServerRespShared(
+        q,
+        [&db, ew](uint64_t idx) -> const uint128_t* { return db.data() + idx * ew; },
+        static_cast<size_t>(ew));
 }
 
 // ---------------------------------------------------------------------------
 // §4 算法 5：ClientRecon
 // ---------------------------------------------------------------------------
 
-uint128_t PlinkoClient::ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r) {
+PlinkoEntry PlinkoClient::ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r) {
     if (h.owner != owner_id_) {
         throw std::invalid_argument("PlinkoClient::ClientRecon: 句柄不属于本客户端");
     }
@@ -653,19 +662,24 @@ uint128_t PlinkoClient::ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r)
         throw std::invalid_argument(
             "PlinkoClient::ClientRecon: 该槽位未被 QueryGen 预留（句柄非法或已被消费）");
     }
-    if (h.target >= p_.n || h.requested >= p_.n) {
+    if (h.target >= p_.m || h.requested >= p_.m) {
         throw std::invalid_argument("PlinkoClient::ClientRecon: 句柄的索引非法");
     }
 
-    // ① 目标值：a = p ⊕ r_b（b 决定取哪个累加器；累加器 b 恰好装着侧 A = E\{α}）
-    const uint128_t a = static_cast<uint128_t>(h.hint_parity ^ (h.b ? r.r1 : r.r0));
+    // ① 目标值：a = p ⊕ r_b（整列逐字 XOR；b 决定取哪个累加器；累加器 b 恰好装着侧 A = E\{α}）
+    const PlinkoEntry& rb = h.b ? r.r1 : r.r0;
+    if (rb.size() != h.hint_parity.size()) {
+        throw std::invalid_argument("PlinkoClient::ClientRecon: 应答宽度与 hint parity 不一致"
+                                    "（I4：宽度不符即拒绝）");
+    }
+    const PlinkoEntry a = XorEntries(h.hint_parity, rb);
 
     // ② 消费被使用的 hint（H[j] ← ⊥）。主/备共用同一张下标空间：被消费的槽位不动，
     //    提升的备份 hint 落到**自己的下标** λw+k 上（论文 §5.2：keeps the same table index）。
     s.kind = PlinkoSlotKind::kEmpty;
-    s.parity = 0;
-    s.backup_parity_in = 0;
-    s.backup_parity_out = 0;
+    s.parity.clear();
+    s.backup_parity_in.clear();
+    s.backup_parity_out.clear();
     s.eta = 0;
     s.promoted_index = kPlinkoNoIndex;
     s.reserved = false;
@@ -690,9 +704,10 @@ uint128_t PlinkoClient::ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& r)
     t.kind = PlinkoSlotKind::kPromoted;
     t.eta = in_b ? 1 : 0;
     t.promoted_index = h.target;
-    t.parity = static_cast<uint128_t>((in_b ? t.backup_parity_out : t.backup_parity_in) ^ a);
-    t.backup_parity_in = 0;
-    t.backup_parity_out = 0;
+    // parity（整列）= 另一半的 parity ⊕ 本次重建出的 a（逐字 XOR）
+    t.parity = XorEntries(in_b ? t.backup_parity_out : t.backup_parity_in, a);
+    t.backup_parity_in.clear();
+    t.backup_parity_out.clear();
     if (in_b) {
         ++eta1_;
     } else {
@@ -791,7 +806,7 @@ size_t PlinkoClient::usable_hint_count() const {
 }
 
 uint64_t PlinkoClient::iprf_offset(uint64_t block, uint64_t hint_slot) const {
-    if (block >= p_.block_count() || hint_slot >= p_.hint_slots()) {
+    if (block >= p_.blocks() || hint_slot >= p_.hint_slots()) {
         throw std::out_of_range("PlinkoClient::iprf_offset: 参数越界");
     }
     return block_iprf_[static_cast<size_t>(block)]->Forward(hint_slot);
@@ -805,10 +820,10 @@ const Iprf& PlinkoClient::block_iprf(uint64_t block) const {
 }
 
 bool PlinkoClient::cached(uint64_t index) const {
-    return index < p_.n && cache_valid_[static_cast<size_t>(index)] != 0;
+    return index < p_.m && cache_valid_[static_cast<size_t>(index)] != 0;
 }
 
-uint128_t PlinkoClient::cached_value(uint64_t index) const {
+PlinkoEntry PlinkoClient::cached_value(uint64_t index) const {
     if (!cached(index)) {
         throw std::invalid_argument("PlinkoClient::cached_value: 该索引不在缓存里");
     }
@@ -823,27 +838,31 @@ size_t PlinkoClient::cached_slot(uint64_t index) const {
 }
 
 size_t PlinkoClient::hint_state_bytes() const {
+    // ⚠️ cache_value_ 每条目是一整列（entry_words 个字），不是 1 个字
     return slots_.size() * sizeof(PlinkoHintSlot) + subsets_.size() * sizeof(uint64_t) +
-           cache_value_.size() * sizeof(uint128_t) + cache_valid_.size() * sizeof(uint8_t) +
-           cache_slot_.size() * sizeof(uint64_t);
+           cache_value_.size() * static_cast<size_t>(p_.entry_words) * sizeof(uint128_t) +
+           cache_valid_.size() * sizeof(uint8_t) + cache_slot_.size() * sizeof(uint64_t);
 }
 
 double PlinkoClient::logical_hint_bytes() const {
     // 按 PLINKO_SPEC §2 表的口径统计"每条 hint 的开销"（不含索引/容器开销）：
-    //   常规/备份 hint：parity（1 或 2 个 128 位字）+ 子集位图 ⌈c/64⌉×8 B
+    //   常规/备份 hint：parity（1 或 2 个**整列**，各 entry_words 个 128 位字）
+    //                   + 子集位图 ⌈κ/64⌉×8 B
     //   提升后：1 个 parity + η（1 B）+ x（8 B）+ 原始 B 的位图
+    // ⚠️ parity 是整列 ⇒ 宽度 16×entry_words B（不是固定 16 B）
     const double bitmap = static_cast<double>(subset_words_) * 8.0;
+    const double col = 16.0 * static_cast<double>(p_.entry_words);
     double total = 0.0;
     for (const PlinkoHintSlot& s : slots_) {
         switch (s.kind) {
             case PlinkoSlotKind::kRegular:
-                total += 16.0 + bitmap;
+                total += col + bitmap;
                 break;
             case PlinkoSlotKind::kBackup:
-                total += 32.0 + bitmap;
+                total += 2.0 * col + bitmap;
                 break;
             case PlinkoSlotKind::kPromoted:
-                total += 16.0 + 9.0 + bitmap;
+                total += col + 9.0 + bitmap;
                 break;
             case PlinkoSlotKind::kEmpty:
             default:

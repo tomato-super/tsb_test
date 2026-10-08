@@ -3,9 +3,32 @@
 # 约定：每个模块一个独立的测试可执行文件（各自注册用例集），
 # 公共入口在 support/test_main.cpp，用例文件里不要写 main。
 #
-# 测试支撑代码（框架 + TestCluster）编成静态库 tsb_test_support：
-#   * 静态库的 PUBLIC 依赖会自动传递给链接方，不必在每个 target 上重复声明
-#   * 避免把 support 源文件塞进每个可执行文件（会重复编译并放大依赖）
+# ===========================================================================
+# ⚠️ 现状（2026-10-08）：**用例文件已全部删除**，待 MPRAQ 列粒度迁移时重写
+# ===========================================================================
+# 原因：负责人指令"现有的测试太多，且都已经过时了，删掉，后面迁移代码时重写"。
+# 背景：新版论文把 MPRAQ 的 PIR 条目粒度从「128 位 word」改成「一整列向量」
+#       （条目数 = LCTE 层数 m，PIR index = 列索引），现有 26 个用例里与几何/
+#       账目/查询集数相关的断言全部作废，逐条改造成本高于重写。
+#
+# 已删除的 26 个用例文件（**在 git 里，可用 `git checkout -- tests/` 恢复**）：
+#   test_field test_aes_prf test_hash test_config test_secret_sharing test_transport
+#   test_database test_verify test_adversary test_mpc test_voo_pir test_vmpq
+#   test_grpc_e2e test_cluster test_mpraq_lcte test_iprf test_mpraq_securemul
+#   test_plinko test_mpraq_init test_mpraq_count test_mpraq_sum test_mpraq_malicious
+#   test_mpraq_grpc test_mpraq_e2e test_mpraq_scaling test_mpraq_scale_config
+#
+# ⚠️ **`support/` 保留，不能删**：`tests/support/mpraq_baseline.hpp` 是
+#    `bench/bench_mpraq.cpp` 与 `src/apps/mpraq_client.cpp` 的**真实 #include 依赖**
+#    （经 `tsb_net_mpraq_remote` 的 PUBLIC include 目录），删掉会让 benchmark 与 demo
+#    直接编译失败。它承载"独立明文基准"（铁律 D6），不是测试专用物。
+#    ⇒ 迁移时应把 `mpraq_baseline.hpp` 移到非 tests 的位置（它已被生产目标使用）。
+#
+# 重写时的纪律（沿用，勿改）：
+#   * 每个算法都要有**确定性随机源下的期望值测试**（铁律 D6），只验"跑通"不算。
+#   * 口径要变成**可执行断言**（本仓库反复受益：D28/D31/D32/D35 都是被断言逼出来的）。
+#   * 计时类断言不进测试（结果不稳定）；计时只进 bench。
+#   * 运行期输出只出裸 `key=value`，解释文字进注释（决策 D40）。
 
 add_library(tsb_test_support STATIC
     support/test_framework.cpp
@@ -35,72 +58,21 @@ function(add_tsb_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-# ---- 第 1 层：core ----
-add_tsb_test(test_field test_field.cpp)
-add_tsb_test(test_aes_prf test_aes_prf.cpp)
-add_tsb_test(test_hash test_hash.cpp)
-add_tsb_test(test_config test_config.cpp)
+# ---------------------------------------------------------------------------
+# 用例注册区
+# ---------------------------------------------------------------------------
 
-# ---- 第 1/2 层：net 与 shared ----
-add_tsb_test(test_secret_sharing test_secret_sharing.cpp)
-add_tsb_test(test_transport test_transport.cpp)
-add_tsb_test(test_database test_database.cpp)
-add_tsb_test(test_verify test_verify.cpp)
+# 列粒度迁移的**条目精确性契约**（不变量 I1–I4）+ D40 print 护栏。
+# 这是迁移后第一批重写的用例（负责人：测试在迁移时重写）。
+add_tsb_test(test_mpraq_entry test_mpraq_entry.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_net_mpraq_remote)
 
-# ---- 恶意行为注入（FND-15）----
-add_tsb_test(test_adversary test_adversary.cpp)
-add_tsb_test(test_mpc test_mpc.cpp)
-
-# ---- 检索原语（PIR-01）----
-
-# ---- 第 3 层：VMPQ 协议 ----
-
-# ---- 真实 gRPC 端到端（FND-10 / VMP-08）----
-
-# ---- 双服务器仿真框架 ----
-add_tsb_test(test_cluster test_cluster.cpp)
-
-# ---- 第 5 层：MPRAQ（MPA-01 LCTE 编码 + MPA-02 谓词解析）----
-add_tsb_test(test_mpraq_lcte test_mpraq_lcte.cpp LIBS tsb_mpraq)
-
-# ---- 第 1 层：core/iprf（FND-06，MPRAQ 检索底座）----
-add_tsb_test(test_iprf test_iprf.cpp)
-
-# ---- 第 5 层：MPRAQ（MPA-05 SecureMul 三方消息流）----
-add_tsb_test(test_mpraq_securemul test_mpraq_securemul.cpp LIBS tsb_mpraq tsb_net)
-
-# ---- 检索原语（PIR-04）：Plinko 六算法（MPRAQ 的检索底座）----
-add_tsb_test(test_plinko test_plinko.cpp LIBS tsb_pir)
-
-# ---- 第 5 层：MPRAQ（MPA-03 Init：服务器共享表 + 客户端七步）----
-add_tsb_test(test_mpraq_init test_mpraq_init.cpp LIBS tsb_mpraq tsb_pir tsb_net)
-add_tsb_test(test_mpraq_count test_mpraq_count.cpp LIBS tsb_mpraq tsb_pir tsb_net)
-# ---- 第 5 层：MPRAQ（MPA-06 Sum/Avg：批量 SecureMul 聚合）----
-add_tsb_test(test_mpraq_sum test_mpraq_sum.cpp LIBS tsb_mpraq tsb_pir tsb_net)
-# ---- 第 5 层：MPRAQ（MPA-07 恶意模型验证路径：系统级篡改注入矩阵 + 验证边界）----
-add_tsb_test(test_mpraq_malicious test_mpraq_malicious.cpp LIBS tsb_mpraq tsb_pir tsb_net)
-
-# ---- 第 5 层：MPRAQ（§9.2 S5 前置：MPRAQ 的传输层 = 真实 gRPC）----
-add_tsb_test(test_mpraq_grpc test_mpraq_grpc.cpp LIBS tsb_net_mpraq tsb_mpraq tsb_pir mpraq_proto)
-
-# ---- 第 5 层：MPRAQ（MPA-08 端到端 demo：真实 gRPC、客户端 + 两台服务器实例）----
-# 复用 `src/net/mpraq_remote_securemul.*`（两进程链路）与 `tests/support/mpraq_baseline.hpp`
-add_tsb_test(test_mpraq_e2e test_mpraq_e2e.cpp LIBS tsb_net_mpraq_remote)
-
-# ---- 第 5 层：MPRAQ（MPA-09 参数与复杂度验证：确定性公式/账目不变量）----
-# ⚠️ 只用结构/账目/公式类断言（铁律 D6，**不含计时断言**）；用例 ⑥⑧ 会**驱动 `bench_mpraq`
-# 二进制**（断言"超预算拒绝运行"与"`--json` 可解析"——这两条是**程序/契约**行为，
-# 在进程内调库函数证明不了）⇒ 必须依赖 `bench_mpraq` 目标并把它的路径编译进来。
-add_tsb_test(test_mpraq_scaling test_mpraq_scaling.cpp
-    LIBS tsb_net_mpraq_remote tsb_net_mpraq tsb_mpraq tsb_pir tsb_net)
-add_dependencies(test_mpraq_scaling bench_mpraq)
-target_compile_definitions(test_mpraq_scaling PRIVATE
-    MPRAQ_BENCH_BIN="$<TARGET_FILE:bench_mpraq>")
-
-# ---- 第 5 层：MPRAQ（规模配置层：行数/每属性列数/谓词数 ⇒ 其余自动派生）----
-# ⚠️ 确定性、**无计时断言**（铁律 D6）；用例 ⑧ 会读仓库内的示例配置
-# `config/mpraq_scale.json` ⇒ 把它的绝对路径编译进来（不依赖运行目录）。
-add_tsb_test(test_mpraq_scale_config test_mpraq_scale_config.cpp
-    LIBS tsb_mpraq tsb_pir tsb_net)
-target_compile_definitions(test_mpraq_scale_config PRIVATE
-    MPRAQ_SCALE_CONFIG_PATH="${CMAKE_SOURCE_DIR}/config/mpraq_scale.json")
+# 待重写（分层清单见文件末尾注释）：
+#   第 1 层 core   → test_field / test_aes_prf / test_hash / test_config / test_iprf
+#   第 2 层 shared → test_secret_sharing / test_database / test_mpc / test_verify
+#                     / test_adversary / test_transport
+#   第 3 层 pir    → test_voo_pir / test_plinko
+#   第 4 层 vmpq   → test_vmpq / test_grpc_e2e
+#   第 5 层 mpraq  → test_mpraq_lcte / test_mpraq_init / test_mpraq_count
+#                     test_mpraq_securemul / test_mpraq_sum / test_mpraq_malicious
+#                     test_mpraq_grpc / test_mpraq_e2e / test_mpraq_scaling
+#                     test_mpraq_scale_config

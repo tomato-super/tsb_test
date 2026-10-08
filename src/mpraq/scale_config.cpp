@@ -50,7 +50,7 @@ uint64_t NextPow2Local(uint64_t v) {
 
 const char* const kKnownFields[] = {"rows",       "columns_per_attribute", "attributes",
                                     "predicates", "lambda",                "eps",
-                                    "seed"};
+                                    "seed",       "security_mode"};
 
 bool IsKnownField(const std::string& k) {
     for (const char* f : kKnownFields) {
@@ -248,6 +248,9 @@ MpraqScaleConfig ParseDoc(const JsonConfig& doc) {
     c.lambda = ToU32Field(GetU64(root, "lambda", c.lambda), "lambda");
     c.eps = GetDouble(root, "eps", c.eps);
     c.seed = GetU64(root, "seed", c.seed);
+    // 档位：字符串键，**严格解析**（非法值在这里就拒绝启动，不静默回落）
+    c.security_mode = ParseMpraqSecurityMode(
+        root.StringOr("security_mode", MpraqSecurityModeName(c.security_mode)));
     return c;
 }
 
@@ -312,6 +315,11 @@ int64_t ScaleDomainMax(const MpraqScaleConfig& config) {
 }
 
 void ValidateScaleConfig(const MpraqScaleConfig& c) {
+    // 档位：JSON/CLI 路径已由 ParseMpraqSecurityMode 严格把关；这里挡住**程序内构造**
+    // 出的非法值（`static_cast<MpraqSecurityMode>(7)` 是编译得过的）。
+    if (!IsKnownMpraqSecurityMode(static_cast<uint32_t>(c.security_mode))) {
+        BadConfig("security_mode 不是合法档位（只认 malicious / semi-honest）");
+    }
     // ① 行数 = 记录数 N，必须是 2 的幂
     if (c.rows == 0) {
         BadConfig("字段 'rows'（记录数 N）不能为 0 —— 必须 >= 1 且是 2 的幂");
@@ -423,7 +431,7 @@ bool MpraqScaleOverrides::any() const {
 
 std::string MpraqScaleOverrides::FlagList() {
     return "--rows, --columns（= 每属性列数）, --attributes, --predicates, --lambda, "
-           "--eps, --seed";
+           "--eps, --seed, --security-mode";
 }
 
 namespace {
@@ -476,7 +484,7 @@ bool MpraqScaleOverrides::IsScaleFlag(const std::string& flag) {
     const std::string f = NormalizeFlag(flag);
     return f == "rows" || f == "columns" || f == "columns_per_attribute" ||
            f == "attributes" || f == "predicates" || f == "lambda" || f == "eps" ||
-           f == "seed";
+           f == "seed" || f == "security_mode" || f == "security-mode";
 }
 
 void MpraqScaleOverrides::Set(const std::string& flag, const std::string& value) {
@@ -495,6 +503,10 @@ void MpraqScaleOverrides::Set(const std::string& flag, const std::string& value)
         eps = ParseDoubleOrThrow(f, value);
     } else if (f == "seed") {
         seed = ParseU64OrThrow(f, value);
+    } else if (f == "security_mode" || f == "security-mode") {
+        // 先严格解析（非法值立刻拒绝），再存字符串
+        (void)ParseMpraqSecurityMode(value);
+        security_mode = value;
     } else {
         BadConfig("旗标 --" + flag + " 不是规模旗标（规模旗标： " + FlagList() + "）");
     }
@@ -508,56 +520,55 @@ MpraqScaleConfig ApplyOverrides(MpraqScaleConfig base, const MpraqScaleOverrides
     if (ov.lambda) base.lambda = *ov.lambda;
     if (ov.eps) base.eps = *ov.eps;
     if (ov.seed) base.seed = *ov.seed;
+    if (ov.security_mode) base.security_mode = ParseMpraqSecurityMode(*ov.security_mode);
     return base;
 }
 
 // ---------------------------------------------------------------------------
 // 预估对照
+//
+// ⚠️ print 精简纪律（全仓库）：这里只产出**裸 `key=value`**。
+//    派生公式、单位、口径括注、出处引用一律写在注释里，**不进输出**。
+//    公式出处：本文件 §1 的注释 与 `scale_config.hpp` 文件头。
+//      entry_words = ⌈n/128⌉                        条目宽度（字）
+//      levels      = 属性数 × 每属性列数             真实层数
+//      m           = ceil(levels/(2w))·2w            PIR 条目数（补齐后；2w | m）
+//      w           = 2^j（最接近 √m）                块大小（条目/块）
+//      kappa       = m / w                          块数（偶数）
+//      去重列数 = min(k, M)
+//      查询集数 = 去重列数 × L
+//      每台 RPC = 1（一次 RunBatch 把所有查询集放进一次 ServerRespBatch）
+//      存储/台  = 16·m·L + 16·N·|attrs|（含补齐；换成 M 即不含补齐）
+//      L14 预算 = 去重列数 · L ≤ min(q = λw/2, n)
 // ---------------------------------------------------------------------------
 
 std::string MpraqScaleEstimate::Headline() const {
     std::ostringstream oss;
-    oss << "本次规模：N=" << rows << "、每属性列数=" << columns_per_attribute
-        << "、属性数=" << attributes << "、M=" << real_columns_M << "、m=" << columns_padded_m
-        << "、谓词数=" << predicates << " ⇒ 去重列数=" << dedup_columns
-        << "、查询集数=" << query_sets << "、每台 RPC=" << rpc_per_server;
+    oss << "n=" << rows << " C=" << columns_per_attribute << " A=" << attributes
+        << " levels=" << levels << " m=" << m << " k=" << predicates
+        << " qsets=" << query_sets << " rpc=" << rpc_per_server
+        << " security=" << MpraqSecurityModeName(security_mode);
     return oss.str();
 }
 
 std::string MpraqScaleEstimate::Report() const {
+    // 只出裸 `key=value`（D40）；标签向论文看齐（D41）：
+    //   n = 记录数、entry_words = ⌈n/128⌉、levels = 真实层数、m = PIR 条目数（含补齐）、
+    //   w = 块大小、kappa = 块数、lw = λw、N_T = λw/2、H = λw + N_T、
+    //   pool_m = 新鲜索引池（= m）、budget = min(N_T, m)。
     std::ostringstream oss;
-    oss << "规模派生（全部由公式算出；出处见 src/mpraq/scale_config.hpp §1）\n";
-    oss << "  L  = ⌈N/128⌉                   = ⌈" << rows << "/128⌉ = " << words_per_column
-        << "   （每列 word 数；D24④）\n";
-    oss << "  M  = 属性数 × 每属性列数        = " << attributes << " × "
-        << columns_per_attribute << " = " << real_columns_M << "   （真实列数）\n";
-    oss << "  m  = 补齐到 2 的幂（含 D35 升级）= " << columns_padded_m
-        << "   （m0 = NextPow2(M) = " << min_pow2_columns_m0 << "，升级倍数 ×"
-        << column_upgrade_factor << "，补 " << padding_columns << " 列）\n";
-    oss << "  n  = m · L                     = " << columns_padded_m << " × "
-        << words_per_column << " = " << entries_n
-        << "   （PIR 条目数 = word 数，不是记录数）\n";
-    oss << "  w  = " << block_size_w << "（2 的幂）、c = n/w = " << blocks_c << "（偶数）\n";
-    oss << "  去重列数 = min(k, M)            = min(" << predicates << ", " << real_columns_M
-        << ") = " << dedup_columns << "   （k = 谓词数）\n";
-    oss << "  查询集数 = 去重列数 × L         = " << dedup_columns << " × "
-        << words_per_column << " = " << query_sets << "   （MPRAQ_IMPL.md §3）\n";
-    oss << "  每台 RPC = " << rpc_per_server
-        << "                      （一次 RunBatch 把所有查询集放进一次 ServerRespBatch；"
-           "Q5/D24④）\n";
-    oss << "  服务器存储（每台）\n";
-    oss << "    含补齐  = 16·m·L + 16·N·|attrs| = 16·" << columns_padded_m << "·"
-        << words_per_column << " + 16·" << rows << "·" << attributes << " = "
-        << storage_bytes_padded << " B\n";
-    oss << "    不含补齐= 16·M·L + 16·N·|attrs| = 16·" << real_columns_M << "·"
-        << words_per_column << " + 16·" << rows << "·" << attributes << " = "
-        << storage_bytes_unpadded << " B（差 "
-        << (storage_bytes_padded - storage_bytes_unpadded) << " B = 补齐 " << padding_columns
-        << " 列）\n";
-    oss << "  L14 预算 = 去重列数 × L <= min(q, n)：q = λw/2 = " << lambda << "·"
-        << block_size_w << "/2 = " << hint_cap_q << "、n = " << pool_cap_n
-        << " ⇒ min = " << budget_min << "；计划 " << query_sets << " ⇒ "
-        << (query_sets <= budget_min ? "通过" : "**超预算（会被拒绝）**") << "\n";
+    oss << "n=" << rows << " entry_words=" << entry_words
+        << " security=" << MpraqSecurityModeName(security_mode) << "\n";
+    oss << "levels=" << levels << "\n";
+    oss << "m=" << m << " padding=" << padding_columns << "\n";
+    oss << "w=" << w << " kappa=" << kappa << "\n";
+    oss << "dedup=" << dedup_columns << "\n";
+    oss << "qsets=" << query_sets << " rpc=" << rpc_per_server << "\n";
+    oss << "srv_padded=" << storage_bytes_padded << " srv_unpadded=" << storage_bytes_unpadded
+        << "\n";
+    oss << "lw=" << main_hints << " N_T=" << backup_hints << " H=" << hint_slots
+        << " pool_m=" << pool_m << " budget=" << budget
+        << " over=" << (query_sets <= budget ? 0 : 1) << "\n";
     return oss.str();
 }
 
@@ -571,83 +582,86 @@ MpraqScaleEstimate EstimateScale(const MpraqScaleConfig& config) {
     e.predicates = config.predicates;
     e.lambda = config.lambda;
     e.eps = config.eps;
+    e.security_mode = config.security_mode;   // 配置回声（Headline/Report 会打印）
 
-    e.words_per_column = (config.rows + 127) / 128;
-    e.real_columns_M = static_cast<uint64_t>(config.attributes) *
+    e.entry_words = (config.rows + 127) / 128;
+    e.levels = static_cast<uint64_t>(config.attributes) *
                        static_cast<uint64_t>(config.columns_per_attribute);
-    e.min_pow2_columns_m0 = NextPow2Local(e.real_columns_M);
 
-    // 几何**只**由 `DerivePaddedGeometry` 派生（D15(a) 只补列 + D35 的 ×2 升级）
+    // 几何**只**由 `DerivePaddedGeometry` 派生（D15(a) 只补条目；D41 只抬到 2w 的倍数）
     MpraqPaddedGeometry g;
     try {
-        g = DerivePaddedGeometry(static_cast<size_t>(e.real_columns_M),
+        g = DerivePaddedGeometry(static_cast<size_t>(e.levels),
                                  static_cast<size_t>(config.rows), config.lambda, config.eps);
     } catch (const std::invalid_argument& ex) {
         std::ostringstream oss;
         oss << "规模配置无法派生出合法几何（N=" << config.rows
             << "、每属性列数=" << config.columns_per_attribute
-            << "、属性数=" << config.attributes << " ⇒ M=" << e.real_columns_M
+            << "、属性数=" << config.attributes << " ⇒ M=" << e.levels
             << "、λ=" << config.lambda << "、ε=" << JsonNumber(config.eps) << "）：\n  "
             << ex.what();
         throw std::invalid_argument(oss.str());
     }
 
-    e.columns_padded_m = static_cast<uint64_t>(g.column_count);
+    e.m = static_cast<uint64_t>(g.m);
     e.padding_columns = static_cast<uint64_t>(g.padding_columns);
-    e.column_upgrade_factor =
-        e.min_pow2_columns_m0 == 0 ? 0 : e.columns_padded_m / e.min_pow2_columns_m0;
-    e.entries_n = e.columns_padded_m * e.words_per_column;
-    e.block_size_w = g.plinko.w;
-    e.blocks_c = g.plinko.block_count();
+    e.m = e.m;   // PIR 条目数 = m（一个条目 = 一整列）
+    e.w = g.plinko.w;
+    e.kappa = g.plinko.blocks();
     e.main_hints = g.plinko.main_hints();
-    e.hint_cap_q = g.plinko.backup_hints();
-    e.hint_slots_H = g.plinko.hint_slots();
+    e.backup_hints = g.plinko.backup_hints();
+    e.hint_slots = g.plinko.hint_slots();
 
-    e.dedup_columns = std::min<uint64_t>(config.predicates, e.real_columns_M);
-    e.query_sets = e.dedup_columns * e.words_per_column;
+    e.dedup_columns = std::min<uint64_t>(config.predicates, e.levels);
+    // ⚠️ **一次列查询 = 1 个查询集**（一个条目 = 一整列）⇒ 查询集数 = 去重列数
+    e.query_sets = e.dedup_columns;
     e.rpc_per_server = 1;
 
     const uint64_t attr_blob = 16ull * config.rows * static_cast<uint64_t>(config.attributes);
-    e.storage_bytes_padded = 16ull * e.columns_padded_m * e.words_per_column + attr_blob;
-    e.storage_bytes_unpadded = 16ull * e.real_columns_M * e.words_per_column + attr_blob;
+    e.storage_bytes_padded = 16ull * e.m * e.entry_words + attr_blob;    e.storage_bytes_unpadded = 16ull * e.levels * e.entry_words + attr_blob;
 
-    e.pool_cap_n = e.entries_n;
-    e.budget_min = std::min(e.hint_cap_q, e.pool_cap_n);
+    e.pool_m = e.m;
+    e.budget = std::min(e.backup_hints, e.pool_m);
 
     // 内部一致性（几何与公式必须自洽；不一致说明本层公式漂移了）
-    if (e.columns_padded_m < e.real_columns_M || !IsScalePowerOfTwo(e.columns_padded_m) ||
-        e.blocks_c % 2 != 0 || e.entries_n != e.blocks_c * e.block_size_w ||
-        e.entries_n != e.columns_padded_m * e.words_per_column) {
+    // ⚠️ 列粒度下**不再要求 m 是 2 的幂**：只要求 `m >= levels`、`w | m`、`κ = m/w` 为偶数。
+    //    （旧口径的 `m = m · ⌈n/128⌉` 也已经变成 `m = m`。）
+    if (e.m < e.levels || e.w == 0 ||
+        e.m % e.w != 0 || e.kappa % 2 != 0 ||
+        e.m != e.kappa * e.w || e.m != e.m) {
         std::ostringstream oss;
-        oss << "规模派生的内部一致性被破坏：m=" << e.columns_padded_m
-            << "（M=" << e.real_columns_M << "，2 的幂？"
-            << IsScalePowerOfTwo(e.columns_padded_m) << "）、n=" << e.entries_n
-            << "、w=" << e.block_size_w << "、c=" << e.blocks_c;
+        oss << "规模派生的内部一致性被破坏：m=" << e.m
+            << "（levels=" << e.levels << "）、m=" << e.m
+            << "、w=" << e.w << "、kappa=" << e.kappa;
         throw std::logic_error(oss.str());
     }
     return e;
 }
 
+// ---------------------------------------------------------------------------
+// L14 查询预算（台账 L14）
+// ---------------------------------------------------------------------------
+// 两条硬约束（详见 `TASK_PLAN.md` §7.8 的 L14 与决策 D41）：
+//   ① **备份 hint 上限**：Plinko 每次查询消费 1 条常规 hint 并提升 1 条备份；
+//      一次离线只有 `N_T = λw/2` 条备份 ⇒ 最多支持 `N_T` 个查询集。用尽即
+//      `PlinkoBackupsExhausted`；D8 明确不做摊销式离线 ⇒ 只能重跑 `HintInit`。
+//   ② **新鲜索引池上限**：重复访问同一索引时 Plinko **不复用**原 hint，而是另取一个
+//      "未被答复过"的新索引（隐私：服务器不能看到重复）⇒ 池子只有 `m` 个条目。
+//   ⇒ 预算 = `min(N_T, m)`，约束的是**查询集个数**（= 列数，因为一列 = 一个条目）。
+// ⚠️ 迁移前（word 粒度）一次列查询要 `⌈n/128⌉` 个查询集，预算因此按"word 查询数"算；
+//    列粒度下 **一次列查询 = 1 个查询集**，所以此处比较的直接就是列数。
 void CheckL14Budget(const MpraqScaleEstimate& e) {
-    if (e.query_sets <= e.budget_min) return;
+    if (e.query_sets <= e.budget) return;
     std::ostringstream oss;
-    oss << "L14 预算拒绝运行：本次规模计划的 word 查询总数 " << e.query_sets
-        << " > 上限 min(q, n) = " << e.budget_min << "（q = λw/2 = " << e.hint_cap_q
-        << "、n = m·⌈N/128⌉ = " << e.pool_cap_n << "；较紧的是 "
-        << (e.pool_cap_n <= e.hint_cap_q ? "pool(n)" : "hint(q)") << "）。\n"
-        << "  算式：去重列数 min(k, M) = " << e.dedup_columns << " × ⌈N/128⌉ = "
-        << e.words_per_column << " = " << e.query_sets << "（N = " << e.rows
-        << "、k = " << e.predicates << "、每属性列数 = " << e.columns_per_attribute
-        << "、属性数 = " << e.attributes << " ⇒ M = " << e.real_columns_M
-        << "、m = " << e.columns_padded_m << "、n = " << e.entries_n
-        << "、λ = " << e.lambda << "、w = " << e.block_size_w << "、q = " << e.hint_cap_q
-        << "）。\n"
-        << "  原因：① 每次 PIR word 查询消费 1 条常规 hint 并提升 1 条备份 ⇒ 上限 q = λw/2；\n"
-        << "        ② 重复访问同一 (列, word) 需另取未答复过的新索引 ⇒ 上限 n = m·⌈N/128⌉"
-           "（D8：不做摊销式离线）。\n"
-        << "  处置：减小 predicates（k ⇒ min(k, M) 变小）、或加大 λ（放大 q），"
-           "或加大 N / 每属性列数（放大 m·⌈N/128⌉）。**不**跑到一半抛 "
-           "PlinkoBackupsExhausted。";
+    oss << "查询预算不足：计划查询集数 " << e.query_sets
+        << " > 上限 min(N_T, m) = " << e.budget << " (N_T=lambda*w/2=" << e.backup_hints
+        << ", m=" << e.pool_m << ", binding="
+        << (e.pool_m <= e.backup_hints ? "pool(m)" : "hint(N_T)") << ")"
+        << " plan dedup_columns=" << e.dedup_columns
+        << " rows=" << e.rows << " cols_per_attr=" << e.columns_per_attribute
+        << " attrs=" << e.attributes << " levels=" << e.levels
+        << " padded_m=" << e.m << " lambda=" << e.lambda
+        << " w=" << e.w;
     throw std::invalid_argument(oss.str());
 }
 
@@ -718,7 +732,7 @@ MpraqScaleSetup Build(const MpraqScaleConfig& config) {
         std::ostringstream oss;
         oss << "规模层的内部不变量被破坏：生成的谓词落在 " << seen.size()
             << " 个不同 (属性, 列) 上，但预估的去重列数是 " << e.dedup_columns
-            << "（k=" << config.predicates << "、M=" << e.real_columns_M << "）";
+            << "（k=" << config.predicates << "、M=" << e.levels << "）";
         throw std::logic_error(oss.str());
     }
 
@@ -730,39 +744,40 @@ MpraqScaleSetup Build(const MpraqScaleConfig& config) {
     setup.init.lambda = config.lambda;
     setup.init.prp_epsilon = config.eps;
     setup.init.seed = config.seed;
+    // 档位随 `MpraqInitParams` 进入 `StoreParams`（服务端据此做一致性校验）
+    setup.init.security_mode = config.security_mode;
     return setup;
 }
 
 std::string CompareEstimateWithStore(const MpraqScaleEstimate& e, const StoreParams& store) {
     std::ostringstream oss;
-    if (store.words_per_column != e.words_per_column) {
-        oss << "⌈N/128⌉ 不一致：预估 " << e.words_per_column << " vs Init 实测 "
-            << store.words_per_column << "；";
+    if (store.entry_words != e.entry_words) {
+        oss << "entry_words 不一致：预估 " << e.entry_words << " vs Init 实测 "
+            << store.entry_words << "；";
     }
-    if (store.real_column_count != e.real_columns_M) {
-        oss << "M 不一致：预估 " << e.real_columns_M << " vs Init 实测 "
-            << store.real_column_count << "；";
+    if (store.levels != e.levels) {
+        oss << "levels 不一致：预估 " << e.levels << " vs Init 实测 "
+            << store.levels << "；";
     }
-    if (store.column_count != e.columns_padded_m) {
-        oss << "m 不一致：预估 " << e.columns_padded_m << " vs Init 实测 " << store.column_count
-            << "；";
+    if (store.m != e.m) {
+        oss << "m 不一致：预估 " << e.m << " vs Init 实测 " << store.m << "；";
     }
-    if (store.plinko.w != e.block_size_w || store.plinko.block_count() != e.blocks_c ||
-        store.entry_count() != e.entries_n || store.plinko.backup_hints() != e.hint_cap_q) {
-        oss << "几何不一致：预估 (n=" << e.entries_n << ", w=" << e.block_size_w
-            << ", c=" << e.blocks_c << ", q=" << e.hint_cap_q << ") vs Init 实测 (n="
+    if (store.plinko.w != e.w || store.plinko.blocks() != e.kappa ||
+        store.entry_count() != e.m || store.plinko.backup_hints() != e.backup_hints) {
+        oss << "几何不一致：预估 (m=" << e.m << ", w=" << e.w
+            << ", kappa=" << e.kappa << ", N_T=" << e.backup_hints << ") vs Init 实测 (m="
             << store.entry_count() << ", w=" << store.plinko.w
-            << ", c=" << store.plinko.block_count()
-            << ", q=" << store.plinko.backup_hints() << ")；";
+            << ", kappa=" << store.plinko.blocks()
+            << ", N_T=" << store.plinko.backup_hints() << ")；";
     }
     const uint64_t attr_blob =
-        16ull * store.num_records * static_cast<uint64_t>(store.num_attributes());
-    const uint64_t storage = 16ull * store.column_count * store.words_per_column + attr_blob;
-    if (storage != e.storage_bytes_padded || store.num_records != e.rows ||
+        16ull * store.n * static_cast<uint64_t>(store.num_attributes());
+    const uint64_t storage = 16ull * store.m * store.entry_words + attr_blob;
+    if (storage != e.storage_bytes_padded || store.n != e.rows ||
         store.num_attributes() != e.attributes) {
-        oss << "存储不一致：预估 " << e.storage_bytes_padded << " B（N=" << e.rows
+        oss << "存储不一致：预估 " << e.storage_bytes_padded << " B（n=" << e.rows
             << "、|attrs|=" << e.attributes << "）vs Init 实测 " << storage
-            << " B（N=" << store.num_records << "、|attrs|=" << store.num_attributes() << "）；";
+            << " B（n=" << store.n << "、|attrs|=" << store.num_attributes() << "）；";
     }
     return oss.str();
 }

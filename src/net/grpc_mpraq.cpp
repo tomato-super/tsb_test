@@ -38,6 +38,34 @@ uint128_t FromBytes(const std::string& s) {
 
 std::string ShareToBytes(const ModShare& s) { return ToBytes(s.value); }
 
+// ---- 整条目（一个条目 = 一整列 = entry_words 个字）的编解码 ----
+// ⚠️ 串接小端：第 j 个字在 [j*16, (j+1)*16)。长度必须是 16 的整数倍，
+//    且调用方按 `entry_words` 校验（不变量 I4：宽度不符即拒绝）。
+std::string EntryToBytes(const PlinkoEntry& e) {
+    std::string out;
+    out.reserve(e.size() * kUint128Bytes);
+    for (uint128_t w : e) out += ToBytes(w);
+    return out;
+}
+
+PlinkoEntry EntryFromBytes(const std::string& s, size_t expect_words) {
+    if (s.size() % kUint128Bytes != 0) {
+        throw std::invalid_argument("整条目编码长度必须 16 的整数倍，实际 " +
+                                    std::to_string(s.size()) + " 字节");
+    }
+    const size_t words = s.size() / kUint128Bytes;
+    if (words != expect_words) {
+        throw std::invalid_argument(
+            "整条目宽度不符（不变量 I4）：期望 " + std::to_string(expect_words) +
+            " 个字，实际 " + std::to_string(words) + " 个字");
+    }
+    PlinkoEntry e(words, 0);
+    for (size_t j = 0; j < words; ++j) {
+        e[j] = FromBytes(s.substr(j * kUint128Bytes, kUint128Bytes));
+    }
+    return e;
+}
+
 ModShare ShareFromBytes(const std::string& s, uint32_t attr_id, size_t index) {
     const uint128_t v = FromBytes(s);
     if (v >= mpraq::kMpraqModulus) {
@@ -55,14 +83,24 @@ ModShare ShareFromBytes(const std::string& s, uint32_t attr_id, size_t index) {
 //    因此"客户端报错的几何"会在 InitTable 阶段被拒绝，而不是留到查询时静默错值。
 mpraq::StoreParams FromProto(const ::mpraqwire::StoreParamsProto& p) {
     mpraq::StoreParams out;
-    out.num_records = static_cast<size_t>(p.num_records());
-    out.words_per_column = static_cast<size_t>(p.words_per_column());
-    out.column_count = static_cast<size_t>(p.column_count());
-    out.real_column_count = static_cast<size_t>(p.real_column_count());
-    out.plinko.n = p.plinko().n();
+    out.n = static_cast<size_t>(p.n());
+    out.entry_words = static_cast<size_t>(p.entry_words());
+    out.m = static_cast<size_t>(p.m());
+    out.levels = static_cast<size_t>(p.levels());
+    out.plinko.m = p.plinko().m();
+    out.plinko.entry_words = p.plinko().entry_words();
     out.plinko.w = p.plinko().w();
     out.plinko.lambda = p.plinko().lambda();
     out.plinko.prp_epsilon = p.plinko().prp_epsilon();
+    // ⚠️ 线协议版本：**不匹配即拒绝**（D41 前后几何字段语义不同 ⇒ 静默按错口径解析会错值）
+    if (p.protocol_version() != kMpraqWireProtocolVersion) {
+        throw std::invalid_argument(
+            "StoreParamsProto.protocol_version = " + std::to_string(p.protocol_version()) +
+            " 与本端期望的 " + std::to_string(kMpraqWireProtocolVersion) +
+            " 不符（1 = word 粒度、2 = 列粒度/D41）—— 拒绝按错口径解析，请两端一起重编译");
+    }
+    // ⚠️ 档位编码必须落在已知档位上（`static_cast` 对任意整数都能过 ⇒ 非法值会静默错路）
+    out.security_mode = mpraq::MpraqSecurityModeFromRaw(p.security_mode());
     out.attrs.clear();
     out.attrs.reserve(static_cast<size_t>(p.attrs_size()));
     for (const auto& a : p.attrs()) {
@@ -82,12 +120,15 @@ mpraq::StoreParams FromProto(const ::mpraqwire::StoreParamsProto& p) {
 // `StoreParams` → `StoreParamsProto`（客户端侧）
 void ToProto(const mpraq::StoreParams& in, ::mpraqwire::StoreParamsProto* p) {
     p->Clear();
-    p->set_num_records(in.num_records);
-    p->set_words_per_column(in.words_per_column);
-    p->set_column_count(in.column_count);
-    p->set_real_column_count(in.real_column_count);
+    p->set_n(in.n);
+    p->set_entry_words(in.entry_words);
+    p->set_m(in.m);
+    p->set_levels(in.levels);
+    p->set_security_mode(static_cast<uint32_t>(in.security_mode));
+    p->set_protocol_version(kMpraqWireProtocolVersion);
     auto* pl = p->mutable_plinko();
-    pl->set_n(in.plinko.n);
+    pl->set_m(in.plinko.m);
+    pl->set_entry_words(in.plinko.entry_words);
     pl->set_w(in.plinko.w);
     pl->set_lambda(in.plinko.lambda);
     pl->set_prp_epsilon(in.plinko.prp_epsilon);
@@ -198,6 +239,7 @@ grpc::Status MpraqServiceImpl::ServerResp(grpc::ServerContext*,
             PlinkoQuery one;
             one.blocks = req->blocks();
             one.block_size = req->block_size();
+            one.entry_words = req->entry_words();
             one.offsets.assign(set.offsets().begin(), set.offsets().end());
             one.groups.assign(set.groups().begin(), set.groups().end());
             qs.push_back(std::move(one));
@@ -212,8 +254,8 @@ grpc::Status MpraqServiceImpl::ServerResp(grpc::ServerContext*,
         }
         for (const PlinkoAnswer& a : answers) {
             auto* out = resp->add_answers();
-            out->set_acc0(ToBytes(a.r0));
-            out->set_acc1(ToBytes(a.r1));
+            out->set_acc0(EntryToBytes(a.r0));
+            out->set_acc1(EntryToBytes(a.r1));
         }
         ++rpc_count_;
         ++batch_rpc_count_;  // 本 RPC **恰好**一次批量调用（不变量的落地位置）
@@ -362,6 +404,8 @@ std::vector<PlinkoAnswer> GrpcMpraqChannel::SendQuerySets(
     ::mpraqwire::PirQueryRequest req;
     req.set_blocks(qs[0].blocks);
     req.set_block_size(qs[0].block_size);
+    // ⚠️ 不变量 I4：条目宽度必须上线，服务端据此校验应答宽度（不符即拒绝）。
+    req.set_entry_words(qs[0].entry_words);
     for (const PlinkoQuery& q : qs) {
         auto* set = req.add_queries();
         set->mutable_offsets()->Reserve(static_cast<int>(q.offsets.size()));
@@ -401,8 +445,11 @@ std::vector<PlinkoAnswer> GrpcMpraqChannel::SendQuerySets(
     }
     std::vector<PlinkoAnswer> out;
     out.reserve(qs.size());
-    for (const auto& a : resp.answers()) {
-        out.push_back(PlinkoAnswer{FromBytes(a.acc0()), FromBytes(a.acc1())});
+    for (size_t i = 0; i < static_cast<size_t>(resp.answers_size()); ++i) {
+        const auto& a = resp.answers(static_cast<int>(i));
+        // ⚠️ 不变量 I4：按该查询集声明的 entry_words 校验应答宽度（不符即抛）
+        const size_t ew = static_cast<size_t>(qs[i].entry_words);
+        out.push_back(PlinkoAnswer{EntryFromBytes(a.acc0(), ew), EntryFromBytes(a.acc1(), ew)});
     }
     queries_served_ += static_cast<uint64_t>(qs.size());
     return out;

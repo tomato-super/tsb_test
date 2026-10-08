@@ -9,15 +9,15 @@
 //      → `PredicatePlan`（字面量 = 列 + 取反标记；`columns` = 去重升序的待检索列）
 //      ⚠️ **操作符语义（含 `gt`/`ge` 差一格、De Morgan 形式、取反）一律复用
 //      `mpraq/predicate.hpp`**，本文件**不重新实现**任何操作符归约。
-//   ② 取 `plan.columns`（已去重升序）→ 每列 `⌈N/128⌉` 个 word
-//      ⇒ **全部查询集放进一个 `MpraqQueryBatch`，一次 RPC 发完**（Q5/D24）
+//   ② 取 `plan.columns`（已去重升序）→ **每列 = 一个条目 = 1 个查询集**
+//      ⇒ **全部查询集放进一个 `MpraqQueryBatch`，一次 RPC 发完**（Q5）
 //   ③ 服务器：Plinko `ServerResp`（各自在本方 XOR 共享上按 `P'` 分两组 XOR 累加）
 //      → 每查询集 2 个 parity（**服务器之间零通信**）
-//   ④ 客户端：`ClientRecon` 逐 word 重建 128 位 → 拼出该列的 `N` 位比特向量
-//      ⚠️ `MpraqClient::RunBatch` 返回的是**重建出的 word**（`uint128_t`），
-//      **不是**展开的比特（§3 的接口细节 / §7.15 语义发现 ②）⇒ 本层自己做位展开：
-//          bit j = word[j/128] >> (j % 128) & 1，**只取 j < N**
-//      （`⌈N/128⌉` 个 word 的尾部填充位按 `MPRAQ_IMPL.md` §1 恒为 0，必须被忽略）
+//   ④ 客户端：`ClientRecon` 逐条目重建**整列**（`entry_words` 个字）→ 展开成该列的 `n` 位比特
+//      ⚠️ `MpraqClient::RunBatch` 返回的是**重建出的整列**（`PlinkoEntry`），
+//      **不是**展开的比特 ⇒ 本层自己做位展开：
+//          bit j = entry[j/128] >> (j % 128) & 1，**只取 j < n**（不变量 I3）
+//      （末字 `j >= n` 的尾部填充位按不变量 I2 恒为 0，但仍必须被忽略）
 //   ⑤ 本地布尔组合（取反 / 合取；De Morgan 形式按 `MPA-02` 的树求值）→ filter 向量
 //      ⇒ 走 `LcteColumnLookup` + `EvaluateFilter(plan, lookup)`（Q5：服务器不参与组合）
 //   ⑥ `Count = popcount(filter)`
@@ -34,13 +34,13 @@
 // ===========================================================================
 // 2. 代价（`MPRAQ_IMPL.md` §3 末 / §6）
 // ===========================================================================
-//   * 检索量 = **列数 × ⌈N/128⌉** 个查询集（不是 `N`，也不是"每谓词一次"）；
+//   * 检索量 = **去重列数** 个查询集（**一列 = 一个条目 = 1 个查询集**）；
 //   * 客户端 `1×IF⁻¹ + c×IF` per 查询集；服务器 `c` 次随机读 + `c` 次 XOR；
 //   * 一次 `Count` 的网络往返 = **每台服务器恰好 1**（`ServerRespBatch` 整批一次，
-//     D24④/Q5），与谓词个数、列个数、`⌈N/128⌉` **全都无关**
+//     Q5），与谓词个数、列个数 **全都无关**
 //     ⇒ 用 `CountResult::server_resp_calls` / `MpraqClient::channel_rpc_stats()` 断言。
-//     ⚠️ 别把"RPC 次数"与"查询集个数"混起来：后者是 `列数 × ⌈N/128⌉`。
-//   * 不做不必要的拷贝：word 一次取回（`RunBatch`），只有展开后的比特向量会留下
+//     ⚠️ 别把"RPC 次数"与"查询集个数"混起来：后者 = **去重列数**。
+//   * 不做不必要的拷贝：整列一次取回（`RunBatch`），只有展开后的比特向量会留下
 //     （`CountResult::filter` 是 `MPA-06` 的输入，必须暴露；各列的比特只在
 //     `combine_ms` 期间存在，`EvaluateFilter` 返回后即释放）。
 //
@@ -61,10 +61,10 @@
 //       ③ 更隐蔽的一条：Plinko 对**重复索引**（同一 `(列, word)` 被再次检索）会另取一个
 //          "未答复"的**随机**索引（`PLINKO_SPEC` §3.5 的重复查询分支）⇒ 大量重复检索同一列
 //          会把 ② 的预算抽干得更快。
-//     ⇒ 一次 `Count` 消耗 `列数 × ⌈N/128⌉` 个查询集；查询多了会抛
+//     ⇒ 一次 `Count` 消耗 `去重列数` 个查询集（一列 = 一个条目 = 1 个查询集）；查询多了会抛
 //       `PlinkoBackupsExhausted`（①/②）或 `std::runtime_error`（"全部 n 个索引都已答复过"，③）
 //       —— 都表示**必须重跑 `Init`**（D8：不做摊销式离线）。
-//   * 检索量口径（`MPRAQ_IMPL.md` §6）：**列数 × ⌈N/128⌉** 个查询集。
+//   * 检索量口径（`MPRAQ_IMPL.md` §6）：**去重列数** 个查询集（一列 = 一个条目）。
 
 #include <cstddef>
 #include <cstdint>
@@ -94,7 +94,7 @@ struct CountResult {
     // ② 实际检索的列（= `PredicatePlan::columns` 的去重升序集合）
     std::vector<std::pair<uint32_t, uint32_t>> columns;
 
-    // ③ 本批实际发出的查询集个数 = `columns.size() · ⌈N/128⌉`
+    // ③ 本批实际发出的查询集个数 = `columns.size()`（一列 = 一个条目 = 1 个查询集）
     //    （一个查询集 = 一个 128 位 word 的 PIR 检索；**不是** RPC 次数）
     uint64_t queries_issued = 0;
 
@@ -153,8 +153,8 @@ CountResult CountPlan(MpraqClient& client, const Schema& schema, const Predicate
 
 // 取属性 `attr_id` 第 `column` 列的 `N` 位比特（`bit j = word[j/128] >> (j % 128) & 1`）。
 // ⚠️ 这是上层（`MPA-06` 以及任何需要列的应用）**唯一**该用的"列取回"入口：
-//    * 条目号一律走 `MpraqClient::ColumnWordIndex`（列主序 = 全局列号·⌈N/128⌉ + word 号）；
-//    * 一个整列的 `⌈N/128⌉` 个 word 放进**一个** `MpraqQueryBatch` ⇒ 每台服务器
+//    * 条目号一律走 `MpraqClient::EntryIndex`（**一列 = 一个条目**，条目号 = 全局列号）；
+//    * 一个整列（**一个条目**）放进**一个** `MpraqQueryBatch` ⇒ 每台服务器
 //      **恰好 1 次** `ServerRespBatch`（= 1 次往返，Q5/D24④）；
 //    * 尾部填充位（`j >= N`）被忽略（`MPRAQ_IMPL.md` §1 保证它们为 0）。
 // 越界（属性号不存在 / `column >= m_a`）⇒ `std::out_of_range`；补齐列不属于任何属性，

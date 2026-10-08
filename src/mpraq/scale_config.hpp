@@ -11,10 +11,12 @@
 //      **2 的幂**（且 >= 2，否则取值域为空）。**所有属性共用同一套特征表参数**
 //      （同 `range_size`、同 `window_size`、同取值域风格），但**每个属性各自拥有一组列**
 //      （否则跨属性谓词会互相串列）⇒
-//          **真实列数 `M` = 属性数 × `columns_per_attribute`**。
-//      补齐到 2 的幂的列数 `m` 与 Plinko 几何 `(n, w, c)` 由 `DerivePaddedGeometry`
-//      自动派生（含决策 **D35** 的"最小补齐无合法几何时按 ×2 升级"）。
-//      服务器存储**双报** `M` 与 `m` 两种口径。
+//          **真实层数 `levels` = 属性数 × `columns_per_attribute`**。
+//      PIR 条目数 `m`（>= levels）与 Plinko 几何 `(m, w, kappa)` 由
+//      `DerivePaddedGeometry` 自动派生。
+//      ⚠️ 列粒度下（D41）**不再"补齐到 2 的幂"**：只需 `2w | m`（等价于 `w | m` 且
+//      `kappa = m/w` 为偶数）⇒ `m = ceil(levels / (2w)) · 2w`，**D35 的 ×2 升级搜索已删除**。
+//      服务器存储**双报** `levels` 与 `m` 两种口径。
 //   ③ **谓词数量 `k`**：用户不写谓词内容，由 `Build()` 自动生成 `k` 个**合法**谓词，
 //      且**尽量落在互不相同的列**上 ⇒ **去重列数 = min(k, M)**。
 //      实现上只用**单列**操作符（lt/le/gt/ge 各占 1 列，见 `scale_config.cpp`）：
@@ -25,9 +27,10 @@
 //      ⚠️ 单个属性上的谓词数 >= 每属性列数 − 1 时，最紧的那个界会贴着取值域边界，
 //         合取**可能为空**（Count = 0）—— 这是合法的查询结果，不是错误：
 //         `AvgOverFilter` 在 `count == 0` 时按设计抛 `std::domain_error`，调用方须先判 count。
-//      ⇒ 换算（负责人按这个手算核对）：
-//          `k → 去重列数 = min(k, M) → 查询集数 = 去重列数 × ⌈N/128⌉ → 每台 RPC = 1`
-//      本层把这条换算放在 `MpraqScaleEstimate::Headline()`，两个 app 启动时都打印它。
+//      ⇒ 换算（负责人按这个手算核对；**只写在这里，不打印**）：
+//          `k → 去重列数 = min(k, levels) → 查询集数 = 去重列数（一列 = 一个条目）→ 每台 RPC = 1`
+//      `MpraqScaleEstimate::Headline()` 只打印该换算的**结果值**（裸 `key=value`），
+//      `Report()` 打印逐项数值；两者的解释文字一律留在注释里（print 精简纪律）。
 //   ④ 数据集**合成生成**：`DeterministicPrng` + 显式 `seed`（铁律 D6 的确定性）；
 //      `MpraqRecord::feature = i`（行号，D36 定义的"死字段"/客户端明文标签，正好当行标签）；
 //      属性值落在该属性的取值域内（D19-5 的 `m >= 跨度+2` 取到无损上限）。
@@ -37,23 +40,22 @@
 // ===========================================================================
 // 1. 派生公式（每条都给出出处；**数值全部由公式算，程序里没有第二份口径**）
 // ===========================================================================
-//   * 每列 word 数      `L = ⌈N/128⌉`
-//                       （`MPRAQ_IMPL.md` §1 / `node.hpp` §1：每列按记录顺序 128 位打包）
-//   * 真实列数          `M = attributes · columns_per_attribute`
+//   * 条目宽度          `entry_words = ⌈n/128⌉`
+//                       （`node.hpp` §1：一个 PIR 条目 = 一整列 = entry_words 个 128 位字）
+//   * 真实层数          `levels = attributes · columns_per_attribute`
 //                       （任务口径 ②；每个属性各自一组列）
-//   * 补齐列数          `m`（2 的幂，>= M）← `DerivePaddedGeometry(M, N, λ, ε)`
-//                       （决策 D15(a) 只补列不补记录；D35 允许 ×2 升级）
-//   * 条目数（PIR 的 n，**word 数**，不是记录数）`n = m · L`（D24④ / D19-6）
-//   * 去重列数          `min(k, M)`（任务口径 ③；每个谓词恰好归约到 1 列，见 §3）
-//   * 查询集数          `min(k, M) · L`（`MPRAQ_IMPL.md` §3 / `aggquery.hpp` §2）
+//   * PIR 条目数        `m`（>= levels 且 `2w | m`）← `DerivePaddedGeometry(levels, n, λ, ε)`
+//                       （决策 D15(a) 只补列不补记录；D41 取代了 D35 的 ×2 升级）
+//   * 去重列数          `min(k, levels)`（任务口径 ③；每个谓词恰好归约到 1 列，见 §3）
+//   * 查询集数          `min(k, levels)`（**一列 = 一个条目 = 1 个查询集**；Q5）
 //   * 每台 RPC 次数     **恒 1**（一次 `RunBatch` 把所有查询集放进一次
 //                       `IMpraqChannel::ServerRespBatch`；Q5 / D24④）
-//   * 服务器存储（每台）`16 · m · L + 16 · N · attributes`（**含补齐**，`node.hpp` §1）
-//                       不含补齐口径：`16 · M · L + 16 · N · attributes`（双报）
-//   * hint 上限         `q = λw/2`（`PlinkoParams::backup_hints()`；D8：每个查询集消费 1 条）
-//   * 新鲜索引池        `n = m · L`（台账 L14 第②条）
-//   * L14 预算          `min(k, M) · L <= min(q, n)`，超预算 ⇒ **拒绝并给出可读原因**
-//                       （`TASK_PLAN.md` 台账 L14 / bench 的"超预算拒绝运行"口径）
+//   * 服务器存储（每台）`16 · m · entry_words + 16 · n · attributes`（**含补齐**，`node.hpp` §1）
+//                       不含补齐：`16 · levels · entry_words + 16 · n · attributes`（双报）
+//   * hint 上限         `N_T = λw/2`（`PlinkoParams::backup_hints()`；D8：每个查询集消费 1 条）
+//   * 新鲜索引池        `m`（台账 L14 第②条）
+//   * 查询预算          `min(k, levels) <= min(N_T, m)`，超预算 ⇒ **拒绝并给出可读原因**
+//                       （`TASK_PLAN.md` 台账 L14 / bench 的 `budget_rejected` 口径）
 //
 // ===========================================================================
 // 2. fail-loudly（铁律）
@@ -95,6 +97,13 @@ struct MpraqScaleConfig {
     uint32_t lambda = 80;   // Plinko 的 λ（失败概率 2^-λ）
     double eps = 1e-4;      // iPRF 的 PRP 目标 ε（D22-1；测试可调小加速）
     uint64_t seed = 7;      // 合成数据 + Init 的确定性种子（D6）
+    // ⑥ 运行方式（安全档位）——**接口预留**（见 `src/mpraq/security_mode.hpp`）。
+    //    JSON 键 **`security_mode`**（**不是** `mode`：那个名字被 bench 的
+    //    `--mode local|grpc` 占用于"传输口径"）；CLI 旗标 `--security-mode`。
+    //    严格解析：只认 "malicious" / "semi-honest"，非法值拒绝启动。
+    //    ⚠️ 本 gate **不改变行为**：两档目前走同一条代码路径，它的作用是
+    //       随 `StoreParams` 上线并被服务端一致性校验（防静默降级）。
+    MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
 
     // 默认值（与 `config/mpraq_scale.json` 逐字段一致）
     static MpraqScaleConfig Defaults() { return MpraqScaleConfig{}; }
@@ -135,6 +144,7 @@ struct MpraqScaleOverrides {
     std::optional<uint32_t> lambda;
     std::optional<double> eps;
     std::optional<uint64_t> seed;
+    std::optional<std::string> security_mode;   // 字符串档位（严格解析在 ApplyOverrides 里做）
 
     bool any() const;
     // 该旗标是否属于规模层（接受 "--rows" 与 "rows" 两种写法）
@@ -161,38 +171,38 @@ struct MpraqScaleEstimate {
     uint64_t predicates = 0;              // k
     uint32_t lambda = 0;
     double eps = 0.0;
+    MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;   // 配置回声
 
-    // ---- 几何（§1 的公式，`m` 含 D35 升级）----
-    uint64_t words_per_column = 0;        // L = ⌈N/128⌉
-    uint64_t real_columns_M = 0;          // M = attributes · columns_per_attribute
-    uint64_t min_pow2_columns_m0 = 0;     // NextPow2(M)（升级前的对照口径，D26）
-    uint64_t columns_padded_m = 0;        // m（补齐到 2 的幂，可能被 D35 ×2 升级）
-    uint64_t column_upgrade_factor = 0;   // m / m0（1 = 未升级）
-    uint64_t padding_columns = 0;         // m − M
-    uint64_t entries_n = 0;               // n = m · L（word 数）
-    uint64_t block_size_w = 0;            // w（2 的幂）
-    uint64_t blocks_c = 0;                // c = n / w（偶数）
-    uint64_t main_hints = 0;              // λw
-    uint64_t hint_slots_H = 0;            // H = λw + q
+    // ---- 几何（符号向论文看齐，D41）----
+    uint64_t entry_words = 0;      // ⌈n/128⌉：条目宽度（字）
+    uint64_t levels = 0;           // 真实 LCTE 层数 = attributes · columns_per_attribute
+    uint64_t m = 0;                // PIR 条目数（= 补齐后的层数；只补到 2w 的倍数）
+    uint64_t padding_columns = 0;  // m − levels
+    uint64_t w = 0;                // 块大小（条目/块；2 的幂）
+    uint64_t kappa = 0;            // 块数 κ = m / w（偶数）
+    uint64_t main_hints = 0;       // λw
+    uint64_t backup_hints = 0;     // N_T = λw/2
+    uint64_t hint_slots = 0;       // H = λw + N_T
 
     // ---- 换算（负责人手算核对的那一条链）----
-    uint64_t dedup_columns = 0;           // min(k, M)
-    uint64_t query_sets = 0;              // dedup_columns · L
+    uint64_t dedup_columns = 0;           // min(k, levels)
+    uint64_t query_sets = 0;              // = dedup_columns（一列 = 一个条目 = 1 个查询集）
     uint64_t rpc_per_server = 1;          // 恒 1（一次 RunBatch）
 
     // ---- 账目 ----
-    uint64_t storage_bytes_padded = 0;    // 16·m·L + 16·N·attributes
-    uint64_t storage_bytes_unpadded = 0;  // 16·M·L + 16·N·attributes
+    uint64_t storage_bytes_padded = 0;    // 16·m·entry_words + 16·n·attributes
+    uint64_t storage_bytes_unpadded = 0;  // 16·levels·entry_words + 16·n·attributes
 
-    // ---- L14 预算 ----
-    uint64_t hint_cap_q = 0;              // q = λw/2
-    uint64_t pool_cap_n = 0;              // n = m · L
-    uint64_t budget_min = 0;              // min(q, n)
+    // ---- 查询预算 ----
+    uint64_t pool_m = 0;              // 新鲜索引池 = m
+    uint64_t budget = 0;              // min(N_T, m)
 
-    // 一行换算（**必须打印**）：
-    //   本次规模：N=…、每属性列数=…、属性数=…、M=…、m=…、谓词数=… ⇒ 去重列数=…、查询集数=…、每台 RPC=1
+    // 一行换算的**结果值**（裸 `key=value`，无任何解释文字）：
+    //   N=… C=… A=… M=… m=… k=… qsets=… rpc=…
+    // ⚠️ print 精简纪律：派生公式、单位、"（真实列数）"这类括注一律写在注释里，不进输出。
     std::string Headline() const;
-    // 多行推导（每条公式带出处与代入的数值）+ 存储双报 + L14 预算
+    // 逐项数值（多行，仍为裸 `key=value`）：几何 / 存储双报 / L14 预算。
+    // 各字段的含义与公式见本文件 §1 与 `EstimateScale` 的实现注释。
     std::string Report() const;
 };
 

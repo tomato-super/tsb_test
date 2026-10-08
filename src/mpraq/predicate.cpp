@@ -328,7 +328,7 @@ PredicatePlan ParsePredicate(const Predicate& predicate, const Schema& schema,
     const AttributeSchema& attr = ResolveAttribute(predicate, schema);
 
     PredicatePlan plan;
-    plan.num_records = attr.lcte.window_size;
+    plan.n = attr.lcte.window_size;
 
     switch (predicate.op) {
         case PredicateOp::kLt: {
@@ -435,8 +435,8 @@ PredicatePlan ParseConjunction(const std::vector<Predicate>& predicates,
         BoolExpr child = sub.root;
         ShiftLiteralIndices(child, offset);
         merged.root.children.push_back(std::move(child));
-        merged.num_records =
-            CheckedRecordCount(merged.num_records, sub.num_records, "ParseConjunction");
+        merged.n =
+            CheckedRecordCount(merged.n, sub.n, "ParseConjunction");
     }
 
     FinalizePlan(merged);
@@ -480,8 +480,8 @@ PredicatePlan ParseRangeConjunctionDeMorgan(
         left_literals.push_back(BoolExpr::Literal(left_index));
         right_literals.push_back(BoolExpr::Literal(right_index));
 
-        plan.num_records = CheckedRecordCount(
-            plan.num_records, attr.lcte.window_size, "ParseRangeConjunctionDeMorgan");
+        plan.n = CheckedRecordCount(
+            plan.n, attr.lcte.window_size, "ParseRangeConjunctionDeMorgan");
     }
 
     // Φ = ¬( ∨_i P_{i0}(l_i) ) ∧ ( ∧_i P_{i1}(r_i) )
@@ -564,7 +564,7 @@ namespace {
 std::vector<uint8_t> EvaluateWithResolvedColumns(
     const PredicatePlan& plan,
     const std::map<LcteColumnRef, std::vector<uint8_t>>& column_bits) {
-    size_t n = plan.num_records;
+    size_t n = plan.n;
     for (const auto& [ref, bits] : column_bits) {
         (void)ref;
         if (n == 0) n = bits.size();
@@ -574,10 +574,10 @@ std::vector<uint8_t> EvaluateWithResolvedColumns(
                 std::to_string(bits.size()) + " vs " + std::to_string(n) + "）");
         }
     }
-    if (plan.num_records != 0 && n != plan.num_records) {
+    if (plan.n != 0 && n != plan.n) {
         throw std::invalid_argument(
             "EvaluateFilter: 列的比特数 " + std::to_string(n) +
-            " 与计划的记录数 " + std::to_string(plan.num_records) + " 不符");
+            " 与计划的记录数 " + std::to_string(plan.n) + " 不符");
     }
 
     std::vector<std::vector<uint8_t>> literal_values(plan.literals.size());

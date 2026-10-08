@@ -20,7 +20,7 @@
 //   ① 确定性合成数据（`DeterministicPrng` + 显式 seed；`feature = i` 是 D36 的行标签）
 //   ② 两台服务器进程上的 `Init`（`InitWithChannels` → 真实 gRPC：InitTable +
 //      特征 word XOR 共享分块上传 + 每个属性一条 mod q 加法共享）
-//   ③ **L14 查询预算**：打印算式（一次 Count 需要 `列数 × ⌈N/128⌉` 个 word 查询；
+//   ③ **L14 查询预算**：打印算式（一次 Count 需要 `去重列数` 个查询集 —— 一列 = 一个条目 = 1 个查询集；
 //      一次离线上限 = min(q = λw/2, 新鲜索引池 n)）
 //   ④ 查询 ①：**单谓词**（= 自动生成的谓词 #0，占 1 列）→ Count + filter
 //   ⑤ 查询 ②：**k 个谓词的合取**（Φ = ∧_j P_j，去重列数 = min(k, M)）→ Count + filter
@@ -70,6 +70,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// 输出详略开关：只有 `--verbose` 才打印全量账目（默认一屏摘要）。
+// ⚠️ 它**只影响打印**：所有口径断言、fail-loudly 与退出码都与它无关。
+bool g_verbose = false;
+
 double MsSince(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
@@ -91,6 +95,9 @@ struct Options {
     uint64_t prng_seed = 11;     // SecureMul triple 的确定性种子
     uint32_t sum_attr = 1;       // Sum/Avg 作用的属性号（默认取规模派生值）
     bool has_sum_attr = false;   // 是否显式给了 --sum-attr（否则用派生值）
+    // 默认**只打一屏摘要**；`--verbose` 打印全部账目（规模派生、L14 算式、服务器增量、
+    // hint 余额、每阶段耗时等）。**所有断言与 fail-loudly 行为与开关无关**。
+    bool verbose = false;
 };
 
 Options ParseArgs(int argc, char** argv) {
@@ -114,6 +121,8 @@ Options ParseArgs(int argc, char** argv) {
         } else if (a == "--sum-attr") {
             o.sum_attr = static_cast<uint32_t>(std::stoul(next("--sum-attr")));
             o.has_sum_attr = true;
+        } else if (a == "--verbose" || a == "-v") {
+            o.verbose = true;
         } else if (a == "--help" || a == "-h") {
             std::cout
                 << "用法: ./mpraq_client --server0 host:port --server1 host:port [选项]\n"
@@ -127,15 +136,18 @@ Options ParseArgs(int argc, char** argv) {
                    "  --lambda L          Plinko 安全参数 λ（默认 80）\n"
                    "  --eps E             iPRF 的 PRP 目标 ε（默认 1e-4）\n"
                    "  --seed S            合成数据与 Init 的确定性种子（默认 7）\n"
+                   "  --security-mode M   运行方式：malicious（默认）| semi-honest\n"
+                   "                        （接口预留；必须与两台服务器的档位一致）\n"
                    "\n"
                    "其余：\n"
                    "  --prng-seed P       SecureMul triple 的确定性种子（默认 11）\n"
                    "  --sum-attr A        Sum/Avg 作用的属性号（默认取规模派生值）\n"
+                   "  --verbose, -v       打印全部账目（默认只打一屏摘要）\n"
                    "  --help              打印本帮助\n"
                    "\n"
                    "命令行覆盖优先于 JSON；启动时会打印一行换算：\n"
                    "  本次规模：N=…、每属性列数=…、属性数=…、M=…、m=…、谓词数=…\n"
-                   "            ⇒ 去重列数=min(k,M)、查询集数=去重列数×⌈N/128⌉、每台 RPC=1\n";
+                   "            ⇒ 去重列数=min(k,M)、查询集数=去重列数、每台 RPC=1\n";
             std::exit(EXIT_SUCCESS);
         } else if (MpraqScaleOverrides::IsScaleFlag(a)) {
             o.scale.Set(a, next(a.c_str()));
@@ -257,44 +269,53 @@ struct QueryReport {
     SecureMulBatchStats sm;
 };
 
-// 打印一条 `Count` 的账目（含 Q5 口径：一批 = 1 次 RPC/台）
-void PrintCountAccounts(const QueryReport& r, size_t words_per_column) {
-    std::printf("    Count：count=%llu（每个命中位的 filter 都逐位对照过基准）\n",
+// 打印一条 `Count` 的账目（含 Q5 口径：一批 = 1 次 RPC/台）—— 仅 `--verbose`。
+// 被移出 print 的口径（原中文说明）：
+//   * 每个命中位的 filter 都逐位对照过明文基准；
+//   * 检索列按去重升序；**一列 = 一个条目 = 1 个查询集** ⇒ 查询集 = 去重列数；
+//   * 一次 RunBatch 恒 1 次 RPC/台，与查询集个数无关；
+//   * retrieve 含 QueryGen+ServerResp+XOR+ClientRecon；combine 是本地布尔组合。
+void PrintCountAccounts(const QueryReport& r, size_t entry_words) {
+    if (!g_verbose) return;
+    std::printf("    count count=%llu filter_bitwise_checked=1\n",
                 static_cast<unsigned long long>(r.count.count));
-    std::printf("      检索列 = %zu 个（去重升序），每列 word 数 ⌈N/128⌉ = %zu "
-                "⇒ 查询集 = %llu = 列数×⌈N/128⌉\n",
-                r.count.columns.size(), words_per_column,
+    std::printf("      columns n=%zu entry_words=%zu query_sets=%llu\n",
+                r.count.columns.size(), entry_words,
                 static_cast<unsigned long long>(r.words_queried));
-    std::printf("      RPC 次数：服务器 0 = %llu、服务器 1 = %llu（**一次 RunBatch 恒 1 次**，"
-                "与查询集个数无关）\n",
+    std::printf("      rpc server0=%llu server1=%llu per_batch=1\n",
                 static_cast<unsigned long long>(r.rpc_calls[0]),
                 static_cast<unsigned long long>(r.rpc_calls[1]));
-    std::printf("      耗时：retrieve=%.1f ms（QueryGen+ServerResp+XOR+ClientRecon） "
-                "combine=%.2f ms（本地布尔组合） 合计=%.1f ms\n",
+    std::printf("      timing retrieve_ms=%.1f combine_ms=%.2f total_ms=%.1f\n",
                 r.count.retrieve_ms, r.count.combine_ms, r.count_ms);
 }
 
+// 打印一次 Sum/Avg 的账目（`--verbose` 专用）。被移出 print 的口径（原中文说明）：
+//   * sum 在 mod q = 2^127−1 下；Avg = sum/count（整数向下取整）；
+//   * count == 0 ⇒ Avg 无定义（`AvgOverFilter` 不被调用）；
+//   * rounds 恒 2；Collect 第 1/2 轮各一次；安装阶段额外 rounds/frames（install_frames 是帧数）；
+//   * messages = 2N（单台视角）、wire_messages = 4N（线上真实条数）；
+//   * 帧长 Phase1 = 6+34N、Phase2 = 6+58N、安装帧合计 = 2×(13+152N)；
+//   * 服务器侧常驻材料 = N×(7×16+16) B/台；records = 不剪枝时 f=0 也照发的记录数。
 void PrintSumAccounts(const QueryReport& r, size_t n) {
+    if (!g_verbose) return;
     const SecureMulBatchStats& s = r.sm;
     if (r.has_avg) {
-        std::printf("    Sum：sum=%s（mod q = 2^127−1）、count=%llu、Avg=sum/count=%s\n",
+        std::printf("    sum sum=%s count=%llu avg=%s mod_q=2^127-1\n",
                     toString(r.sum.sum).c_str(),
                     static_cast<unsigned long long>(r.sum.count), toString(r.avg).c_str());
     } else {
-        std::printf("    Sum：sum=%s（mod q = 2^127−1）、count=0 ⇒ **Avg 无定义**"
-                    "（未调用 `AvgOverFilter`）\n",
+        std::printf("    sum sum=%s count=0 avg=undefined avg_called=0 mod_q=2^127-1\n",
                     toString(r.sum.sum).c_str());
     }
-    std::printf("      往返：rounds=%llu（**恒 2**）、Collect 次数 第1轮=%llu/第2轮=%llu；"
-                "安装阶段额外 %llu 次往返/全部（install_frames=%llu）\n",
+    std::printf("      rounds rounds=%llu collect_p1=%llu collect_p2=%llu "
+                "install_rounds=%llu install_frames=%llu\n",
                 static_cast<unsigned long long>(s.rounds),
                 static_cast<unsigned long long>(s.collect_calls_phase1),
                 static_cast<unsigned long long>(s.collect_calls_phase2),
                 static_cast<unsigned long long>(s.install_rounds),
                 static_cast<unsigned long long>(s.install_frames));
-    std::printf("      消息：messages=%llu（= 2N，单台视角）、wire_messages=%llu（= 4N，"
-                "线上真实条数）；每台处理记录 第1轮=%llu/%llu 第2轮=%llu/%llu；"
-                "每台帧数=%llu/%llu\n",
+    std::printf("      messages messages=%llu wire_messages=%llu "
+                "p1_s0=%llu p1_s1=%llu p2_s0=%llu p2_s1=%llu frames_s0=%llu frames_s1=%llu\n",
                 static_cast<unsigned long long>(s.messages),
                 static_cast<unsigned long long>(s.wire_messages),
                 static_cast<unsigned long long>(s.server_records_processed[0]),
@@ -303,17 +324,15 @@ void PrintSumAccounts(const QueryReport& r, size_t n) {
                 static_cast<unsigned long long>(s.server_records_processed_phase2[1]),
                 static_cast<unsigned long long>(s.server_frames[0]),
                 static_cast<unsigned long long>(s.server_frames[1]));
-    std::printf("      帧长：Phase1=%llu B（= 6+34N）、Phase2=%llu B（= 6+58N）、"
-                "安装帧合计=%llu B（= 2×(13+152N)）\n",
+    std::printf("      frame_bytes phase1=%llu phase2=%llu install_total=%llu\n",
                 static_cast<unsigned long long>(s.frame_bytes_phase1),
                 static_cast<unsigned long long>(s.frame_bytes_phase2),
                 static_cast<unsigned long long>(s.install_bytes));
-    std::printf("      耗时：offline_triple=%.1f ms、offline_setup=%.1f ms、online=%.1f ms、"
-                "verify=%.1f ms、Sum 合计=%.1f ms\n",
+    std::printf("      timing offline_triple_ms=%.1f offline_setup_ms=%.1f online_ms=%.1f "
+                "verify_ms=%.1f sum_total_ms=%.1f\n",
                 s.offline_triple_ms, s.offline_setup_ms, s.online_ms, s.verify_ms,
                 r.sum_ms);
-    std::printf("      服务器侧常驻材料：%llu B/台（= N×(7×16+16)）；"
-                "不剪枝：records=%llu（f=0 的记录照发）\n",
+    std::printf("      server_state bytes_per_server=%llu records=%llu\n",
                 static_cast<unsigned long long>(s.server_state_peak_bytes),
                 static_cast<unsigned long long>(s.records));
     (void)n;
@@ -324,12 +343,18 @@ void PrintSumAccounts(const QueryReport& r, size_t n) {
 int main(int argc, char** argv) {
     try {
         const Options opt = ParseArgs(argc, argv);
+        g_verbose = opt.verbose;
 
-        std::printf("=====================================================================\n");
-        std::printf("MPRAQ 端到端 demo（MPA-08）：真实 gRPC、两进程、1 客户端 + 2 服务器\n");
-        std::printf("=====================================================================\n");
-        std::printf("服务器 0 = %s\n服务器 1 = %s\n", opt.server0.c_str(),
-                    opt.server1.c_str());
+        if (g_verbose) {
+            // 原中文标题「MPRAQ 端到端 demo（MPA-08）：真实 gRPC、两进程、1 客户端 + 2 服务器」
+            // 与分隔线一并精简为裸键值：口径 = 真 gRPC、两个服务器进程、1 客户端 + 2 服务器。
+            std::printf("mpraq_demo mode=grpc_two_process clients=1 servers=2\n");
+            std::printf("server0=%s\nserver1=%s\n", opt.server0.c_str(),
+                        opt.server1.c_str());
+        } else {
+            std::printf("mpraq_demo mode=grpc_two_process server0=%s server1=%s\n",
+                        opt.server0.c_str(), opt.server1.c_str());
+        }
 
         // ---------------------------------------------------------------
         // ⓪ 规模配置（JSON + CLI 覆盖）→ 派生 schema / 合成数据 / 谓词 / 几何
@@ -353,17 +378,21 @@ int main(int argc, char** argv) {
                 std::to_string(cfg.attributes - 1) + "]）");
         }
         const std::string cfg_source =
-            opt.config.empty() ? std::string("内置默认值（同 config/mpraq_scale.json）")
-                               : ("--config " + opt.config);
-        std::printf("规模来源：%s；CLI 覆盖：%s\n", cfg_source.c_str(),
-                    opt.scale.any() ? "有（已逐项覆盖）" : "无");
-        std::printf("参数：λ = %u、ε = %g、seed = %llu、prng_seed = %llu、sum_attr = %u\n",
-                    cfg.lambda, cfg.eps, static_cast<unsigned long long>(cfg.seed),
-                    static_cast<unsigned long long>(opt.prng_seed), sum_attr);
+            opt.config.empty() ? std::string("default") : ("config:" + opt.config);
+        if (g_verbose) {
+            // 规模来源：缺省 = 内置默认值（同 config/mpraq_scale.json）；CLI 覆盖 = 有/无。
+            std::printf("scale_source=%s cli_overrides=%s\n", cfg_source.c_str(),
+                        opt.scale.any() ? "yes" : "no");
+        }
 
         // ---- 必须打印的一行换算（负责人按它手算核对）----
-        std::printf("\n[规模] %s\n", est.Headline().c_str());
-        std::printf("%s", est.Report().c_str());
+        std::printf("\nscale %s\n", est.Headline().c_str());
+        if (g_verbose) {
+            std::printf("%s", est.Report().c_str());
+        }
+        std::printf("params lambda=%u eps=%g seed=%llu prng_seed=%llu sum_attr=%u\n", cfg.lambda,
+                    cfg.eps, static_cast<unsigned long long>(cfg.seed),
+                    static_cast<unsigned long long>(opt.prng_seed), sum_attr);
 
         // ---------------------------------------------------------------
         // ⓪' 数据 + 基准（全部来自规模派生）
@@ -371,19 +400,24 @@ int main(int argc, char** argv) {
         const Schema& schema = setup.schema;
         const std::vector<MpraqRecord>& records = setup.records;
         const mpraq_baseline::Dataset baseline = MakeBaseline(schema, records);
-        std::printf("\n[数据] N = %zu；%u 个属性，每个属性：R = [0,%u]、m = %u、"
-                    "domain = [%lld,%lld]，取值由 `DeterministicPrng(seed=%llu)` 合成；"
-                    "真实列数 M = %llu\n",
-                    N, cfg.attributes, cfg.columns_per_attribute - 1,
-                    cfg.columns_per_attribute, static_cast<long long>(ScaleDomainMin(cfg)),
-                    static_cast<long long>(ScaleDomainMax(cfg)),
-                    static_cast<unsigned long long>(cfg.seed),
-                    static_cast<unsigned long long>(est.real_columns_M));
-        std::printf("        谓词：%u 个（自动生成，阈值全部落在该属性的 LCTE 区间内）"
-                    "⇒ 去重列数 = min(k, M) = min(%u, %llu) = %llu\n",
-                    cfg.predicates, cfg.predicates,
-                    static_cast<unsigned long long>(est.real_columns_M),
-                    static_cast<unsigned long long>(est.dedup_columns));
+        if (g_verbose) {
+            // 数据口径（原中文说明）：N 条记录；每个属性 R = [0, 列数−1]、m = 列数、
+            // domain = [min,max]；取值由 `DeterministicPrng(seed)` 合成；M = 真实列数
+            // = 属性数 × 每属性列数。
+            std::printf("data N=%zu attrs=%u R_max=%u m=%u domain_min=%lld domain_max=%lld "
+                        "seed=%llu M=%llu\n",
+                        N, cfg.attributes, cfg.columns_per_attribute - 1,
+                        cfg.columns_per_attribute,
+                        static_cast<long long>(ScaleDomainMin(cfg)),
+                        static_cast<long long>(ScaleDomainMax(cfg)),
+                        static_cast<unsigned long long>(cfg.seed),
+                        static_cast<unsigned long long>(est.levels));
+            // 谓词自动生成（阈值全部落在该属性的 LCTE 区间内）⇒ 去重列数 = min(k, M)。
+            std::printf("preds k=%u min(k,M)=%u M=%llu dedup=%llu\n",
+                        cfg.predicates, cfg.predicates,
+                        static_cast<unsigned long long>(est.levels),
+                        static_cast<unsigned long long>(est.dedup_columns));
+        }
 
         // ---------------------------------------------------------------
         // ② Init（真实 gRPC 到两台服务器进程）
@@ -411,39 +445,47 @@ int main(int argc, char** argv) {
 
         const StoreParams& store = client->store_params();
         const PlinkoParams& plinko = client->plinko_params();
-        const size_t words_per_column = store.words_per_column;
+        const size_t entry_words = store.entry_words;
         const uint64_t n_entries = store.entry_count();
         const uint64_t q_hints = plinko.backup_hints();
         const uint64_t hint_slots = plinko.hint_slots();
 
-        std::printf("\n[Init] 连接 2 台服务器 = %.1f ms（每台 1 次 TCP/HTTP2 握手）；"
-                    "Init（含上传） = %.1f ms\n", connect_ms, init_ms);
-        {
-            const MpraqInitTimings& t = client->timings();
-            std::printf("        分阶段：LCTE=%.1f ms、位打包/列主序=%.1f ms、"
-                        "共享生成=%.1f ms、HintInit=%.1f ms、上传=%.1f ms\n",
-                        t.lcte_ms, t.pack_ms, t.share_ms, t.hint_ms, t.upload_ms);
-            std::printf("        上传分块：%zu 个块 × %zu word；上传字节 = %llu B"
-                        "（两台合计）= 2×(16n + 16N·|attrs|)\n",
-                        t.chunk_count, t.chunk_words,
-                        static_cast<unsigned long long>(client->upload_bytes()));
-        }
-        std::printf("        几何：N=%zu、⌈N/128⌉=%zu、真实列数 M=%zu、补齐后列数 m=%zu"
-                    "（补齐 %zu 列）、n = m·⌈N/128⌉ = %llu、w=%llu、c=%llu、λw=%llu、q=%llu、"
-                    "H=%llu\n",
-                    store.num_records, words_per_column, store.real_column_count,
-                    store.column_count, store.padding_columns(),
+        // [Init] 一行：连接/Init（含上传）/HintInit 耗时、上传字节、几何 n/w/c。
+        std::printf("\ninit connect_ms=%.1f init_ms=%.1f hintinit_ms=%.1f "
+                    "upload_bytes=%llu m=%llu w=%llu kappa=%llu\n",
+                    connect_ms, init_ms, client->timings().hint_ms,
+                    static_cast<unsigned long long>(client->upload_bytes()),
                     static_cast<unsigned long long>(n_entries),
                     static_cast<unsigned long long>(plinko.w),
-                    static_cast<unsigned long long>(plinko.block_count()),
-                    static_cast<unsigned long long>(plinko.main_hints()),
-                    static_cast<unsigned long long>(q_hints),
-                    static_cast<unsigned long long>(hint_slots));
-        // Init 阶段的 RPC 次数（口径由 `DistributeUpload` 推导，不写死常数）
-        std::printf("        Init RPC：每台 %llu 次 = InitTable 1 + 上传 %llu + 属性共享 %zu\n",
-                    static_cast<unsigned long long>(channel0.rpc_count()),
-                    static_cast<unsigned long long>(client->timings().chunk_count),
-                    store.num_attributes());
+                    static_cast<unsigned long long>(plinko.blocks()));
+        if (g_verbose) {
+            const MpraqInitTimings& t = client->timings();
+            // 上传字节（两台合计）= 2×(16n + 16N·|attrs|)。
+            std::printf("        phases lcte_ms=%.1f pack_ms=%.1f share_ms=%.1f "
+                        "hintinit_ms=%.1f upload_ms=%.1f\n",
+                        t.lcte_ms, t.pack_ms, t.share_ms, t.hint_ms, t.upload_ms);
+            std::printf("        upload_chunks chunks=%zu chunk_words=%zu bytes=%llu\n",
+                        t.chunk_count, t.chunk_words,
+                        static_cast<unsigned long long>(client->upload_bytes()));
+            // 几何：m = PIR 条目数（一列 = 一个条目）；λw = 常规 hint；N_T = λw/2（备份）；
+            //       H = λw+N_T（槽位）。
+            std::printf("        geom n=%zu entry_words=%zu levels=%zu m=%zu pad=%zu w=%llu kappa=%llu "
+                        "lw=%llu N_T=%llu H=%llu\n",
+                        store.n, entry_words, store.levels,
+                        store.m, store.padding_columns(),
+                        static_cast<unsigned long long>(n_entries),
+                        static_cast<unsigned long long>(plinko.w),
+                        static_cast<unsigned long long>(plinko.blocks()),
+                        static_cast<unsigned long long>(plinko.main_hints()),
+                        static_cast<unsigned long long>(q_hints),
+                        static_cast<unsigned long long>(hint_slots));
+            // Init 阶段的 RPC 次数（口径由 `DistributeUpload` 推导，不写死常数）：
+            // 每台 = InitTable 1 + 上传 %llu + 属性共享 %zu。
+            std::printf("        init_rpc per_server=%llu init_table=1 upload=%llu attr_shares=%zu\n",
+                        static_cast<unsigned long long>(channel0.rpc_count()),
+                        static_cast<unsigned long long>(client->timings().chunk_count),
+                        store.num_attributes());
+        }
 
         // 服务器账目的**基线**：本 demo 的服务器进程可能在多次客户端运行之间存活，
         // 因此所有"服务器侧计数"都用**增量**口径（与通道侧的 delta 口径一致），
@@ -454,54 +496,73 @@ int main(int argc, char** argv) {
         // ---------------------------------------------------------------
         // ③ L14 查询预算（**先算清楚再查**）
         // ---------------------------------------------------------------
-        // ① 每次 word 查询消费 1 条常规 hint 并提升 1 条备份 ⇒ 一次离线支持
-        //    `q = λw/2` 次 **word 查询**；
-        // ② 重复访问同一列要另取"未答复过的"新索引 ⇒ 新鲜索引池 `n = m·⌈N/128⌉`。
+        // ① 每个**查询集**（= 一整列）消费 1 条常规 hint 并提升 1 条备份 ⇒ 一次离线支持
+        //    `N_T = λw/2` 次列举查询；
+        // ② 重复访问同一列要另取"未答复过的"新索引 ⇒ 新鲜索引池 = m（条目数）。
+        // ⚠️ 列粒度：**一列 = 一个条目 = 1 个查询集**，因此计划量就是"列数"，
+        //    **不再乘以 ⌈n/128⌉**（旧 word 口径的 128 倍消耗已作废）。
         const auto budget_plan = [&](const std::vector<size_t>& per_query_columns) {
             uint64_t total = 0;
-            for (size_t c : per_query_columns) total += c * words_per_column;
+            for (size_t c : per_query_columns) total += c;
             return total;
         };
         // 两次查询的去重列数：①单谓词 = 1 列；②k 个谓词 = min(k, M)（规模派生值）
         const std::vector<size_t> plan_columns = {1,
                                                   static_cast<size_t>(est.dedup_columns)};
-        const uint64_t planned_words = budget_plan(plan_columns);
+        const uint64_t planned_sets = budget_plan(plan_columns);
         const uint64_t budget = std::min<uint64_t>(q_hints, n_entries);
-        std::printf("\n[L14 预算] 一次 Count 消耗 列数 × ⌈N/128⌉ 个 word 查询：\n");
-        std::printf("           查询①（单谓词，%zu 列）= %zu × %zu = %zu；"
-                    "查询②（%u 个谓词，去重 %zu 列）= %zu × %zu = %zu ⇒ 合计 %llu 个 word 查询\n",
-                    plan_columns[0], plan_columns[0], words_per_column,
-                    plan_columns[0] * words_per_column, cfg.predicates, plan_columns[1],
-                    plan_columns[1], words_per_column, plan_columns[1] * words_per_column,
-                    static_cast<unsigned long long>(planned_words));
-        std::printf("           口径换算：谓词数 %u → 去重列数 min(k, M) = min(%u, %llu) = %zu "
-                    "→ 查询集数 = 去重列数 × ⌈N/128⌉ = %zu × %zu = %zu（对齐规模派的预估值 "
-                    "%llu）→ 每台 RPC = 1\n",
-                    cfg.predicates, cfg.predicates,
-                    static_cast<unsigned long long>(est.real_columns_M), plan_columns[1],
-                    plan_columns[1], words_per_column, plan_columns[1] * words_per_column,
-                    static_cast<unsigned long long>(est.query_sets));
-        if (plan_columns[1] * words_per_column != est.query_sets) {
+        // 口径断言（与详略无关，必须始终成立）
+        if (plan_columns[1] != est.query_sets) {
             throw std::logic_error(
-                "本次查询的去重列数 × ⌈N/128⌉ ≠ 规模派生的查询集数 " + Num(est.query_sets) +
+                "本次查询的去重列数 ≠ 规模派生的查询集数 " + Num(est.query_sets) +
                 " —— 规模层与谓词层的口径漂移了");
         }
-        std::printf("           一次离线的上限 = min(① 备份 hint q = λw/2 = %u·%llu/2 = %llu，"
-                    "② 新鲜索引池 n = m·⌈N/128⌉ = %llu) = %llu\n",
-                    cfg.lambda, static_cast<unsigned long long>(plinko.w),
+        if (planned_sets > budget) {
+            throw std::runtime_error(
+                "L14 预算不足：计划 " + Num(planned_sets) + " 个查询集 > 上限 " +
+                Num(budget) + " —— 必须加大 λ/w（放大 N_T）或减少本次查询的列数");
+        }
+        // 一行摘要（默认）；完整算式在 `--verbose`。
+        // 口径：计划查询集 ≤ min(N_T = λw/2（备份 hint）, m（新鲜索引池）)。
+        std::printf("budget planned_sets=%llu N_T=%llu m=%llu budget=%llu margin=%llu pass=1\n",
+                    static_cast<unsigned long long>(planned_sets),
                     static_cast<unsigned long long>(q_hints),
                     static_cast<unsigned long long>(n_entries),
-                    static_cast<unsigned long long>(budget));
-        std::printf("           %llu ≤ %llu ⇒ 预算内（余量 %llu）；两次查询用的列**互不重复**"
-                    "（列 %zu+%zu 个，m = %zu）⇒ 不额外消耗新鲜索引\n",
-                    static_cast<unsigned long long>(planned_words),
                     static_cast<unsigned long long>(budget),
-                    static_cast<unsigned long long>(budget - planned_words),
-                    plan_columns[0], plan_columns[1], store.column_count);
-        if (planned_words > budget) {
-            throw std::runtime_error(
-                "L14 预算不足：计划 " + Num(planned_words) + " 个 word 查询 > 上限 " +
-                Num(budget) + " —— 必须加大 λ/w（放大 q）或减少本次查询的列数");
+                    static_cast<unsigned long long>(budget - planned_sets));
+        if (g_verbose) {
+            // 一次 Count 消耗「去重列数」个查询集；查询① = 单谓词（1 列）、
+            // 查询② = k 个谓词（去重 min(k,M) 列）。
+            std::printf("\nbudget_check\n");
+            std::printf("           q0_cols=%zu q0_cols_mul=%zu entry_words=%zu q0_sets=%zu "
+                        "q1_preds=%u q1_cols=%zu q1_cols_mul=%zu wpr2=%zu q1_words=%zu "
+                        "total_words=%llu\n",
+                        plan_columns[0], plan_columns[0], entry_words,
+                        plan_columns[0] * entry_words, cfg.predicates, plan_columns[1],
+                        plan_columns[1], entry_words, plan_columns[1] * entry_words,
+                        static_cast<unsigned long long>(planned_sets));
+            // 口径换算：谓词数 k → 去重列数 min(k, M) → 查询集数 = 去重列数
+            // （对齐规模派的预估值）→ 每台 RPC = 1。
+            std::printf("           convert preds=%u preds2=%u M=%llu dedup=%zu dedup2=%zu "
+                        "entry_words=%zu qsets=%zu est_qsets=%llu rpc_per_server=1\n",
+                        cfg.predicates, cfg.predicates,
+                        static_cast<unsigned long long>(est.levels), plan_columns[1],
+                        plan_columns[1], entry_words, plan_columns[1] * entry_words,
+                        static_cast<unsigned long long>(est.query_sets));
+            // 一次离线的上限 = min(① 备份 hint N_T = λw/2，② 新鲜索引池 m)。
+            std::printf("           cap min_lambda_w_over_2 lambda=%u w=%llu N_T=%llu pool_m=%llu cap=%llu\n",
+                        cfg.lambda, static_cast<unsigned long long>(plinko.w),
+                        static_cast<unsigned long long>(q_hints),
+                        static_cast<unsigned long long>(n_entries),
+                        static_cast<unsigned long long>(budget));
+            // 两次查询用的列互不重复（列 plan_columns[0]+plan_columns[1] 个，m 列）
+            // ⇒ 不额外消耗新鲜索引。
+            std::printf("           check planned=%llu budget=%llu margin=%llu "
+                        "cols0=%zu cols1=%zu m=%zu disjoint=1\n",
+                        static_cast<unsigned long long>(planned_sets),
+                        static_cast<unsigned long long>(budget),
+                        static_cast<unsigned long long>(budget - planned_sets),
+                        plan_columns[0], plan_columns[1], store.m);
         }
 
         // 客户端侧 SecureMul 状态（α **全局一份**，来自 Init 的 mac_key_shares()）
@@ -518,14 +579,15 @@ int main(int argc, char** argv) {
             std::vector<mpraq_baseline::Pred> bpreds;
             uint64_t expect_columns = 0;  // 期望的去重列数（规模派生口径）
         };
-        // ① 单谓词（自动生成的谓词 #0）⇒ 1 列；
-        // ② 全部 k 个谓词的合取 ⇒ 去重列数 = min(k, M)（谓词落在互不相同的列上）
+        // ① 单谓词（自动生成的谓词 #0，name=q0）⇒ 1 列；
+        // ② 全部 k 个谓词的合取（name=q1_k<k>）⇒ 去重列数 = min(k, M)（谓词落在互不相同的列上）。
+        // 名字只作为裸键值/诊断里的标识，不再带中文。
         const std::vector<Case> cases = {
-            {"①单谓词（自动生成的谓词 #0）",
+            {"q0",
              {setup.predicates[0]},
              {ToBaseline(setup.predicates[0])},
              1},
-            {"②全部 " + std::to_string(cfg.predicates) + " 个谓词的合取",
+            {"q1_k" + std::to_string(cfg.predicates),
              setup.predicates,
              ToBaseline(setup.predicates),
              est.dedup_columns},
@@ -545,8 +607,9 @@ int main(int argc, char** argv) {
             QueryReport r;
             r.name = c.name;
             r.predicate_text = PredString(c.preds);
-            std::printf("\n---------------------------------------------------------------------\n");
-            std::printf("查询 %s：Φ = %s\n", c.name.c_str(), r.predicate_text.c_str());
+            if (g_verbose) {
+                std::printf("\nquery name=%s phi=%s\n", c.name.c_str(), r.predicate_text.c_str());
+            }
 
             const uint64_t rpc0_before = channel0.rpc_count();
             const uint64_t rpc1_before = channel1.rpc_count();
@@ -555,11 +618,12 @@ int main(int argc, char** argv) {
             r.count_ms = MsSince(t_count);
             r.rpc_calls[0] = channel0.rpc_count() - rpc0_before;
             r.rpc_calls[1] = channel1.rpc_count() - rpc1_before;
-            r.words_queried =
-                static_cast<uint64_t>(r.count.columns.size()) * words_per_column;
+            // ⚠️ 列粒度：**一列 = 一个条目 = 1 个查询集** ⇒ 查询集数就等于去重列数
+            //    （不再乘以 entry_words）。
+            r.words_queried = static_cast<uint64_t>(r.count.columns.size());
             // 口径核对（必须打印/断言出来，而不是只写在注释里）：
             //   去重列数 == 期望值（① 1 列；② min(k, M)）
-            //   查询集数 == 去重列数 × ⌈N/128⌉
+            //   查询集数 == 去重列数（一列 = 一个条目 = 1 个查询集）
             //   每台 RPC 次数 == 1（一次 RunBatch 恒 1，与批次大小无关）
             if (r.count.columns.size() != c.expect_columns) {
                 throw std::runtime_error(
@@ -568,7 +632,7 @@ int main(int argc, char** argv) {
                     Num(c.expect_columns));
             }
             if (r.count.queries_issued != r.words_queried) {
-                throw std::runtime_error("查询集数 ≠ 去重列数 × ⌈N/128⌉");
+                throw std::runtime_error("查询集数 ≠ 去重列数");
             }
             if (r.rpc_calls[0] != 1 || r.rpc_calls[1] != 1) {
                 throw std::runtime_error(
@@ -587,10 +651,13 @@ int main(int argc, char** argv) {
                 mpraq_baseline::FilterShape(bfilter)) {
                 throw std::runtime_error("filter 向量与明文基准逐位不一致");
             }
-            std::printf("    明文基准：count=%llu（filter 逐位一致 %zu 位；"
-                        "每字面量取反/合取由客户端本地做，服务器零参与）\n",
-                        static_cast<unsigned long long>(bcount), r.count.filter.size());
-            PrintCountAccounts(r, words_per_column);
+            if (g_verbose) {
+                // 明文基准对照：filter 逐位一致；每字面量取反/合取由客户端本地做，服务器零参与。
+                std::printf("    baseline count=%llu filter_bits=%zu bitwise_match=1 "
+                            "server_participation=0\n",
+                            static_cast<unsigned long long>(bcount), r.count.filter.size());
+            }
+            PrintCountAccounts(r, entry_words);
 
             // ---- Sum / Avg（`MPA-06` 批量 SecureMul，**服务器在另一个进程**）----
             // ⚠️ `count == 0`（没有任何记录满足谓词）是**合法**的查询结果，但 `Avg` 在数学上
@@ -605,9 +672,10 @@ int main(int argc, char** argv) {
             r.has_avg = (r.count.count > 0);
             if (r.has_avg) {
                 r.avg = AvgOverFilter(r.sum);
-            } else {
-                std::printf("    Avg：count = 0 ⇒ 平均值无定义，**不调用** `AvgOverFilter`"
-                            "（库口径：count == 0 ⇒ std::domain_error）；Sum = 0 仍与基准对照\n");
+            } else if (g_verbose) {
+                // count == 0 ⇒ 平均值无定义，**不调用** `AvgOverFilter`
+                //（库口径：count == 0 ⇒ std::domain_error）；Sum = 0 仍与明文基准对照。
+                std::printf("    avg count=0 avg=undefined avg_called=0 sum_still_checked=1\n");
             }
             r.sm = r.sum.securemul;
             r.has_sum = true;
@@ -636,17 +704,33 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("SecureMul 消息条数与 2N/4N 口径不符");
             }
             PrintSumAccounts(r, N);
-            if (bm.count == 0) {
-                std::printf("    明文基准：Sum=%llu、count=0 ⇒ Avg 无定义（两边口径一致："
-                            "不调用 AvgOverFilter、不做除法）\n",
-                            static_cast<unsigned long long>(bm.sum));
-            } else {
-                std::printf("    明文基准：Sum=%llu、count=%llu、Avg=%llu（整数向下取整）"
-                            "⇒ 三路一致（协议 / 基准）\n",
-                            static_cast<unsigned long long>(bm.sum),
-                            static_cast<unsigned long long>(bm.count),
-                            static_cast<unsigned long long>(bm.sum / bm.count));
+            if (g_verbose) {
+                if (bm.count == 0) {
+                    // 两边口径一致：不调用 AvgOverFilter、不做除法。
+                    std::printf("    baseline sum=%llu count=0 avg=undefined "
+                                "avg_called=0 divide_done=0\n",
+                                static_cast<unsigned long long>(bm.sum));
+                } else {
+                    // Avg 为整数向下取整；协议 / 基准双向一致。
+                    std::printf("    baseline sum=%llu count=%llu avg=%llu floor=1 match=1\n",
+                                static_cast<unsigned long long>(bm.sum),
+                                static_cast<unsigned long long>(bm.count),
+                                static_cast<unsigned long long>(bm.sum / bm.count));
+                }
             }
+            // 一行摘要（默认）：结果 = 基准、Sum/Avg、关键账目
+            std::printf("query name=%s phi=%s count=%llu count_matches_baseline=1 sum=%s avg=%s "
+                        "columns=%zu query_sets=%llu rpc0=%llu rpc1=%llu retrieve_ms=%.1f "
+                        "sum_ms=%.1f\n",
+                        c.name.c_str(), r.predicate_text.c_str(),
+                        static_cast<unsigned long long>(r.count.count),
+                        toString(r.sum.sum).c_str(),
+                        r.has_avg ? toString(r.avg).c_str() : "undefined",
+                        r.count.columns.size(),
+                        static_cast<unsigned long long>(r.words_queried),
+                        static_cast<unsigned long long>(r.rpc_calls[0]),
+                        static_cast<unsigned long long>(r.rpc_calls[1]), r.count.retrieve_ms,
+                        r.sum_ms);
 
             total_query_sets += r.words_queried;
             total_pir_rpc[0] += r.rpc_calls[0];
@@ -662,33 +746,40 @@ int main(int argc, char** argv) {
         // ---------------------------------------------------------------
         // ⑦ 账目汇总
         // ---------------------------------------------------------------
-        std::printf("\n=====================================================================\n");
-        std::printf("账目汇总（真实 gRPC 两进程；**不是**进程内 LocalTransport 口径）\n");
-        std::printf("=====================================================================\n");
+        if (g_verbose) {
+            // 账目汇总（原中文标题）：真实 gRPC 两进程，**不是**进程内 LocalTransport 口径。
+            std::printf("\naccounts mode=grpc_two_process local_transport=0\n");
+        }
 
         // ---- 服务器存储：公式双报（含补齐 / 不含补齐）+ 服务器**实测**值 ----
         const uint64_t feature_padded =
-            16ull * store.column_count * words_per_column;
+            16ull * store.m * entry_words;
         const uint64_t feature_unpadded =
-            16ull * store.real_column_count * words_per_column;
+            16ull * store.levels * entry_words;
         const uint64_t attr_bytes =
-            16ull * store.num_records * store.num_attributes();
-        std::printf("[存储：公式，每台服务器]\n");
-        std::printf("  含补齐  = 16·m·⌈N/128⌉ + 16·N·|attrs| = 16·%zu·%zu + 16·%zu·%zu = %llu B\n",
-                    store.column_count, words_per_column, store.num_records,
-                    store.num_attributes(),
-                    static_cast<unsigned long long>(feature_padded + attr_bytes));
-        std::printf("  不含补齐= 16·M·⌈N/128⌉ + 16·N·|attrs| = 16·%zu·%zu + 16·%zu·%zu = %llu B"
-                    "（差 %llu B = 补齐 %zu 列）\n",
-                    store.real_column_count, words_per_column, store.num_records,
-                    store.num_attributes(),
-                    static_cast<unsigned long long>(feature_unpadded + attr_bytes),
-                    static_cast<unsigned long long>(feature_padded - feature_unpadded),
-                    store.padding_columns());
-        std::printf("  属性值部分 = 16·N·|attrs| = %llu B（每属性一条长度 N 的向量）\n",
-                    static_cast<unsigned long long>(attr_bytes));
-
-        std::printf("\n[存储：服务器进程**实测**（经 Relay 的账目帧取回，非公式）]\n");
+            16ull * store.n * store.num_attributes();
+        if (g_verbose) {
+            // 公式（每台服务器）：
+            //   含补齐   = 16·m·entry_words + 16·n·|attrs|；
+            //   不含补齐 = 16·levels·entry_words + 16·n·|attrs|；
+            //   属性值部分 = 16·N·|attrs|（每属性一条长度 N 的向量）。
+            std::printf("storage_formula per_server=1\n");
+            std::printf("  srv_padded m=%zu entry_words=%zu n=%zu attrs=%zu bytes=%llu\n",
+                        store.m, entry_words, store.n,
+                        store.num_attributes(),
+                        static_cast<unsigned long long>(feature_padded + attr_bytes));
+            std::printf("  srv_unpadded levels=%zu entry_words=%zu n=%zu attrs=%zu bytes=%llu diff=%llu "
+                        "pad_cols=%zu\n",
+                        store.levels, entry_words, store.n,
+                        store.num_attributes(),
+                        static_cast<unsigned long long>(feature_unpadded + attr_bytes),
+                        static_cast<unsigned long long>(feature_padded - feature_unpadded),
+                        store.padding_columns());
+            std::printf("  srv_attr_bytes bytes=%llu\n",
+                        static_cast<unsigned long long>(attr_bytes));
+            // 服务器进程**实测**值：经 Relay 的账目帧取回（非公式）。
+            std::printf("\nstorage_measured source=relay_account_frame\n");
+        }
         for (int sid = 0; sid < 2; ++sid) {
             const ServerStats st = QueryServerStats(transport, sid);
             const ServerStats& b = stats_before[static_cast<size_t>(sid)];
@@ -706,33 +797,38 @@ int main(int argc, char** argv) {
                 st.node_batch_rpc_count - b.node_batch_rpc_count;
             const uint64_t d_node_scalar =
                 st.node_scalar_rpc_count - b.node_scalar_rpc_count;
-            std::printf("  服务器 %d：初始化=%s 存储=%llu B（特征 %llu + 属性 %llu）；"
-                        "本次运行**增量**：数据 RPC=%llu（服务侧受理的 4 条数据 RPC 合计；"
-                        "本 demo 里 = Count 次数 %zu）、受理查询集=%llu、node 层 word 读取=%llu"
-                        "（= 查询集×c = %llu×%llu；⚠️ node 层计数在 InitTable 时清零）\n",
-                        sid, st.initialized ? "是" : "否",
-                        static_cast<unsigned long long>(st.storage_bytes),
-                        static_cast<unsigned long long>(st.feature_storage_bytes),
-                        static_cast<unsigned long long>(st.attribute_storage_bytes),
-                        static_cast<unsigned long long>(d_rpc), reports.size(),
-                        static_cast<unsigned long long>(d_queries),
-                        static_cast<unsigned long long>(d_words),
-                        static_cast<unsigned long long>(d_queries),
-                        static_cast<unsigned long long>(plinko.block_count()));
-            std::printf("              PIR 计数口径（增量）：服务侧批量入口调用 = %llu"
-                        "（= 数据 RPC 次数 %llu ⇒ **一次 RPC 恰好一次批量调用**）、"
-                        "node 层批量 = %llu、node 层标量 = %llu（gRPC 部署下**恒 0**：\n"
-                        "              服务侧不再走标量接口；node 层的 `InitTable` 会清零，"
-                        "故此处是「最近一次 Init 之后」的增量）\n",
-                        static_cast<unsigned long long>(d_service_batch),
-                        static_cast<unsigned long long>(d_rpc),
-                        static_cast<unsigned long long>(d_node_batch),
-                        static_cast<unsigned long long>(d_node_scalar));
-            std::printf("              Relay 增量：安装帧=%llu（= Sum 次数 %zu）、相位帧=%llu"
-                        "（= 2×Sum 次数）、累计处理记录=%llu（= 2N×Sum 次数）\n",
-                        static_cast<unsigned long long>(d_install), reports.size(),
-                        static_cast<unsigned long long>(d_phase),
-                        static_cast<unsigned long long>(d_records));
+            if (g_verbose) {
+                // 服务器实测（增量口径，本次客户端运行期间）：数据 RPC = 服务侧受理的 4 条
+                // 数据 RPC 合计（本 demo 里 = Count 次数）；node 层 word 读取 = 查询集 × c；
+                // node 层计数在 InitTable 时清零。
+                std::printf("  server id=%d initialized=%s storage_bytes=%llu feature_bytes=%llu "
+                            "attr_bytes=%llu d_rpc=%llu count_calls=%zu d_queries=%llu "
+                            "d_words_read=%llu d_queries_mul=%llu c=%llu\n",
+                            sid, st.initialized ? "yes" : "no",
+                            static_cast<unsigned long long>(st.storage_bytes),
+                            static_cast<unsigned long long>(st.feature_storage_bytes),
+                            static_cast<unsigned long long>(st.attribute_storage_bytes),
+                            static_cast<unsigned long long>(d_rpc), reports.size(),
+                            static_cast<unsigned long long>(d_queries),
+                            static_cast<unsigned long long>(d_words),
+                            static_cast<unsigned long long>(d_queries),
+                            static_cast<unsigned long long>(plinko.blocks()));
+                // PIR 计数口径（增量）：服务侧批量入口调用 = 数据 RPC 次数（一次 RPC 恰好一次
+                // 批量调用）；node 层批量；node 层标量在 gRPC 部署下恒 0（服务侧不再走标量接口，
+                // 且 node 层的 `InitTable` 会清零 ⇒ 此处是最近一次 Init 之后的增量）。
+                std::printf("              pir_counts service_batch=%llu d_rpc=%llu "
+                            "node_batch=%llu node_scalar=%llu\n",
+                            static_cast<unsigned long long>(d_service_batch),
+                            static_cast<unsigned long long>(d_rpc),
+                            static_cast<unsigned long long>(d_node_batch),
+                            static_cast<unsigned long long>(d_node_scalar));
+                // Relay 增量：安装帧 = Sum 次数、相位帧 = 2×Sum 次数、累计处理记录 = 2N×Sum 次数。
+                std::printf("              relay d_install_frames=%llu sum_calls=%zu "
+                            "d_phase_frames=%llu d_records=%llu\n",
+                            static_cast<unsigned long long>(d_install), reports.size(),
+                            static_cast<unsigned long long>(d_phase),
+                            static_cast<unsigned long long>(d_records));
+            }
             if (st.storage_bytes != feature_padded + attr_bytes) {
                 throw std::runtime_error(
                     "服务器 " + Num(static_cast<uint64_t>(sid)) + " 实测存储 " +
@@ -759,8 +855,11 @@ int main(int argc, char** argv) {
             if (d_queries != total_query_sets) {
                 throw std::runtime_error("服务器受理的查询集增量 ≠ 客户端发出的查询集数");
             }
-            if (d_words != total_query_sets * plinko.block_count()) {
-                throw std::runtime_error("服务器 word 读取增量 ≠ 查询集数 × c");
+            // ⚠️ 列粒度：每个查询集读的是**一整个条目**（entry_words 个字）⇒
+            //    words_read = 查询集数 × κ × entry_words。
+            if (d_words != total_query_sets * plinko.blocks() * store.entry_words) {
+                throw std::runtime_error(
+                    "服务器 word 读取增量 ≠ 查询集数 × κ × entry_words");
             }
             if (d_phase != 2 * reports.size()) {
                 throw std::runtime_error("服务器相位帧增量 ≠ 2 × Sum 次数（两轮/查询）");
@@ -773,38 +872,52 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ---- 查询集 / RPC / 往返 ----
-        std::printf("\n[查询与 RPC]\n");
-        std::printf("  查询集总数 = %llu（= Σ 每次 Count 的 列数×⌈N/128⌉；"
-                    "PIR 的 n 是 **word 数**，不是记录数）\n",
-                    static_cast<unsigned long long>(total_query_sets));
-        std::printf("  PIR RPC：服务器 0 = %llu、服务器 1 = %llu（每台 = 查询次数 %zu，"
-                    "因为**一次 RunBatch = 1 次 RPC**，与批次大小无关）\n",
+        // ---- 账目一行摘要（默认）；完整账目在 `--verbose` ----
+        // 口径：存储/台 = 公式 = 实测；查询集 = Σ 每次 Count 的 列数×⌈N/128⌉；
+        // SecureMul rounds 与线上消息（wire）；安装 rounds 与帧数（两台合计）。
+        std::printf("\naccounts storage_bytes_per_server=%llu query_sets=%llu "
+                    "pir_rpc0=%llu pir_rpc1=%llu sm_rounds=%llu sm_wire_messages=%llu "
+                    "install_rounds=%llu install_frames=%llu\n",
+                    static_cast<unsigned long long>(feature_padded + attr_bytes),
+                    static_cast<unsigned long long>(total_query_sets),
                     static_cast<unsigned long long>(total_pir_rpc[0]),
-                    static_cast<unsigned long long>(total_pir_rpc[1]), reports.size());
-        std::printf("  SecureMul（每台视角）：rounds=%llu（每次 Sum 恒 2 ⇒ %zu 次 Sum）、"
-                    "线上消息=%llu（= 4N × %zu）\n",
-                    static_cast<unsigned long long>(total_sm_rounds), reports.size(),
-                    static_cast<unsigned long long>(total_sm_wire), reports.size());
-        std::printf("  安装（离线 dealer 材料下发，**每次 Sum 一次**）：rounds=%llu、"
-                    "帧数=%llu（两台合计）\n",
+                    static_cast<unsigned long long>(total_pir_rpc[1]),
+                    static_cast<unsigned long long>(total_sm_rounds),
+                    static_cast<unsigned long long>(total_sm_wire),
                     static_cast<unsigned long long>(total_install_rounds),
                     static_cast<unsigned long long>(2 * reports.size()));
-        std::printf("  端到端 RPC/往返总计（每台）：PIR %llu + SecureMul 在线 %llu + 安装 %llu"
-                    " + 账目查询 %llu = %llu\n",
-                    static_cast<unsigned long long>(total_pir_rpc[0]),
-                    static_cast<unsigned long long>(total_sm_rounds),
-                    static_cast<unsigned long long>(total_install_rounds),
-                    static_cast<unsigned long long>(2),
-                    static_cast<unsigned long long>(total_pir_rpc[0] + total_sm_rounds +
-                                                    total_install_rounds + 2));
+
+        // ---- 查询集 / RPC / 往返 ----
+        if (g_verbose) {
+            // 口径（原中文说明）：查询集总数 = Σ 每次 Count 的 列数×⌈N/128⌉；PIR 的 n 是
+            // **word 数**，不是记录数；每台 PIR RPC = 查询次数（一次 RunBatch = 1 次 RPC，
+            // 与批次大小无关）；SecureMul 每次 Sum 恒 2 轮，线上消息 = 4N × Sum 次数；
+            // 安装 = 离线 dealer 材料下发（每次 Sum 一次），帧数两台合计；
+            // 端到端 RPC/往返总计（每台）= PIR + SecureMul 在线 + 安装 + 账目查询(2)。
+            std::printf("\nquery_rpc\n");
+            std::printf("  query_sets total=%llu\n",
+                        static_cast<unsigned long long>(total_query_sets));
+            std::printf("  pir_rpc server0=%llu server1=%llu count=%zu per_batch=1\n",
+                        static_cast<unsigned long long>(total_pir_rpc[0]),
+                        static_cast<unsigned long long>(total_pir_rpc[1]), reports.size());
+            std::printf("  securemul rounds=%llu sum_calls=%zu wire_messages=%llu sum_calls2=%zu\n",
+                        static_cast<unsigned long long>(total_sm_rounds), reports.size(),
+                        static_cast<unsigned long long>(total_sm_wire), reports.size());
+            std::printf("  install rounds=%llu frames=%llu\n",
+                        static_cast<unsigned long long>(total_install_rounds),
+                        static_cast<unsigned long long>(2 * reports.size()));
+            std::printf("  rpc_total per_server pir=%llu sm_online=%llu install=%llu "
+                        "accounts=%llu total=%llu\n",
+                        static_cast<unsigned long long>(total_pir_rpc[0]),
+                        static_cast<unsigned long long>(total_sm_rounds),
+                        static_cast<unsigned long long>(total_install_rounds),
+                        static_cast<unsigned long long>(2),
+                        static_cast<unsigned long long>(total_pir_rpc[0] + total_sm_rounds +
+                                                        total_install_rounds + 2));
+        }
 
         // ---- hint 预算消耗 ----
         const uint64_t consumed = client->query_count();
-        std::printf("\n[hint 预算（L14）]\n");
-        std::printf("  已消耗 word 查询 = %llu（客户端计数）= 实际发出的查询集 %llu \n",
-                    static_cast<unsigned long long>(consumed),
-                    static_cast<unsigned long long>(total_query_sets));
         // L14 的两条上限都要算（**最小的那条说了算**）。
         // 口径：以"**本轮 demo 的这两次查询**"为单位（合计 `total_query_sets` 个 word 查询）
         // ⇒ "还能做 N 轮"是可直接对应的说法，而不是把一个平均值冒充"每次查询"。
@@ -814,36 +927,48 @@ int main(int argc, char** argv) {
         const uint64_t pool_left =
             n_entries > total_query_sets ? n_entries - total_query_sets : 0;
         const uint64_t by_pool = per_round == 0 ? 0 : pool_left / per_round;
-        std::printf("  ① 备份 hint：剩余 %llu / q = %llu（H = λw+q = %llu）⇒ 还能再做 %llu 轮"
-                    "同样规模的查询（每轮 %llu 个 word 查询）\n",
+        std::printf("hint backup_remaining=%llu N_T=%llu pool_m=%llu pool_used=%llu "
+                    "rounds_left=%llu\n",
                     static_cast<unsigned long long>(client->backup_remaining()),
                     static_cast<unsigned long long>(q_hints),
-                    static_cast<unsigned long long>(hint_slots),
-                    static_cast<unsigned long long>(by_hint),
-                    static_cast<unsigned long long>(per_round));
-        std::printf("  ② 新鲜索引池：n = %llu，已消耗 %llu（重复访问同一 (列,word) 要另取"
-                    "未答复索引）⇒ 还能再做 %llu 轮\n",
                     static_cast<unsigned long long>(n_entries),
                     static_cast<unsigned long long>(total_query_sets),
-                    static_cast<unsigned long long>(by_pool));
-        std::printf("  ⇒ **两条上限取较小者** = %llu 轮；用尽必须重跑离线（D8，本项目不做摊销式离线）\n",
                     static_cast<unsigned long long>(std::min(by_hint, by_pool)));
+        if (g_verbose) {
+            // 预算（台账 L14）明细：已消耗的查询集数（客户端计数）= 实际发出的查询集；
+            // ① 备份 hint 剩余 / N_T（H = λw + N_T）⇒ 还能做几轮同样规模的查询（每轮 per_round 个）；
+            // ② 新鲜索引池 m（重复访问同一**条目**要另取未答复索引）；
+            // 两条上限取较小者；用尽必须重跑离线（D8，本项目不做摊销式离线）。
+            std::printf("\nhint_budget\n");
+            std::printf("  hint_used words=%llu query_sets=%llu\n",
+                        static_cast<unsigned long long>(consumed),
+                        static_cast<unsigned long long>(total_query_sets));
+            std::printf("  hint_backup remaining=%llu N_T=%llu H=%llu rounds_left=%llu "
+                        "words_per_round=%llu\n",
+                        static_cast<unsigned long long>(client->backup_remaining()),
+                        static_cast<unsigned long long>(q_hints),
+                        static_cast<unsigned long long>(hint_slots),
+                        static_cast<unsigned long long>(by_hint),
+                        static_cast<unsigned long long>(per_round));
+            std::printf("  hint_pool m=%llu used=%llu rounds_left=%llu\n",
+                        static_cast<unsigned long long>(n_entries),
+                        static_cast<unsigned long long>(total_query_sets),
+                        static_cast<unsigned long long>(by_pool));
+            std::printf("  hint_limit rounds_min=%llu exhausted_action=offline_rerun\n",
+                        static_cast<unsigned long long>(std::min(by_hint, by_pool)));
+        }
         if (consumed != total_query_sets) {
             throw std::runtime_error("hint 消耗计数 " + Num(consumed) +
                                      " ≠ 发出的查询集数 " + Num(total_query_sets));
         }
 
-        // ---- 耗时 ----
-        std::printf("\n[耗时]\n");
-        std::printf("  Init（含上传）= %.1f ms；两次 Count = %.1f ms（合计）；"
-                    "两次 Sum/Avg = %.1f ms（合计）\n", init_ms, total_count_ms,
-                    total_sum_ms);
-        std::printf("  demo 总墙钟 = %.1f ms（不含造数据/进程启动）\n",
-                    MsSince(t_init));
+        // ---- 耗时（一行） ----
+        std::printf("timing init_ms=%.1f count_ms=%.1f sum_ms=%.1f wall_ms=%.1f\n",
+                    init_ms, total_count_ms, total_sum_ms, MsSince(t_init));
 
-        std::printf("\n[结论] 两次查询的 Count / filter / Sum / Avg 全部与**明文基准**逐值一致；"
-                    "一次 RunBatch 恒 1 次 RPC/台；SecureMul 往返恒 2；"
-                    "服务器实测存储 = §1 公式值。\n");
+        // 结论：Count/filter/Sum/Avg 全部与明文基准逐值一致；一次 RunBatch = 1 次 RPC/台；
+        // SecureMul 往返恒 2；服务器存储 = 公式。
+        std::printf("result baseline_match=1 rpc_per_batch=1 sm_rounds=2 storage_formula_match=1\n");
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << "\n[FAIL-LOUDLY] demo 中止：" << e.what() << "\n";

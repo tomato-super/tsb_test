@@ -6,9 +6,9 @@
 //     （Q5 的摊薄往返口径）；16 字节元素一律小端。
 //   * 不同的部分（为什么不能复用 vmpq.proto）：
 //       1. VMPQ 的表是"one-hot 条目 + 每属性取值域 2^{l_a}"，条目数可以**补齐到
-//          2 的幂**；MPRAQ 的表是"**LCTE 特征位**，每列 ⌈N/128⌉ 个 128 位 word，
-//          列主序展平"，且补齐只补**列**（`StoreParams::column_count` vs
-//          `real_column_count`）⇒ 几何字段完全不同。
+//          2 的幂**；MPRAQ 的表是"**LCTE 特征位**，**一个 PIR 条目 = 一整列**
+//          （`entry_words = ⌈n/128⌉` 个 128 位字）"，且补齐只补**条目**
+//          （`StoreParams::m` vs `levels`）⇒ 几何字段完全不同。
 //       2. MPRAQ 的 PIR 是 **Plinko**：查询集是 `(offsets[α], groups[α])`，应答是
 //          **两个** parity（`acc0`/`acc1`）；VMPQ 的 V-OO-PIR 查询集与应答结构不同。
 //       3. MPRAQ 还要传**属性值的 mod q 加法共享**（`ModShare`，q = 2^127−1）与
@@ -23,9 +23,12 @@
 //
 //   * ⚠️ **半诚实版本**：不含任何 proof/验证值字段（决策 D16；MPRAQ 侧的验证机制
 //     待 `TASK_PLAN.md` §7.13 的 V1 裁决 ⇒ 本文件**不能**预留"看着像"的字段）。
-//   * ⚠️ **`n` 是 word 数而非记录数**（D24④ / D19-6）：`StoreParams.entry_count =
-//     column_count · words_per_column`，`PlinkoQuery.block_size` 是"**每个区块的
-//     word 数**"。写错会静默错 128 倍 ⇒ 服务端对几何做显式校验并返回可读错误。
+//   * ⚠️ **符号口径（D41）**：`n` = **记录数**（列长 bit），`m` = **PIR 条目数**
+//     （= 补齐后的 LCTE 层数），`entry_words = ⌈n/128⌉` = 条目宽度（字），
+//     `PlinkoQuery.block_size` 是"**每个区块的条目数**"。
+//     ⚠️ 与 Plinko 原文的记法**不同**（原文的 `n` 就是这里的 `m`）—— 本仓库选"向
+//     论文看齐"，因此一律用 `m`。把"字"与"条目"搞混会静默错 ⌈n/128⌉ 倍 ⇒
+//     服务端对几何做显式校验（含 `entry_words` 的不变量 I4）并返回可读错误。
 //   * 每个 `bytes` 元素都是**定长 16 字节小端 uint128**（与 `grpc_vmpq.cpp` 的
 //     `ToBytes`/`FromBytes` 完全同一约定）：`toBytesLE` 写、`fromBytesLE` 读。
 
@@ -77,23 +80,31 @@ message StoreAttributeProto {
     int64 domain_max = 5;     // 闭取值域上界
 }
 
-// ⚠️ `PlinkoParams` 的派生量（block_count/main_hints/…）**不上线**：
+// ⚠️ `PlinkoParams` 的派生量（blocks/main_hints/…）**不上线**：
 //    服务端一律用 `PlinkoParams::Validate()` + `StoreParams::Validate()` 自己核对，
-//    避免"客户端报一个 c、服务器按另一个算"的静默错值。
+//    避免"客户端报一个 κ、服务器按另一个算"的静默错值。
 message PlinkoParamsProto {
-    uint64 n = 1;              // **word 数**（= column_count · words_per_column），D24④
-    uint64 w = 2;              // 区块大小（**必须是 2 的幂**，D21）
+    uint64 m = 1;              // PIR 条目数 = LCTE 层数（**一个条目 = 一整列**）
+    uint64 w = 2;              // 区块大小（**条目**/块；**必须是 2 的幂**，D21）
     uint32 lambda = 3;         // 安全参数 λ
     double prp_epsilon = 4;    // iPRF 的 PRP 目标 ε（D22-1）
+    uint64 entry_words = 5;    // 条目宽度（字）= ⌈n/128⌉（不变量 I1/I4）
 }
 
+// ⚠️ 线协议版本：几何口径变更（word 粒度 → 列粒度）时必须 fail-loudly，
+//    绝不静默按旧口径解析。当前 = 2（见 StoreParamsProto.protocol_version）。
 message StoreParamsProto {
-    uint64 num_records = 1;        // N
-    uint64 words_per_column = 2;   // ⌈N/128⌉
-    uint64 column_count = 3;       // **补齐后**的总列数
-    uint64 real_column_count = 4;  // 真实（未补齐）的总列数
+    uint64 n = 1;              // 记录数 = 列长（bit）
+    uint64 entry_words = 2;    // ⌈n/128⌉
+    uint64 m = 3;              // PIR 条目数 = **补齐后**的 LCTE 层数
+    uint64 levels = 4;         // 真实（未补齐）的 LCTE 层数 = Σ_a m_a
     PlinkoParamsProto plinko = 5;
     repeated StoreAttributeProto attrs = 6;
+    // 运行方式（**接口预留**）：0 = semi-honest、1 = malicious。
+    // 服务端据此**校验档位一致**（不一致即拒绝）—— 防"静默降级"。
+    uint32 security_mode = 7;
+    // 线协议版本（见 kMpraqWireProtocolVersion）；不匹配即拒绝。
+    uint32 protocol_version = 8;
 }
 
 message InitTableRequest {
@@ -145,11 +156,13 @@ message PirQuerySet {
 }
 
 message PirQueryRequest {
-    // queries[j] 对应第 j 个待检索 word。
-    // ⚠️ 客户端把**整列（乃至多列）的全部 word** 一次性放进这里（Q5/D24④）。
+    // queries[j] 对应第 j 个待检索列（**一个条目 = 一整列**）。
+    // ⚠️ 客户端把**整批全部列**一次性放进这里（Q5）。
     repeated PirQuerySet queries = 1;
-    uint64 blocks = 2;      // c（几何自足：服务端据此校验查询集长度）
-    uint64 block_size = 3;  // w = **每个区块的 word 数**（D24④，写错静默错 128 倍）
+    uint64 blocks = 2;      // κ（几何自足：服务端据此校验查询集长度）
+    uint64 block_size = 3;  // w = **每个区块的条目数**（不是字/块）
+    // 条目宽度（字）。⚠️ 不变量 I4：服务端据此校验应答宽度，不符即拒绝。
+    uint64 entry_words = 4;
 }
 
 message PirAnswer {

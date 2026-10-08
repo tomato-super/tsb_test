@@ -16,13 +16,13 @@
 //   ① 参数校验（D19-5 的 `m >= 跨度+2`、`w = 2^k`、`c` 偶数、N>0、越域）
 //      → `MpraqClient::Init` 的 `ValidateInputs`
 //   ② LCTE 编码（复用 MPA-01 的 `LcteBits`）→ 位打包 → 客户端明文特征表
-//      → 列主序展平：**条目号 = 全局列号 · ⌈N/128⌉ + word 序号**（D24④）
+//      → **一个条目 = 一整列**：条目号 = 全局列号，条目宽度 = `entry_words = ⌈n/128⌉` 字
 //   ③ 属性值 → mod q 加法共享（强类型 `ModShare`；D11/D24）
 //   ④ `PlinkoClient::HintInit`（客户端本地，对**明文** feature word 表；论文 `:524`）
 //      ⚠️ 真实部署里 hint 由 **offline server**（持有 DB 的那一方）生成后发给客户端；
 //         本仓库沿用 `voo_pir`/Plinko 的**单机仿真约定**：客户端持有一份明文副本、
 //         在本地跑 `HintInit`。两种做法产出的 hint 完全相同（PLINKO_SPEC §2 的注）。
-//   ⑤ 上传：特征 word 的 **XOR** 共享（分块）+ 属性值共享（带 attr_id）
+//   ⑤ 上传：特征**整条目**的 **XOR** 共享（分块，按 `entry_words` 对齐）+ 属性值共享（带 attr_id）
 //   ⑥ `st`：hint 表（在 `PlinkoClient` 内）、每区块密钥、MAC 密钥 α
 //      （`GenerateMacKey(2, q)`，**全局一份**，Q3）+ 明文副本
 //   ⑦ ❌ **不生成任何 HMAC 验证值**：论文 `:527`「对 ⟨E⟩_p 算 HMAC」在共享域上
@@ -30,45 +30,41 @@
 //      本文件**没有**任何 HMAC 标签、"每条 hint 一个 F" 之类的字段——绝不伪造验证层。
 //
 // ===========================================================================
-// 2. 补齐到合法几何（D15(a) + PLINKO_SPEC §1）
+// 2. 补齐到合法几何（D15(a) + D41 + PLINKO_SPEC §1）
 // ===========================================================================
-// Plinko 的几何约束（`PlinkoParams::Validate`）：
-//     n = c·w、w 为**2 的幂**、c **为偶数**、n ≥ 4
-// 而 LCTE 布局给出的条目数是 **n = M·⌈N/128⌉**（`M = Σ_a m_a` 是真实列数）——
-// 一般**不满足**上述约束（例如 N=8、M=3 ⇒ n=3 < 4；N=128、M=16 ⇒ c=4 恰好合法；
-// 而 M=8 ⇒ n=8 时 w=2、c=4 合法，M=2 ⇒ n=2 又不合法）。
+// Plinko 的几何约束（`PlinkoParams::Validate`，符号见 D41）：
+//     `m = kappa·w`、`w` 为**2 的幂**、`kappa` **为偶数**、`m ≥ 4`
+// 而 LCTE 布局给出的条目数是 **`levels = Σ_a m_a`**（真实层数）——
+// 一般**不满足**上述约束（例如 `levels = 3 < 4`；`levels = 6` 时需 `2w | 6`）。
 //
-// ⇒ 与 D15(a)/PLINKO_SPEC §1 的分工一致：**补齐是上层（本层）的事**，
-//    `core/iprf` 与 `pir/plinko` 都**不偷偷改 n**（`PlinkoParams::Derive` 会直接抛错
+// ⇒ 与 D15(a) 的分工一致：**补齐是上层（本层）的事**，
+//    `core/iprf` 与 `pir/plinko` 都**不偷偷改 `m`**（`PlinkoParams::Derive` 会直接抛错
 //    并给出"应补齐到多少"的建议）。
 //
-// 补齐**只用"补齐列"**，绝不补记录：
-//   * 增加一列 = 在展平表末尾追加 `⌈N/128⌉` 个 word，其**明文恒为 0**
-//     ⇒ 两台服务器的共享**逐位相同**（0 ⊕ 0 = 0 的任一种拆分都行；本实现取
-//     `s0 = 0、s1 = 0`），因此"尾部填充位两台一致"这一要求自动满足（§1 的 ⚠️）。
-//   * 补记录会改变 `⌈N/128⌉` 并给真实记录引入伪造行，语义上更脏，因此不做。
+// 补齐**只用"补齐列"（= 补齐条目）**，绝不补记录：
+//   * 增加一列 = 在展平表末尾追加 `entry_words` 个字（= 一个条目），其**明文恒为 0**
+//     ⇒ 两台服务器的共享**逐位相同**（本实现取 `s0 = 0、s1 = 0`），
+//     因此不变量 I2（尾部填充两台恒 0）自动满足。
+//   * 补记录会改变 `entry_words` 并给真实记录引入伪造行，语义上更脏，因此不做。
 //   * **w 是自由参数**（`PlinkoParams::w`），且多个取值常常都合法 ⇒ 本层在全部合法候选中
-//     按 **`(n, w)` 排序取最优**（主键 = 服务器存储 `16·n`；次键 = hint 表 `H = 3λw/2`）。
-//     候选从 `w = 2^⌈log₂ ⌈N/128⌉⌉`（一列 = 一个区块，落在 √n 量级，与
-//     `PlinkoParams::Derive` 的 `w = 2^⌈log₂√n⌉` 同族）逐级翻倍。失败时报错并列出原因。
-//   * 补齐列只影响**服务器存储**（多存 `16·(M_pad−M)·⌈N/128⌉` B）与 `n`，
-//     不影响任何真实列的条目号（列主序是前缀连续的）。
-//   * ⚠️ 补齐可能显著放大存储：`N = 130`、`M = 3` 时 `⌈N/128⌉ = 2`，最小的 4 的幂列数
-//     会让 `n = 8`（真实只需 6 个条目）——这是"列数必须补齐到 2 的幂"的直接后果
-//     （与 `VmpqParams::PaddedEntries` 同一取舍）。🔴 **待负责人裁决**：若希望存储更紧，
-//     可选方案是"按记录补齐到 128 的倍数"（代价：给真实记录引入伪造行）。
+//     取 **`w` 最接近 `√m`** 的那个（主键：`|log₂w − ½log₂m|` 最小 ⇒ `kappa` 次线性；
+//     次键 = 更少补齐列；末键 = hint 表更小）。候选 `w = 2^j` 满足 `2w | m`。
+//     ⚠️ **不能取 `w = 1`**：那会让一次列查询退化成整表扫描（`kappa = m`）。
+//   * 补齐列只影响**服务器存储**（多存 `16·padding_columns·entry_words` B）与 `m`，
+//     不影响任何真实列的条目号（条目号 = 全局列号，前缀连续）。
+//   * ⚠️ 列粒度下补齐量很小：只需把 `levels` 抬到最近的 `2w` 倍数
+//     （旧口径"抬到 2 的幂"连同 D35 的 ×2 升级搜索**已整体删除**）。
 //
 // ===========================================================================
 // 3. 给 `MPA-04` / `MPA-06` 留的入口
 // ===========================================================================
-//   * `MpraqClient::CreateQueries({ColumnWord, ...})` / `CreateColumnQuery(...)` →
+//   * `MpraqClient::CreateQueries({ColumnEntry, ...})` / `CreateColumnQuery(...)` →
 //     构造查询批次（**只生成查询集，不发 RPC**）。
 //   * `MpraqQueryBatch::Run()` → 每台服务器**一次** `IMpraqChannel::ServerRespBatch`
-//     （= **一次网络往返**承载整批查询集，Q5 / `MPRAQ_IMPL.md` §3 / D24④）
+//     （= **一次网络往返**承载整批查询集，Q5 / `MPRAQ_IMPL.md` §3）
 //     + `XorAnswers` + 逐条 `ClientRecon`（重建是客户端本地工作，逐条做）。
-//     ⇒ 一次 `AggQuery`（任意多少列、每列 ⌈N/128⌉ 个 word）的网络往返数恒为 **1**。
-//   * `MpraqClient::ColumnWordIndex(attr_id, column, word)` / `ColumnWordCount()`：
-//     ⚠️ **列主序**条目号，`ServerResp` 的步长是"每区块的 **word** 数"（D24④）。
+//     ⇒ 一次 `AggQuery`（任意多少列；**一列 = 一个条目 = 1 个查询集**）的网络往返数恒为 **1**。
+//   * `MpraqClient::EntryIndex(attr_id, column)`：**一列 = 一个条目**，条目号 = 全局列号。
 //   * `MpraqClient::AttributeShare(attr_id, record)`（mod q 加法共享，MPA-06 的 SecureMul 输入）
 //     与 `MpraqClient::mac_key_shares()`（α 的分享，Q3 全局一份）。
 //   * `MpraqClient::node(i)` / `storage_bytes()`：账目与测试。
@@ -138,6 +134,13 @@ struct MpraqInitParams {
     // 理由：一次消息不宜过大（VMPQ 侧用同一量级），同时要让分块数远小于条目数
     // 以免 RPC 元数据成为瓶颈 ⇒ 4096 个 word = 64 KiB/块。
     size_t upload_chunk_words = 4096;
+    // 运行方式（安全档位）——**接口预留**（负责人要求"保留一个半诚实运行方式，
+    // 用配置文件配置"）。默认恶意档；半诚实档为显式 opt-in。
+    // ⚠️ 本 gate **不改变任何行为**：两个档位目前走同一条代码路径；
+    //    它的作用是随 `StoreParams` **上线**，让服务端能拒绝"档位不一致"（防静默降级）。
+    //    落地机制（按档位跳过 xmac / SPDZ MAC / §4.5-A/B / 逐记录校验）见
+    //    `src/mpraq/security_mode.hpp` 的文件头。
+    MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
 };
 
 // 各阶段的实测耗时（毫秒；供验收报告与基准使用，**不是**估算）
@@ -147,37 +150,36 @@ struct MpraqInitParams {
 // `total_ms` = 以上五段 + 参数校验/几何补齐/对象构造的其余开销。
 struct MpraqInitTimings {
     double lcte_ms = 0.0;      // ② LCTE 编码
-    double pack_ms = 0.0;      // ② 位打包 + 列主序展平
+    double pack_ms = 0.0;      // ② 位打包 + 一列一条目
     double hint_ms = 0.0;      // ④ Plinko HintInit（客户端本地）
     double share_ms = 0.0;     // ③ 生成共享（XOR 掩码 + mod q 掩码）
     double upload_ms = 0.0;    // ⑤ 分块上传到两台服务器
     double total_ms = 0.0;
-    // 规模
-    size_t records = 0;         // N
-    size_t words_per_column = 0;// ⌈N/128⌉
-    size_t column_count = 0;    // 补齐后的列数 m
-    size_t padding_columns = 0; // 补齐列数
-    uint64_t entry_count = 0;   // n
-    uint64_t block_count = 0;   // c
+    // 规模（符号向论文看齐）
+    size_t n = 0;               // 记录数 = 列长（bit）
+    size_t entry_words = 0;     // ⌈n/128⌉：条目宽度（字）
+    size_t m = 0;               // PIR 条目数 = 补齐后的 LCTE 层数
+    size_t levels = 0;          // 真实 LCTE 层数 = Σ_a lcte.range_size
+    size_t padding_columns = 0; // 补齐列数 = m − levels
+    uint64_t blocks = 0;        // κ = m/w
     uint64_t block_size = 0;    // w
-    size_t chunk_words = 0;     // 实际分块大小
+    size_t chunk_words = 0;     // 实际分块大小（word 数）
     size_t chunk_count = 0;     // 分块数
 };
 
 // 最小合法几何的建议（由 `DerivePaddedGeometry` 给出；供上层/测试直接使用）
 struct MpraqPaddedGeometry {
-    PlinkoParams plinko;          // n / w / c / λ / ε
-    size_t real_column_count = 0; // M
-    size_t column_count = 0;      // 补齐后的列数
-    size_t padding_columns = 0;   // column_count − M
+    PlinkoParams plinko;        // m / entry_words / w / κ / λ / ε
+    size_t levels = 0;          // 真实 LCTE 层数
+    size_t m = 0;               // PIR 条目数（= 补齐后的层数）
+    size_t padding_columns = 0; // m − levels（全零列）
 };
 
-// 由 (真实列数 M, 记录数 N, λ, ε) 求**最小**的合法补齐几何。
+// 由 (真实层数 levels, 记录数 n, λ, ε) 求**最小**的合法补齐几何。
 // 失败（找不到合法 w）时抛 std::invalid_argument，消息里给出原因与建议。
-MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_records,
-                                        uint32_t lambda = 80,
-                                        double prp_epsilon = 1e-10,
-                                        bool has_explicit_w = false, uint64_t w = 0);
+MpraqPaddedGeometry DerivePaddedGeometry(size_t levels, size_t n, uint32_t lambda = 80,
+                                         double prp_epsilon = 1e-10,
+                                         bool has_explicit_w = false, uint64_t w = 0);
 
 // ---------------------------------------------------------------------------
 // RPC 计数（Q5 / D24④ 口径的结构性断言）
@@ -190,8 +192,8 @@ MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_re
 //   * `server_resp_single_calls` = 标量 `IMpraqChannel::ServerResp` 的次数
 //     （只有 `RunQuery` 单条路径会用到）。
 //   * `queries` = 一共处理了多少个**查询集**（= Σ 批次大小）—— 与 RPC 次数无关，
-//     一次 `RunBatch(k 列 × ⌈N/128⌉ 个 word)` 的 `queries = k·⌈N/128⌉` 而
-//     `server_resp_batch_calls = 1`。
+//     一次 `RunBatch(k 列)` 的 `queries = k`（**一个条目 = 一整列 = 1 个查询集**）
+//     而 `server_resp_batch_calls = 1`。
 // 进程内通道下"一次方法调用"就代表"一次往返"（无序列化开销可省）。
 struct MpraqRpcStats {
     uint64_t server_resp_batch_calls = 0;
@@ -201,14 +203,14 @@ struct MpraqRpcStats {
 };
 
 // ---------------------------------------------------------------------------
-// 单次 word 查询
+// 单次列查询
 // ---------------------------------------------------------------------------
 
-// 上层要检索的 (属性, 列, word)
-struct ColumnWord {
+// 上层要检索的列：**一个条目 = 一整列**，因此只有 (属性, 列) 两个坐标，
+// **没有 word 维度**（旧口径的 `k·⌈N/128⌉` 个查询集已作废）。
+struct ColumnEntry {
     uint32_t attr_id = 0;
     uint32_t column = 0;
-    size_t word = 0;
 };
 
 class MpraqClient;
@@ -233,8 +235,8 @@ public:
     const PlinkoAnswer& answer0() const;  // 服务器 0 的应答
     const PlinkoAnswer& answer1() const;  // 服务器 1 的应答
     const PlinkoAnswer& answer() const;   // 两者 XOR（= 明文应答）
-    // 重建出的**明文** feature word（Run() 之前抛 std::logic_error）
-    uint128_t value() const;
+    // 重建出的**明文整列**（entry_words 个字；Run() 之前抛 std::logic_error）
+    const PlinkoEntry& value() const;
 
 private:
     friend class MpraqClient;
@@ -246,10 +248,9 @@ private:
     PlinkoAnswer answer0_{};
     PlinkoAnswer answer1_{};
     PlinkoAnswer answer_{};
-    uint128_t value_ = 0;
+    PlinkoEntry value_;   // 重建出的明文整列（entry_words 个字）
     bool answered_ = false;
 };
-
 // 一批查询：**一次 RPC** 把全部查询集发给两台服务器（Q5：所有谓词的所有 word 一起发）
 class MpraqQueryBatch {
 public:
@@ -265,9 +266,9 @@ public:
 
     // 每台服务器**一次** `ServerRespBatch`（整批查询集 ⇒ **一次往返**），
     // 随后逐条 `XorAnswers` + `ClientRecon`（本地计算）。
-    // 返回本批全部重建出的明文 feature word（与查询顺序一致）。
+    // 返回本批全部重建出的明文**整列**（与查询顺序一致；每条 entry_words 个字）。
     // 抛出：`PlinkoBackupsExhausted`/`PlinkoHintCoverageFailure`（来自 `ClientRecon`）。
-    std::vector<uint128_t> Run();
+    std::vector<PlinkoEntry> Run();
 
 private:
     friend class MpraqClient;
@@ -341,37 +342,35 @@ public:
 
     // --------------------- 给 MPA-04 / MPA-06 的入口 ---------------------
 
-    // ⚠️ **列主序**条目号 = 全局列号 · ⌈N/128⌉ + word 序号（D24④）。
+    // ⚠️ **一列 = 一个条目**：条目号就是全局列号（不再有 word 维度）。
     //    这是上层**唯一**应该用来算条目号的地方。
-    uint64_t ColumnWordIndex(uint32_t attr_id, uint32_t column, size_t word) const;
+    uint64_t EntryIndex(uint32_t attr_id, uint32_t column) const;
     // 直接按**全局列号**（= Σ_{a < attr_id} m_a + column）取条目号。
-    // 用途：补齐列（`column ∈ [real_column_count, column_count)`）不属于任何属性，
+    // 用途：补齐列（`column ∈ [levels, m)`）不属于任何属性，
     // 只有全局列号能定位它（上层 predicate 层永远不会请求补齐列）。
-    uint64_t GlobalColumnWordIndex(size_t global_column, size_t word) const;
-    size_t ColumnWordCount() const { return store_.words_per_column; }
-    size_t real_column_count() const { return store_.real_column_count; }
-    size_t column_count() const { return store_.column_count; }
-    // 属性 a 的第 column 列的**连续**条目区间 [begin, begin + ⌈N/128⌉)
-    std::pair<uint64_t, uint64_t> ColumnSegment(uint32_t attr_id, uint32_t column) const;
+    uint64_t GlobalEntryIndex(size_t global_column) const;
+    size_t entry_words() const { return store_.entry_words; }
+    size_t levels() const { return store_.levels; }
+    size_t m() const { return store_.m; }
 
-    // 取该属性的**明文**列比特（长度 N；word 的第 j 位 = 第 j 条记录）
+    // 取该属性的**明文**列比特（长度恰好 n；word 的第 j 位 = 第 j 条记录）—— 不变量 I3
     std::vector<uint8_t> PlainColumnBits(uint32_t attr_id, uint32_t column) const;
 
     // 构造一批查询（**只生成查询集，不发 RPC**）
-    MpraqQueryBatch CreateQueries(const std::vector<ColumnWord>& targets);
+    MpraqQueryBatch CreateQueries(const std::vector<ColumnEntry>& targets);
     // 按**裸条目号**构造（诊断/测试用：补齐列不属于任何属性，只有裸条目号能定位）
     MpraqQueryBatch CreateQueriesForIndices(const std::vector<uint64_t>& flat_indices);
-    // 取回一整列（⌈N/128⌉ 个 word）⇒ 直接喂 `predicate.hpp` 的
-    // `LcteColumnLookup` / `EvaluateFilter`（MPA-04 的"取一整列就是一段连续条目"）
+    // 取回一整列（**1 个条目 = 1 个查询集**）⇒ 直接喂 `predicate.hpp` 的
+    // `LcteColumnLookup` / `EvaluateFilter`
     MpraqQueryBatch CreateColumnQuery(uint32_t attr_id, uint32_t column);
 
     // 两台服务器的应答（各自在自己那半 XOR 共享上）：
     //   - `RunBatch`：**整批**查询集走每台服务器的**一次** `ServerRespBatch`
-    //     ⇒ **每批 1 次网络往返**（Q5 / `MPRAQ_IMPL.md` §3 / D24④）。
-    //     重建逐条做（客户端本地），返回与批次同序的明文 feature word 向量。
+    //     ⇒ **每批 1 次网络往返**（Q5 / `MPRAQ_IMPL.md` §3）。
+    //     重建逐条做（客户端本地），返回与批次同序的明文**整列**（每条 entry_words 个字）。
     //   - `RunQuery`：单条路径，走标量 `ServerResp`（1 个查询集 ⇒ 1 次往返）。
-    std::vector<uint128_t> RunBatch(MpraqQueryBatch& batch);
-    uint128_t RunQuery(MpraqQuery& query);
+    std::vector<PlinkoEntry> RunBatch(MpraqQueryBatch& batch);
+    PlinkoEntry RunQuery(MpraqQuery& query);
 
     // 属性值的**本方**加法共享（mod q，强类型 —— 绝不与 XOR 共享混用）
     ModShare AttributeShare(uint32_t attr_id, size_t record, int server) const;
@@ -397,7 +396,7 @@ public:
 
 private:
     // 两条路径共用的**客户端本地**收尾：两台应答 XOR → `ClientRecon`（不产生通道调用）
-    uint128_t FinishOne(MpraqQuery& q, const PlinkoAnswer& a0, const PlinkoAnswer& a1);
+    PlinkoEntry FinishOne(MpraqQuery& q, const PlinkoAnswer& a0, const PlinkoAnswer& a1);
 
 public:
 

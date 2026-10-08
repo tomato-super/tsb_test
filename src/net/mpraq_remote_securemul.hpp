@@ -138,8 +138,8 @@ InstallPayload DecodeInstallPayload(const Payload& payload, uint32_t count);
 // ---------------------------------------------------------------------------
 // 口径全部是**服务器进程实测**的值（不是客户端按公式算的）：
 //   [0] initialized（0/1）
-//   [1] storage_bytes        （= 16·column_count·⌈N/128⌉ + 16·N·|attrs|，含补齐列）
-//   [2] feature_storage_bytes（= 16·column_count·⌈N/128⌉）
+//   [1] storage_bytes        （= 16·m·entry_words + 16·n·|attrs|，含补齐条目）
+//   [2] feature_storage_bytes（= 16·m·entry_words）
 //   [3] attribute_storage_bytes（= 16·N·|attrs|）
 //   [4] rpc_count（4 条数据 RPC 中成功的次数）
 //   [5] queries_served（受理的**查询集**个数；与 RPC 次数无关）

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -26,18 +27,6 @@ uint64_t NextPow2(uint64_t v) {
     while (p < v && p < (static_cast<uint64_t>(1) << 62)) p <<= 1;
     return p;
 }
-
-// v 的**奇数部分**（去掉全部因子 2）。决策 D35 的可行性判据要用它：
-// ⌈N/128⌉ = 2^t·q 中只有 q 决定"列数至少要多大"。
-uint64_t OddPart(uint64_t v) {
-    if (v == 0) return 0;
-    while ((v & 1u) == 0u) v >>= 1;
-    return v;
-}
-
-// 列数升级搜索的**余量**（决策 D35）：充要条件给出的列数之上再允许 2^k 次翻倍。
-// 取值 2 ⇒ 上限是最小充分列数的 4 倍；更大只会多试几个（主键 n 最小 ⇒ 不会误选大列数）。
-constexpr uint64_t kColumnUpgradeSlack = 2;
 
 // XOR/mod q 掩码流的根密钥（编译期可从 tag 推出 ⇒ 跨进程可复现，铁律 D6）。
 // 独立流标签 ⇒ 与 Plinko 的流（区块密钥 / hint 子集 / 哑偏移）**互不干扰**。
@@ -84,91 +73,49 @@ double MsSince(const std::chrono::steady_clock::time_point& t0) {
 // 最小合法几何（补齐是**本层**的事：PLINKO_SPEC §1 的注 + D15(a)）
 // ---------------------------------------------------------------------------
 
-MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_records,
-                                        uint32_t lambda, double prp_epsilon,
-                                        bool has_explicit_w, uint64_t w_explicit) {
-    if (num_records == 0) {
+MpraqPaddedGeometry DerivePaddedGeometry(size_t levels, size_t n, uint32_t lambda,
+                                         double prp_epsilon, bool has_explicit_w,
+                                         uint64_t w_explicit) {
+    if (n == 0) {
         throw std::invalid_argument(
-            "DerivePaddedGeometry: N（记录数）必须 >= 1（N=0 时 ⌈N/128⌉=0，"
-            "特征表为空 ⇒ 没有任何可检索的条目）");
+            "DerivePaddedGeometry: n（记录数 = 列长）必须 >= 1（n=0 时 ⌈n/128⌉=0，"
+            "条目宽度为 0 ⇒ 没有任何可检索的条目）");
     }
-    if (real_column_count == 0) {
-        throw std::invalid_argument("DerivePaddedGeometry: 真实列数 M 必须 >= 1");
+    if (levels == 0) {
+        throw std::invalid_argument(
+            "DerivePaddedGeometry: levels（真实 LCTE 层数 = Σ_a lcte.range_size）必须 >= 1");
     }
-    const size_t words_per_column = (num_records + 127) / 128;
-    const uint64_t real_n = static_cast<uint64_t>(real_column_count) *
-                            static_cast<uint64_t>(words_per_column);
+    const uint64_t entry_words = (static_cast<uint64_t>(n) + 127) / 128;
 
     MpraqPaddedGeometry g;
-    g.real_column_count = real_column_count;
+    g.levels = levels;
 
     // ---------------------------------------------------------------------
-    // 列数补齐：**只补列、绝不补记录**（D15(a)），并允许 ×2 **升级搜索**（决策 D35）
+    // 列级补齐：**只补列、绝不补记录**
     // ---------------------------------------------------------------------
-    // 列数 `cols`（= PIR 的 `m`）必须是 **2 的幂**（与 `VmpqParams::PaddedEntries`
-    // 同一手法），条目数 `n = cols · ⌈N/128⌉`。
-    //
-    // 🔴 为什么必须**升级**（D35）：设 `L = ⌈N/128⌉ = 2^t·q`（`q` 为奇）、`cols = 2^a`、
-    //    `w = 2^b`。几何合法性（`PlinkoParams::Validate`）要求
-    //      * `w >= L`（一个区块至少装下一整列 ⇒ `b >= t + ⌈log₂q⌉`）；
-    //      * `n = c·w` 且 `c` 为**偶数**（PLINKO_SPEC §5.5）⇒ `c = 2^(a+t−b)·q`
-    //        为偶 ⇔ `b <= a + t − 1`；
-    //    ⇒ **存在合法 (a, b) ⇔ `a >= 1 + ⌈log₂q⌉`**（且仍需 `2^a >= M`）。
-    //    只试**最小**的 `2^a = NextPow2(min_columns(w))` 在 `q > M/2` 时**必然无解**：
-    //    例如 `L=13`、`M=10` ⇒ `cols=16` 时 `c` 恒为奇数（试遍所有 `w`），
-    //    升到 `cols=32`、`w=16` 后 `n=416`、`c=26` 为偶 ✅。
-    //    代价：服务器存储 `16·cols·L` 随升级**翻倍**（D26 口径 ⇒ 必须与"不含补齐"双报，
-    //    `MPA-09` 的 bench 也把 `m0`（升级前）与 `m`（升级后）都打出来）。
-    //
-    // 搜索顺序（**先最小列数，无解才升级**）：
-    //    对每个候选 `w`（`w = 2^⌈log₂L⌉·2^k`）从 `cols = NextPow2(min_columns(w))` 起
-    //    逐个 `×2` 试到上限；每个 `w` 取**第一个**合法列数（= 该 `w` 下 `n` 最小），
-    //    最后在全部候选里按 **(n 最小, w 最小)** 排序取最优（主键 = 服务器存储 `16·n`；
-    //    次键 = hint 表 `H = 3λw/2`）⇒ 有解时不升级、升级时也只升到够用为止。
-    //
-    // 列数上限（**有文档记录**）：由上面的充要条件，`cols >= 2^max(⌈log₂M⌉, 1+⌈log₂q⌉)`
-    //    时**一定**存在合法 `w`（取 `w = 2^(t+⌈log₂q⌉)` 即可），因此上限取
-    //    `NextPow2(max(M, 2q)) · 2^kColumnUpgradeSlack`。
-    const uint64_t odd_L = OddPart(static_cast<uint64_t>(words_per_column));
-
-    // 真实数据需要多少个**全局列**：至少 M 个，且必须能装进 `entry_count / w` 个区块
-    // （一个区块含 w 个 word，即 `w/words_per_column` 个整列）。
-    const auto min_columns = [&](uint64_t w) -> uint64_t {
-        const uint64_t cap = w / words_per_column;  // 一个区块覆盖多少**整列**
-        if (cap == 0) return std::numeric_limits<uint64_t>::max();
-        const uint64_t need = (real_column_count + cap - 1) / cap;
-        return std::max<uint64_t>(need, real_column_count);
-    };
-
-    // 某个（最小）列数之上允许升到多少
-    const auto cols_cap = [&](uint64_t base) -> uint64_t {
-        const uint64_t need_math =
-            std::max<uint64_t>(static_cast<uint64_t>(real_column_count), 2 * odd_L);
-        uint64_t sufficient = NextPow2(need_math);
-        for (uint64_t i = 0; i < kColumnUpgradeSlack; ++i) {
-            if (sufficient > (std::numeric_limits<uint64_t>::max() >> 1)) break;
-            sufficient <<= 1;
-        }
-        return std::max(base, sufficient);
-    };
-
+    // ⚠️ 列粒度（一个条目 = 一整列）下，Plinko 的几何要求只剩三条：
+    //      * `w` 是 2 的幂（D21：w 是 iPRF 的值域）；
+    //      * `m = κ·w`，即 **w | m**；
+    //      * `κ = m/w` 为**偶数**（§5.5 的对称性硬要求）⇒ 等价于 **2w | m**。
+    //   ⇒ 对给定的 `w`，满足条件的最小 `m` 就是 `ceil(levels / (2w)) · 2w`。
+    //   🔴 **旧口径作废**：word 粒度下条目数 = 列数 × ⌈n/128⌉，且 `w >= ⌈n/128⌉`、
+    //      `cols` 必须补齐到 2 的幂，于是出现了 D35 的"×2 升级搜索"。
+    //      列粒度下 **m 不再需要是 2 的幂**，补齐量从"抬到 2 的幂"降到"抬到 2w 的倍数"，
+    //      D35 的升级搜索因此**整体删除**（连同 `OddPart` / `kColumnUpgradeSlack`，已删）。
+    //   代价只有"补齐列"（全零列；几何公开 ⇒ 不泄露），存储增量
+    //   `16·(m − levels)·entry_words` B，必须与 `levels` 口径**双报**。
     struct Candidate {
         uint64_t w = 0;
-        uint64_t n = 0;
-        uint64_t cols = 0;
+        uint64_t m = 0;   // PIR 条目数（含补齐列）
     };
 
-    // 指定 (w, cols) 是否自洽。几何判据**只有** `PlinkoParams::Validate` 一处
-    // （本层绝不自己重写一套、也不放宽它 —— MPA-09 任务 C 的边界纪律）。
-    const auto build = [&](uint64_t w, uint64_t cols, PlinkoParams* out,
+    // 指定 (w, m) 是否自洽。几何判据**只有** `PlinkoParams::Validate` 一处
+    // （本层绝不自己重写一套、也不放宽它）。
+    const auto build = [&](uint64_t w, uint64_t m, PlinkoParams* out,
                            std::string* why) -> bool {
-        const uint64_t n = cols * static_cast<uint64_t>(words_per_column);
-        if (n < 4) {
-            *why = "n=" + Num(n) + " < 4（最小合法几何）";
-            return false;
-        }
         PlinkoParams p;
-        p.n = n;
+        p.m = m;
+        p.entry_words = entry_words;
         p.w = w;
         p.lambda = lambda;
         p.prp_epsilon = prp_epsilon;
@@ -182,33 +129,24 @@ MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_re
         return true;
     };
 
-    // 对给定 w：最小列数 → ×2 升级，取第一个合法几何
+    // 给定 w：取**最小**的合法 m（>= levels 且 2w | m）
     const auto try_w = [&](uint64_t w, Candidate* out, std::string* why) -> bool {
-        const uint64_t need = min_columns(w);
-        if (need == std::numeric_limits<uint64_t>::max()) {
-            *why = "w 小于一列的大小（w=" + Num(w) + " < ⌈N/128⌉=" +
-                   Num(words_per_column) + "）";
+        if (w == 0 || !IsPowerOfTwo(w)) {
+            *why = "w 必须是 2 的幂";
             return false;
         }
-        const uint64_t base = NextPow2(need);
-        const uint64_t cap = cols_cap(base);
-        std::string tried;
-        for (uint64_t cols = base;; cols <<= 1) {
-            PlinkoParams p;
-            std::string r;
-            if (build(w, cols, &p, &r)) {
-                out->w = w;
-                out->n = p.n;
-                out->cols = cols;
-                return true;
-            }
-            if (!tried.empty()) tried += "；";
-            tried += "cols=" + Num(cols) + "（n=" + Num(cols * words_per_column) +
-                     "）：" + r;
-            if (cols >= cap) break;
+        const uint64_t step = 2 * w;                       // κ 必须为偶数 ⇒ 2w | m
+        uint64_t m = ((static_cast<uint64_t>(levels) + step - 1) / step) * step;
+        if (m < 4) m = 4;                                  // 最小合法几何（w=2 ⇒ κ=2）
+        if (m % step != 0) m = ((m + step - 1) / step) * step;
+        PlinkoParams p;
+        std::string r;
+        if (build(w, m, &p, &r)) {
+            out->w = w;
+            out->m = m;
+            return true;
         }
-        *why = "已尝试列数 " + Num(base) + "…" + Num(cap) + "（含 ×2 升级，上限 = " +
-               Num(cap) + "）仍无合法几何 ⇒ " + tried;
+        *why = r;
         return false;
     };
 
@@ -216,17 +154,17 @@ MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_re
     const auto apply = [&](const Candidate& c) {
         PlinkoParams p;
         std::string why;
-        if (!build(c.w, c.cols, &p, &why)) {
+        if (!build(c.w, c.m, &p, &why)) {
             throw std::logic_error(
                 "MPRAQ Init: 内部一致性错误（选中的候选几何重新校验失败）：" + why);
         }
-        g.column_count = static_cast<size_t>(c.cols);
-        g.padding_columns = static_cast<size_t>(c.cols) - real_column_count;
+        g.m = static_cast<size_t>(c.m);
+        g.padding_columns = static_cast<size_t>(c.m) - levels;
         g.plinko = p;
     };
 
     if (has_explicit_w) {
-        // 显式 w：块容量 = w 个 word/区块（D24④），**只补齐列数**（含 ×2 升级），不改 w
+        // 显式 w：只补齐列数，不改 w
         if (w_explicit == 0 || !IsPowerOfTwo(w_explicit)) {
             throw std::invalid_argument(
                 "MPRAQ Init: w 必须是 2 的幂（决策 D21：w 是 iPRF 的值域；"
@@ -238,30 +176,19 @@ MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_re
         if (!try_w(w_explicit, &c, &why)) {
             throw std::invalid_argument(
                 "MPRAQ Init: 显式 w = " + Num(w_explicit) +
-                " 无法通过补齐整列凑出合法的 Plinko 几何（条目数恒为 columns·⌈N/128⌉ = " +
-                Num(words_per_column) + " 的整数倍；M = " + Num(real_column_count) +
-                "、⌈N/128⌉ 的奇数部分 q = " + Num(odd_L) + "）：" + why +
-                "。\n  处置：改用**默认派生**的 w（它在全部合法 (w, 列数) 里按 "
-                "(服务器存储 16·n, hint 表 3λw/2) 取最优），或换一个 N"
-                "（⌈N/128⌉ 的奇数部分越小越容易补齐）。");
+                " 无法通过补齐整列凑出合法的 Plinko 几何（levels = " + Num(levels) +
+                "、entry_words = " + Num(entry_words) + "）：" + why);
         }
         apply(c);
         return g;
     }
 
-    // 默认路径：块容量取 w_column = ⌈⌈N/128⌉⌉₂（一列 = 一个区块，让 w 落在 √n 量级，
-    // 与 `PlinkoParams::Derive` 的 `w = 2^⌈log₂√n⌉` 同族）。w 是自由参数，多个取值常常
-    // 都合法 ⇒ **在全部合法候选里按 (服务器存储, 提示表) 排序取最优**：
-    //   * 服务器存储 = `16·n` 字节，`n = 列数·⌈N/128⌉`（`MPRAQ_IMPL.md` §1）⇒ 主键 `n`；
-    //   * 提示表规模 = `H = 3λw/2` 个槽位（PLINKO_SPEC §2）⇒ 次键 `w`（更小的 w 让 hint
-    //     存储与每轮成本都更低）。
-    // ⚠️ 升级只在"最小列数无解"时才会被选中：升级后的 `n` 严格大于同 `w` 的最小列数候选，
-    //    而主键是 `n` 最小 ⇒ 有解时行为与 D35 之前**逐位一致**（`test_mpraq_scaling` 有回归守卫）。
-    const uint64_t w_column = NextPow2(static_cast<uint64_t>(words_per_column));
+    // 默认路径：在全部合法 w 里按 (服务器存储 16·m·entry_words, hint 表 H = 3λw/2) 取最优。
+    //   主键 = m（更小的 m ⇒ 更少补齐列、更小存储）；次键 = w（更小的 H）。
     std::vector<Candidate> valid;
     std::vector<std::string> reasons;
     for (uint64_t k = 0; k < 33; ++k) {
-        const uint64_t w = w_column << k;
+        const uint64_t w = static_cast<uint64_t>(1) << k;
         if (w > (static_cast<uint64_t>(1) << 32)) break;
         Candidate c;
         std::string why;
@@ -273,33 +200,34 @@ MpraqPaddedGeometry DerivePaddedGeometry(size_t real_column_count, size_t num_re
     }
     if (valid.empty()) {
         std::ostringstream oss;
-        oss << "MPRAQ Init: 无法把 LCTE 布局（M=" << real_column_count << " 列 × ⌈N/128⌉="
-            << words_per_column << " 个 word/列，即 " << real_n
-            << " 个真实条目）补齐到任何合法的 Plinko 几何"
-            << "（要求 w = 2^k、n = c·w、c 为偶数、n >= 4）。\n"
-            << "  诊断：⌈N/128⌉ 的奇数部分 q = " << odd_L
-            << " ⇒ 由「c 必须为偶数」（PLINKO_SPEC §5.5）推出的**充要条件**是 "
-               "列数 >= 2q = "
-            << (2 * odd_L) << "（且 >= NextPow2(M) = " << NextPow2(real_column_count)
-            << "）；本层已把列数从最小候选 **×2 升级**到上限 "
-            << cols_cap(NextPow2(static_cast<uint64_t>(real_column_count)))
-            << "（决策 D35），每个候选 w 都升级过。\n"
-            << "  试过的候选 w（每个都含列数升级）：";
+        oss << "MPRAQ Init: 无法把 LCTE 布局（levels=" << levels << " 层 × entry_words="
+            << entry_words << " 个字/列）补齐到任何合法的 Plinko 几何"
+            << "（要求 w = 2^k、w | m、κ = m/w 为偶数、m >= 4）。\n"
+            << "  诊断：对每个 w 取最小 m = ceil(levels / 2w)·2w 都被 PlinkoParams::Validate"
+               " 拒绝。\n"
+            << "  试过的候选 w：";
         for (size_t i = 0; i < reasons.size() && i < 8; ++i) {
             oss << "\n    " << reasons[i];
         }
         if (reasons.size() > 8) {
             oss << "\n    …（其余 " << (reasons.size() - 8) << " 个候选同理）";
         }
-        oss << "\n  处置：换一个 N（⌈N/128⌉ 的奇数部分越小越容易补齐；N 取 2 的幂最省）、"
-               "或调整 schema（增大 M 会同时抬高 NextPow2(M)）、"
-               "或检查 λ/ε（`λw` 或 `H = 3λw/2` 超过 core/iprf 的 2^32 域宽时"
+        oss << "\n  处置：检查 λ/ε（`λw` 或 `H = 3λw/2` 超过 core/iprf 的 2^32 域宽时"
                "**任何**几何都不合法）。";
         throw std::invalid_argument(oss.str());
     }
-    std::sort(valid.begin(), valid.end(), [](const Candidate& a, const Candidate& b) {
-        if (a.n != b.n) return a.n < b.n;   // 主键：条目数（= 服务器存储 16·n 字节）
-        return a.w < b.w;                   // 次键：区块更小（H = 3λw/2 ⇒ hint 表更小）
+    // 次键选择：**w 取最接近 √m 的 2 的幂**（Plinko 的标准选择 w ≈ √m）。
+    //   ⚠️ 查询成本 = κ = m/w 次**区块访问** ⇒ w 越小读得越多；`w = 1` 会让一次列查询
+    //      退化成整表扫描（κ = m），彻底丧失次线性 —— 必须避免。
+    //      而 hint 表规模 H = 3λw/2 随 w 增长 ⇒ 取 w ≈ √m 是"读次数 vs hint 表"的
+    //      标准折中（与 `PlinkoParams::Derive` 的 `w = 2^⌈log₂√m⌉` 同族）。
+    const auto log2d = [](uint64_t v) { return std::log2(static_cast<double>(v)); };
+    std::sort(valid.begin(), valid.end(), [&](const Candidate& a, const Candidate& b) {
+        const double da = std::fabs(log2d(a.w) - 0.5 * log2d(a.m));
+        const double db = std::fabs(log2d(b.w) - 0.5 * log2d(b.m));
+        if (da != db) return da < db;      // 主键：w 越接近 √m 越好
+        if (a.m != b.m) return a.m < b.m;  // 次键：更少补齐列（存储更小）
+        return a.w < b.w;                  // 末键：hint 表更小（H = 3λw/2）
     });
     apply(valid.front());
     return g;
@@ -314,8 +242,8 @@ namespace {
 size_t ValidateInputs(const Schema& schema, const std::vector<MpraqRecord>& records) {
     if (records.empty()) {
         throw std::invalid_argument(
-            "MpraqClient::Init: 记录数 N 必须 >= 1（N=0 时特征表为空，"
-            "没有任何可检索的条目；⌈N/128⌉ = 0 ⇒ Plinko 的 n = 0）");
+            "MpraqClient::Init: 记录数 n 必须 >= 1（n=0 时特征表为空，"
+            "没有任何可检索的条目 ⇒ Plinko 的 m = 0）");
     }
     if (schema.num_attributes() == 0) {
         throw std::invalid_argument("MpraqClient::Init: schema 至少要有一个属性");
@@ -421,10 +349,10 @@ const PlinkoAnswer& MpraqQuery::answer() const {
     return answer_;
 }
 
-uint128_t MpraqQuery::value() const {
+const PlinkoEntry& MpraqQuery::value() const {
     if (!answered_) {
         throw std::logic_error(
-            "MpraqQuery::value: 尚未 Run —— 明文值只有在两台服务器应答并 ClientRecon 之后才存在");
+            "MpraqQuery::value: 尚未 Run —— 明文整列只有在两台服务器应答并 ClientRecon 之后才存在");
     }
     return value_;
 }
@@ -445,7 +373,7 @@ const MpraqQuery& MpraqQueryBatch::at(size_t i) const {
     return queries_[i];
 }
 
-std::vector<uint128_t> MpraqQueryBatch::Run() {
+std::vector<PlinkoEntry> MpraqQueryBatch::Run() {
     if (owner_ == nullptr) {
         throw std::logic_error("MpraqQueryBatch::Run: 批次没有归属的客户端");
     }
@@ -474,27 +402,29 @@ std::unique_ptr<MpraqClient> MpraqClient::Init(const Schema& schema,
                              params.has_explicit_w, params.w);
 
     client->store_ = StoreParams{};
-    client->store_.num_records = records.size();
-    client->store_.words_per_column = (records.size() + 127) / 128;
-    client->store_.real_column_count = real_cols;
-    client->store_.column_count = g.column_count;
+    client->store_.n = records.size();
+    client->store_.entry_words = (records.size() + 127) / 128;
+    client->store_.levels = real_cols;
+    client->store_.m = g.m;
     client->store_.plinko = g.plinko;
+    client->store_.security_mode = params.security_mode;
+    client->store_.security_mode = params.security_mode;
     client->store_.attrs.clear();
     for (const AttributeSchema& a : schema.attributes()) {
         client->store_.attrs.push_back(
             StoreAttribute{a.name, a.id, a.lcte, a.domain_min, a.domain_max});
     }
-    // ⚠️ 这里就是"补齐后的 n 满足 PlinkoParams 几何（c 偶数、w = 2^k）"的**断言点**：
-    //    `StoreParams::Validate` 会核对 plinko.n == column_count·⌈N/128⌉ 并跑
-    //    `PlinkoParams::Validate`（w 是 2 的幂、n = c·w、c 为偶数）。
+    // ⚠️ 这里就是"补齐后的 `m` 满足 PlinkoParams 几何（kappa 偶数、w = 2^k）"的**断言点**：
+    //    `StoreParams::Validate` 会交叉核对 `plinko.m == m`、`plinko.entry_words == entry_words`
+    //    并跑 `PlinkoParams::Validate`（w 是 2 的幂、m = kappa·w、kappa 为偶数）。
     client->store_.Validate();
 
-    client->timings_.records = records.size();
-    client->timings_.words_per_column = client->store_.words_per_column;
-    client->timings_.column_count = g.column_count;
+    client->timings_.n = records.size();
+    client->timings_.entry_words = client->store_.entry_words;
+    client->timings_.m = g.m;
+    client->timings_.levels = g.levels;
     client->timings_.padding_columns = g.padding_columns;
-    client->timings_.entry_count = g.plinko.n;
-    client->timings_.block_count = g.plinko.block_count();
+    client->timings_.blocks = g.plinko.blocks();
     client->timings_.block_size = g.plinko.w;
 
     // ---------- ② LCTE 编码 + 位打包 + 列主序展平 ----------
@@ -542,11 +472,12 @@ std::unique_ptr<MpraqClient> MpraqClient::InitWithChannels(
                              params.has_explicit_w, params.w);
 
     client->store_ = StoreParams{};
-    client->store_.num_records = records.size();
-    client->store_.words_per_column = (records.size() + 127) / 128;
-    client->store_.real_column_count = real_cols;
-    client->store_.column_count = g.column_count;
+    client->store_.n = records.size();
+    client->store_.entry_words = (records.size() + 127) / 128;
+    client->store_.levels = real_cols;
+    client->store_.m = g.m;
     client->store_.plinko = g.plinko;
+    client->store_.security_mode = params.security_mode;
     client->store_.attrs.clear();
     for (const AttributeSchema& a : schema.attributes()) {
         client->store_.attrs.push_back(
@@ -554,12 +485,12 @@ std::unique_ptr<MpraqClient> MpraqClient::InitWithChannels(
     }
     client->store_.Validate();
 
-    client->timings_.records = records.size();
-    client->timings_.words_per_column = client->store_.words_per_column;
-    client->timings_.column_count = g.column_count;
+    client->timings_.n = records.size();
+    client->timings_.entry_words = client->store_.entry_words;
+    client->timings_.m = g.m;
+    client->timings_.levels = g.levels;
     client->timings_.padding_columns = g.padding_columns;
-    client->timings_.entry_count = g.plinko.n;
-    client->timings_.block_count = g.plinko.block_count();
+    client->timings_.blocks = g.plinko.blocks();
     client->timings_.block_size = g.plinko.w;
 
     client->channels_[0] = &channel0;
@@ -579,9 +510,9 @@ std::unique_ptr<MpraqClient> MpraqClient::InitWithChannels(
 
 void MpraqClient::BuildPlainTable(const std::vector<MpraqRecord>& records) {
     const auto t_total = std::chrono::steady_clock::now();
-    const size_t N = store_.num_records;
-    const size_t words = store_.words_per_column;
-    const size_t cols = store_.column_count;
+    const size_t N = store_.n;
+    const size_t words = store_.entry_words;
+    const size_t cols = store_.m;
 
     plain_features_.assign(N, 0);
     plain_attrs_.assign(store_.attrs.size(), std::vector<int64_t>(N, 0));
@@ -603,10 +534,10 @@ void MpraqClient::BuildPlainTable(const std::vector<MpraqRecord>& records) {
     }
     timings_.lcte_ms = MsSince(t_total);
 
-    // 位打包 + 列主序展平：
-    //   第 c 列第 w 个 word 的**条目号 = c·⌈N/128⌉ + w**（MPRAQ_IMPL.md §1 / D24④）
-    //   word 的第 j 位 = 第 j 条记录；第 j >= N 的位是**尾部填充位**，恒为 0
-    //   （本实现从零初始化后只置位，因此填充位天然为 0 且两台一致）。
+    // 位打包：**一列 = 一个条目**。
+    //   条目 i（= 全局列号 i）占 `[i·entry_words, (i+1)·entry_words)` 个连续 word；
+    //   word 的第 j 位 = 第 j 条记录；第 j >= n 的位是**尾部填充位**（不变量 I2），
+    //   本实现从零初始化后只置位 ⇒ 填充位天然为 0 且两台一致。
     const auto t_pack = std::chrono::steady_clock::now();
     plain_words_.assign(cols * words, 0);
     for (size_t a = 0; a < store_.attrs.size(); ++a) {
@@ -622,8 +553,8 @@ void MpraqClient::BuildPlainTable(const std::vector<MpraqRecord>& records) {
             }
         }
     }
-    // 补齐列（条目号 [real_column_count, column_count)）保持全 0 —— 明文恒为 0，
-    // 因此两台服务器的共享也逐位相同（0 ⊕ 0），尾部填充位一致这一要求自动满足。
+    // 补齐列（条目号 [levels, m)）保持全 0 —— 明文恒为 0，
+    // 因此两台服务器的共享也逐位相同（0 ⊕ 0），列级与位级填充都自动满足不变量 I2。
     timings_.pack_ms = MsSince(t_pack);
 }
 
@@ -633,25 +564,41 @@ void MpraqClient::BuildPlainTable(const std::vector<MpraqRecord>& records) {
 
 void MpraqClient::PrepareShares(const MpraqInitParams& params) {
     const auto t_total = std::chrono::steady_clock::now();
-    const size_t n = static_cast<size_t>(store_.entry_count());
+    // ⚠️ 特征表是**扁平的字数组**：总量 = m 个条目 × entry_words 个字
+    const size_t total_words =
+        static_cast<size_t>(store_.entry_count()) * store_.entry_words;
     const uint128_t q = kMpraqModulus;
 
     // ---------- ③ 共享材料 ----------
     // 特征 word：**XOR 共享**（D3/D12；parity 语义是 ⊕ ⇒ 绝不用加法共享）。
     // s0 = mask、s1 = plain ⊕ mask；两台分别上传。
     // 补齐列必须**两台同为 0**：这样"补齐位明文为 0 且两台一致"逐位成立
-    // （MPRAQ_IMPL.md §1 的 ⚠️），而不是靠 mask ⊕ mask = 0 这种"结果对但分量不一致"的写法。
-    feature_share0_.assign(n, 0);
-    feature_share1_.assign(n, 0);
-    const size_t real_cols = store_.real_column_count;
-    for (size_t i = 0; i < n; ++i) {
-        const size_t col = i / store_.words_per_column;
+    // （不变量 I2），而不是靠 mask ⊕ mask = 0 这种"结果对但分量不一致"的写法。
+    feature_share0_.assign(total_words, 0);
+    feature_share1_.assign(total_words, 0);
+    const size_t real_cols = store_.levels;
+    for (size_t i = 0; i < total_words; ++i) {
+        const size_t col = i / store_.entry_words;   // 一列 = 一个条目（entry_words 个字）
         if (col >= real_cols) {  // 补齐列：两台同为 0
             continue;
         }
         const uint128_t mask = rng_->Next();
         feature_share0_[i] = mask;
         feature_share1_[i] = static_cast<uint128_t>(plain_words_[i] ^ mask);
+    }
+    // ⚠️ **不变量 I2**：末字的尾部填充位（`j >= n`）必须在**两台分片上恒为 0**，
+    //    而不是"靠 mask ⊕ mask = 0 让重建结果对"—— 后者会让两台分片在填充位上
+    //    **取值相同**（都等于掩码），既是文档点名的反面写法，也让"哪些位是填充"
+    //    在分片层面留下结构性痕迹。这里显式把两台的高位掩掉。
+    //    （列级补齐的全零列已在上面 `continue` 掉，同样是两台恒 0。）
+    const size_t tail_bits = store_.n % 128;
+    if (tail_bits != 0) {
+        const uint128_t keep = (static_cast<uint128_t>(1) << tail_bits) - 1;
+        for (size_t e = 0; e < store_.m; ++e) {
+            const size_t last = e * store_.entry_words + (store_.entry_words - 1);
+            feature_share0_[last] = static_cast<uint128_t>(feature_share0_[last] & keep);
+            feature_share1_[last] = static_cast<uint128_t>(feature_share1_[last] & keep);
+        }
     }
 
     // 属性值：**mod q 加法共享**（强类型 `ModShare`）
@@ -682,23 +629,30 @@ void MpraqClient::PrepareShares(const MpraqInitParams& params) {
 
 void MpraqClient::DistributeUpload() {
     const auto t_up = std::chrono::steady_clock::now();
-    const size_t n = static_cast<size_t>(store_.entry_count());
+    // ⚠️ 特征表是**扁平的字数组**：总量 = m 个条目 × entry_words 个字
+    //    （旧口径下 `entry_count()` 就是字数；列粒度下必须再乘 entry_words，
+    //     否则只会上传前 m 个字 ⇒ 静默少传，重建出垃圾）。
+    const size_t total_words =
+        static_cast<size_t>(store_.entry_count()) * store_.entry_words;
     size_t chunk = init_params_.upload_chunk_words;
     if (chunk == 0) {
         throw std::invalid_argument(
             "MpraqClient::Init: upload_chunk_words 必须 >= 1（分块大小为 0 时无法推进）");
     }
-    chunk = std::min(chunk, n);
+    // ⚠️ 分块必须是 entry_words 的整数倍（服务端按条目边界校验上传长度 = 不变量 I1）
+    chunk = (chunk / store_.entry_words) * store_.entry_words;
+    if (chunk == 0) chunk = store_.entry_words;
+    chunk = std::min(chunk, total_words);
 
     for (int s = 0; s < 2; ++s) {
         channels_[s]->InitTable(store_);
     }
-    // 特征 word 的 XOR 共享：**分块**上传（块大小固定常量 4096 word = 64 KiB/块；
-    // 理由见 `MpraqInitParams::upload_chunk_words`）。
+    // 特征 word 的 XOR 共享：**分块**上传（块大小默认 4096 word = 64 KiB/块，
+    // 且按 entry_words 对齐；理由见 `MpraqInitParams::upload_chunk_words`）。
     const auto& s0 = feature_share0_;
     const auto& s1 = feature_share1_;
-    for (size_t base = 0; base < n; base += chunk) {
-        const size_t cnt = std::min(chunk, n - base);
+    for (size_t base = 0; base < total_words; base += chunk) {
+        const size_t cnt = std::min(chunk, total_words - base);
         std::vector<uint128_t> w0(s0.begin() + static_cast<ptrdiff_t>(base),
                                   s0.begin() + static_cast<ptrdiff_t>(base + cnt));
         std::vector<uint128_t> w1(s1.begin() + static_cast<ptrdiff_t>(base),
@@ -712,10 +666,10 @@ void MpraqClient::DistributeUpload() {
     for (size_t a = 0; a < store_.attrs.size(); ++a) {
         channels_[0]->SetAttributeShares(static_cast<uint32_t>(a), attr_share0_[a]);
         channels_[1]->SetAttributeShares(static_cast<uint32_t>(a), attr_share1_[a]);
-        upload_bytes_ += 2ull * store_.num_records * kUint128Bytes;
+        upload_bytes_ += 2ull * store_.n * kUint128Bytes;
     }
     timings_.chunk_words = chunk;
-    timings_.chunk_count = (n + chunk - 1) / chunk;
+    timings_.chunk_count = (total_words + chunk - 1) / chunk;
     timings_.upload_ms = MsSince(t_up);
 }
 
@@ -724,7 +678,7 @@ void MpraqClient::DistributeUpload() {
 // ---------------------------------------------------------------------------
 
 IprfKey MpraqClient::block_key(uint64_t block) const {
-    const uint64_t c = store_.plinko.block_count();
+    const uint64_t c = store_.plinko.blocks();
     if (block >= c) {
         throw std::out_of_range("MpraqClient::block_key: 区块号越界 " + Num(block) +
                                 "（c = " + Num(c) + "）");
@@ -752,27 +706,22 @@ uint128_t MpraqClient::PlainFeatureWord(uint64_t i) const {
     return plain_words_[static_cast<size_t>(i)];
 }
 
-uint64_t MpraqClient::ColumnWordIndex(uint32_t attr_id, uint32_t column, size_t word) const {
-    // ⚠️ 唯一入口：**列主序**条目号 = 全局列号 · ⌈N/128⌉ + word 序号（D24④）。
-    return store_.ColWordIndex(attr_id, column, word);
+uint64_t MpraqClient::EntryIndex(uint32_t attr_id, uint32_t column) const {
+    // ⚠️ 唯一入口：**一列 = 一个条目**，条目号就是全局列号。
+    return store_.EntryIndex(attr_id, column);
 }
 
-uint64_t MpraqClient::GlobalColumnWordIndex(size_t global_column, size_t word) const {
-    return store_.ColWordIndex(global_column, word);
-}
-
-std::pair<uint64_t, uint64_t> MpraqClient::ColumnSegment(uint32_t attr_id,
-                                                         uint32_t column) const {
-    const uint64_t begin = store_.ColWordIndex(attr_id, column, 0);
-    return {begin, begin + store_.words_per_column};
+uint64_t MpraqClient::GlobalEntryIndex(size_t global_column) const {
+    return store_.EntryIndex(global_column);
 }
 
 std::vector<uint8_t> MpraqClient::PlainColumnBits(uint32_t attr_id, uint32_t column) const {
-    const uint64_t base = store_.ColWordIndex(attr_id, column, 0);
-    std::vector<uint8_t> bits(store_.num_records, 0);
-    for (size_t j = 0; j < store_.num_records; ++j) {
-        const uint128_t word = plain_words_[static_cast<size_t>(base) + j / 128];
-        bits[j] = static_cast<uint8_t>((word >> (j % 128)) & 1u);
+    // 不变量 I3：只暴露**恰好 n 个有效 bit**（尾部填充位绝不外泄）。
+    const uint64_t entry = store_.EntryIndex(attr_id, column);
+    const uint128_t* words = plain_words_.data() + static_cast<size_t>(entry) * store_.entry_words;
+    std::vector<uint8_t> bits(store_.n, 0);
+    for (size_t j = 0; j < store_.n; ++j) {
+        bits[j] = static_cast<uint8_t>((words[j / 128] >> (j % 128)) & 1u);
     }
     return bits;
 }
@@ -781,7 +730,7 @@ std::vector<uint8_t> MpraqClient::PlainColumnBits(uint32_t attr_id, uint32_t col
 // 查询：QueryGen → 两台 ServerResp → XorAnswers → ClientRecon
 // ---------------------------------------------------------------------------
 
-MpraqQueryBatch MpraqClient::CreateQueries(const std::vector<ColumnWord>& targets) {
+MpraqQueryBatch MpraqClient::CreateQueries(const std::vector<ColumnEntry>& targets) {
     if (targets.empty()) {
         throw std::invalid_argument("MpraqClient::CreateQueries: 目标不能为空");
     }
@@ -797,9 +746,9 @@ MpraqQueryBatch MpraqClient::CreateQueries(const std::vector<ColumnWord>& target
     }
     std::vector<uint64_t> flats;
     flats.reserve(targets.size());
-    for (const ColumnWord& t : targets) {
-        // ⚠️ 唯一的条目号算法：**列主序** = 全局列号 · ⌈N/128⌉ + word 序号（D24④）
-        flats.push_back(store_.ColWordIndex(t.attr_id, t.column, t.word));
+    for (const ColumnEntry& t : targets) {
+        // ⚠️ 唯一的条目号算法：**一列 = 一个条目**，条目号 = 全局列号
+        flats.push_back(store_.EntryIndex(t.attr_id, t.column));
     }
     return CreateQueriesForIndices(flats);
 }
@@ -835,19 +784,17 @@ MpraqQueryBatch MpraqClient::CreateQueriesForIndices(const std::vector<uint64_t>
 }
 
 MpraqQueryBatch MpraqClient::CreateColumnQuery(uint32_t attr_id, uint32_t column) {
-    std::vector<ColumnWord> targets;
-    targets.reserve(store_.words_per_column);
-    for (size_t w = 0; w < store_.words_per_column; ++w) {
-        targets.push_back(ColumnWord{attr_id, column, w});
-    }
+    // ⚠️ **一次列查询 = 1 个查询集**（一个条目 = 一整列），不再有 word 维度的展开。
+    std::vector<ColumnEntry> targets;
+    targets.push_back(ColumnEntry{attr_id, column});
     return CreateQueries(targets);
 }
 
 // 两条路径共用的**客户端本地**收尾：两台应答 XOR 起来 → `ClientRecon`。
 // ⊕ 与 XOR 共享线性相容（D12/D3）⇒ 合并后的应答就是明文应答。
 // （作为 `MpraqClient` 的成员以访问 `MpraqQuery` 的私有字段；不产生任何通道调用。）
-uint128_t MpraqClient::FinishOne(MpraqQuery& q, const PlinkoAnswer& a0,
-                                const PlinkoAnswer& a1) {
+PlinkoEntry MpraqClient::FinishOne(MpraqQuery& q, const PlinkoAnswer& a0,
+                                  const PlinkoAnswer& a1) {
     q.answer0_ = a0;
     q.answer1_ = a1;
     q.answer_ = PlinkoClient::XorAnswers(a0, a1);
@@ -856,7 +803,7 @@ uint128_t MpraqClient::FinishOne(MpraqQuery& q, const PlinkoAnswer& a0,
     return q.value_;
 }
 
-uint128_t MpraqClient::RunQuery(MpraqQuery& q) {
+PlinkoEntry MpraqClient::RunQuery(MpraqQuery& q) {
     // **单条**路径：1 个查询集 ⇒ 1 次标量 `ServerResp`（= 1 次往返）。
     // 标量语义正是"只有一条查询"的退化解，因此这里**不**套用批量接口。
     const PlinkoAnswer a0 = channels_[0]->ServerResp(q.query_);
@@ -868,7 +815,7 @@ uint128_t MpraqClient::RunQuery(MpraqQuery& q) {
     return FinishOne(q, a0, a1);
 }
 
-std::vector<uint128_t> MpraqClient::RunBatch(MpraqQueryBatch& batch) {
+std::vector<PlinkoEntry> MpraqClient::RunBatch(MpraqQueryBatch& batch) {
     if (batch.owner_ != this) {
         throw std::invalid_argument(
             "MpraqClient::RunBatch: 该批次不属于本客户端（跨客户端复用会读错 hint 表）");
@@ -876,10 +823,9 @@ std::vector<uint128_t> MpraqClient::RunBatch(MpraqQueryBatch& batch) {
     if (batch.queries_.empty()) {
         throw std::invalid_argument("MpraqClient::RunBatch: 批次不能为空");
     }
-    // ⚠️ **Q5 / MPRAQ_IMPL.md §3 / D24④**：整批查询集走每台服务器的**一次**
-    //    `ServerRespBatch` ⇒ 远程部署下一次 `AggQuery`（任意多少列 × 每列 ⌈N/128⌉ 个
-    //    word）的网络往返数恒为 **1**。逐条调用 `ServerResp` 会让 N=2^14 的一列
-    //    （128 个 word）变成 128 次 RPC。
+    // ⚠️ **Q5 / MPRAQ_IMPL.md §3**：整批查询集走每台服务器的**一次** `ServerRespBatch`
+    //    ⇒ 远程部署下一次 `AggQuery`（任意多少列）的网络往返数恒为 **1**。
+    //    逐条调用 `ServerResp` 会让"每列 1 个查询集"退化成"每列 1 次 RPC"。
     std::vector<PlinkoQuery> wire;
     wire.reserve(batch.queries_.size());
     for (const MpraqQuery& q : batch.queries_) wire.push_back(q.query_);
@@ -899,7 +845,7 @@ std::vector<uint128_t> MpraqClient::RunBatch(MpraqQueryBatch& batch) {
     }
 
     // 重建是**客户端本地**工作 ⇒ 逐条做（不再产生任何通道调用）
-    std::vector<uint128_t> out;
+    std::vector<PlinkoEntry> out;
     out.reserve(batch.queries_.size());
     for (size_t i = 0; i < batch.queries_.size(); ++i) {
         out.push_back(FinishOne(batch.queries_[i], ans0[i], ans1[i]));
@@ -918,7 +864,7 @@ ModShare MpraqClient::AttributeShare(uint32_t attr_id, size_t record, int server
     if (attr_id >= store_.attrs.size()) {
         throw std::out_of_range("MpraqClient::AttributeShare: 属性号越界 " + Num(attr_id));
     }
-    if (record >= store_.num_records) {
+    if (record >= store_.n) {
         throw std::out_of_range("MpraqClient::AttributeShare: 记录号越界 " + Num(record));
     }
     return (server == 0 ? attr_share0_ : attr_share1_)[attr_id][record];

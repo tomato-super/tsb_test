@@ -11,7 +11,7 @@
 > ./build/bin/mpraq_client --config config/mpraq_scale.json --rows 8192 --predicates 5
 > ./build/bin/bench_mpraq  --columns-per-attribute 16 --attributes 3 --predicates 4 --rows 2048
 > ```
-> 派生链（程序会打印，供手算核对）：`M = 属性数×每属性列数` → `m` 补齐到 2 的幂 → **去重列 = min(k, M)** → **查询集 = 去重列×⌈N/128⌉** → **每台 RPC 恒 1**；
+> 派生链（程序会打印，供手算核对）：`levels = 属性数×每属性列数` → `m` 补齐到 `2w` 的倍数 → **去重列 = min(k, levels)** → **查询集 = 去重列**（一列 = 一个条目） → **每台 RPC 恒 1**；
 > ⚠️ 约束：`rows` 与每属性列数**必须都是 2 的幂**（否则程序**拒绝**，不静默取整）；超 **L14** 预算也会**拒绝运行**。
 > ⚠️ 查询**仍不**用 JSON 表达（`TASK_PLAN.md` §7.7 已裁决作废）：查询由 API（`Predicate` + `CountPredicates` + `SumOverFilter`）或规模层自动生成的谓词表达。
 

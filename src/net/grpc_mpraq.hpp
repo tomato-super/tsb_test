@@ -98,6 +98,15 @@ private:
 // 客户端侧：实现 IMpraqChannel
 // ---------------------------------------------------------------------------
 
+// **线协议版本**（写进 `StoreParamsProto.protocol_version`）。
+// ⚠️ 存在的理由：D41 把 PIR 条目从「128 位 word」改成「**一整列**」，几何字段的
+//    **语义**整体变了（`n` 从 word 数变成记录数、`entry_words` 变成 ⌈n/128⌉、
+//    `m` 从 word 数变成条目数）。字段号没变，因此"旧客户端 + 新服务器"若被静默接受，
+//    会按不同口径解释同一串数字 ⇒ **静默错值**。
+//    ⇒ 发送方必须带上本常量，接收方**不匹配即拒绝**（fail-loudly）。
+// 版本历史：1 = word 粒度；**2 = 列粒度（D41，现行）**。
+inline constexpr uint32_t kMpraqWireProtocolVersion = 2;
+
 // ⚠️ 收包上限（`MPA-09` 任务 B）：本通道与 `GrpcTransportClient` 一样**显式**设置
 //    `kGrpcClientMaxReceiveBytes`（256 MiB，见 `net/grpc_transport.hpp`）——gRPC 默认
 //    只有 4 MiB，超限时**收包方**直接拒绝（fail-loudly，绝不静默截断）。
@@ -120,9 +129,9 @@ public:
 
     // **整批一次往返**（Q5 / `MPRAQ_IMPL.md` §3）：整批查询集放进**一个**
     // `PirQueryRequest`（proto 的 `repeated PirQuerySet`），因此一次 `RunBatch`
-    // （任意列数 × 每列任意 word 数）在远程部署下恒为 **1 次 RPC**。
+    // （任意列数；**一列 = 一个条目 = 1 个查询集**）在远程部署下恒为 **1 次 RPC**。
     // ⚠️ 必须覆写：`IMpraqChannel` 的默认实现会退化成"每个查询集一次 RPC"
-    //    （`N = 2^14` 的一列 = 128 次往返）。本覆写因此是 MPA-08 的性能前提。
+    //    （旧 word 口径下一列 = ⌈n/128⌉ 次往返）。本覆写因此是 MPA-08 的性能前提。
     // 语义与 `LocalMpraqChannel` **逐条等价**：返回的应答与 `qs` 同长、同序，
     // 每条都等于对该查询集单独调 `ServerResp` 的结果。
     std::vector<PlinkoAnswer> ServerRespBatch(

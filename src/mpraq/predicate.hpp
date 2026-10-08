@@ -246,7 +246,7 @@ struct PredicatePlan {
     BoolExpr root;
 
     // 期望的记录数 N（来自所涉属性的 window_size；不一致时解析直接报错）
-    size_t num_records = 0;
+    size_t n = 0;   // 记录数（= 论文的 n；谓词求值需要知道列长）
 
     // root 是否为"字面量的合取"（可压平成"列 + 取反标记"的合取列表）
     bool IsConjunction() const;
@@ -290,7 +290,7 @@ PredicatePlan ParseRangeConjunctionDeMorgan(
 // 本地求值（Q5：全部在客户端做）
 // ---------------------------------------------------------------------------
 
-// 按 (属性, 列) 取回该列的**明文比特**（长度必须等于 plan.num_records）。
+// 按 (属性, 列) 取回该列的**明文比特**（长度必须等于 plan.n）。
 using LcteColumnLookup =
     std::function<std::vector<uint8_t>(const LcteColumnRef& ref)>;
 
@@ -308,7 +308,7 @@ std::vector<uint8_t> EvaluateFilterWithColumns(
 // 供测试直接比对"合取形式"与"De Morgan 形式"的等价性。
 std::vector<uint8_t> EvaluateBoolExpr(
     const BoolExpr& expr, const std::vector<std::vector<uint8_t>>& literal_values,
-    size_t num_records);
+    size_t n);
 
 }  // namespace mpraq
 }  // namespace tsb

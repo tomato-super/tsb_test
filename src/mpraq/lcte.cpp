@@ -241,8 +241,8 @@ XorShardedLcte XorShareLcte(const std::vector<int64_t>& values,
 
     XorShardedLcte sharded;
     sharded.params = params;
-    sharded.num_records = values.size();
-    sharded.words_per_column = words;
+    sharded.n = values.size();
+    sharded.entry_words = words;
 
     // 列优先扁平化 → 序列化 → 逐字节 XOR 共享（shared/secret_sharing 的
     // XOR 家族原语；决策 D12：比特/parity 语义的数据绝不用加法共享）
@@ -271,7 +271,7 @@ ShareTable LcteShareTable(const XorShardedLcte& sharded, int server) {
                                     std::to_string(server));
     }
     const size_t cols = sharded.params.range_size;
-    const size_t words = sharded.words_per_column;
+    const size_t words = sharded.entry_words;
     const auto& src = (server == 0) ? sharded.words0 : sharded.words1;
     if (src.size() != cols * words) {
         throw std::invalid_argument(
@@ -287,21 +287,21 @@ ShareTable LcteShareTable(const XorShardedLcte& sharded, int server) {
 }
 
 PlainTable ReconstructLcteFromShares(const ShareTable& a, const ShareTable& b,
-                                     size_t num_records) {
+                                     size_t n) {
     if (a.num_columns() != b.num_columns() || a.num_rows() != b.num_rows()) {
         throw std::invalid_argument(
             "ReconstructLcteFromShares: 两个共享表的形状不一致");
     }
     const size_t cols = a.num_columns();
     const size_t words = a.num_rows();
-    if (num_records > words * 128) {
+    if (n > words * 128) {
         throw std::invalid_argument(
-            "ReconstructLcteFromShares: num_records=" +
-            std::to_string(num_records) + " 超出打包容量 " +
+            "ReconstructLcteFromShares: n=" +
+            std::to_string(n) + " 超出打包容量 " +
             std::to_string(words * 128));
     }
     PlainTable out(cols);
-    for (size_t r = 0; r < num_records; ++r) {
+    for (size_t r = 0; r < n; ++r) {
         std::vector<uint128_t> row(cols, 0);
         for (size_t c = 0; c < cols; ++c) {
             const uint128_t word = static_cast<uint128_t>(
@@ -316,7 +316,7 @@ PlainTable ReconstructLcteFromShares(const ShareTable& a, const ShareTable& b,
 PlainTable ReconstructLctePlain(const XorShardedLcte& sharded) {
     const ShareTable a = LcteShareTable(sharded, 0);
     const ShareTable b = LcteShareTable(sharded, 1);
-    return ReconstructLcteFromShares(a, b, sharded.num_records);
+    return ReconstructLcteFromShares(a, b, sharded.n);
 }
 
 // ---------------------------------------------------------------------------
