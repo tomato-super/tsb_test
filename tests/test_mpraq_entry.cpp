@@ -29,6 +29,7 @@
 #include "core/gf128.hpp"
 #include "mpraq/aggquery.hpp"
 #include "mpraq/init.hpp"
+#include "net/grpc_mpraq.hpp"
 #include "mpraq/node.hpp"
 #include "mpraq/predicate.hpp"
 #include "mpraq/scale_config.hpp"
@@ -630,4 +631,34 @@ TEST(MpraqEntry, XmacRejectsTamperedAnswers) {
         EXPECT_EQ(g.client->RunBatch(b).size(), 1u);
         EXPECT_EQ(g.client->tag_checks(), 0u);
     }
+}
+
+// ---------------------------------------------------------------------------
+// J10：线协议版本不匹配必须被拒（xmac 加了 tag 字段 ⇒ 版本 2 的 peer 不可静默接受）
+// ---------------------------------------------------------------------------
+
+TEST(MpraqEntry, WireProtocolVersionMismatchIsRejected) {
+    // `StoreParamsProto.protocol_version` 必须等于本端的 `kMpraqWireProtocolVersion`。
+    // ⚠️ 为什么这条重要：v2 的 peer 不认识 `PirAnswer.mac_acc0/mac_acc1`，
+    //    若被静默接受，恶意档会拿到"没有 tag"的应答 ⇒ 退化成"只校验数据"，
+    //    正是 xmac 要防的静默降级。
+    MpraqNode node;
+    MpraqServiceImpl svc(node);
+
+    ::mpraqwire::InitTableRequest req;
+    // 只设一个**错的**版本号即可：版本检查在 `FromProto` 的**最前面**，
+    // 早于几何校验，所以不必构造完整的合法几何。
+    req.mutable_params()->set_protocol_version(2);   // 旧版本
+    ::mpraqwire::InitTableResponse resp;
+    grpc::ServerContext ctx;
+    const grpc::Status st = svc.InitTable(&ctx, &req, &resp);
+    EXPECT_FALSE(st.ok());                            // 必须被拒
+    EXPECT_FALSE(resp.ok());
+
+    // 版本正确但几何非法 ⇒ 仍应被拒（证明拒绝不是因为别的字段缺失）
+    ::mpraqwire::InitTableRequest req2;
+    req2.mutable_params()->set_protocol_version(3);
+    ::mpraqwire::InitTableResponse resp2;
+    const grpc::Status st2 = svc.InitTable(&ctx, &req2, &resp2);
+    EXPECT_FALSE(st2.ok());
 }

@@ -64,7 +64,7 @@ endfunction()
 
 # 列粒度迁移的**条目精确性契约**（不变量 I1–I4）+ D40 print 护栏。
 # 这是迁移后第一批重写的用例（负责人：测试在迁移时重写）。
-add_tsb_test(test_mpraq_entry test_mpraq_entry.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_net_mpraq_remote)
+add_tsb_test(test_mpraq_entry test_mpraq_entry.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_net_mpraq tsb_net_mpraq_remote mpraq_proto)
 
 # 待重写（分层清单见文件末尾注释）：
 #   第 1 层 core   → test_field / test_aes_prf / test_hash / test_config / test_iprf

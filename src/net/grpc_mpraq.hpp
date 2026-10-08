@@ -109,8 +109,15 @@ private:
 //    `m` 从 word 数变成条目数）。字段号没变，因此"旧客户端 + 新服务器"若被静默接受，
 //    会按不同口径解释同一串数字 ⇒ **静默错值**。
 //    ⇒ 发送方必须带上本常量，接收方**不匹配即拒绝**（fail-loudly）。
-// 版本历史：1 = word 粒度；**2 = 列粒度（D41，现行）**。
-inline constexpr uint32_t kMpraqWireProtocolVersion = 2;
+// 版本历史：
+//   * **1** = word 粒度（D41 之前）；
+//   * **2** = 列粒度（D41）；
+//   * **3** = 列粒度 + **xmac 的 tag 字段**（`PirAnswer.mac_acc0/mac_acc1` +
+//     `UploadFeatureTags` RPC）。**现行**。
+// ⚠️ 加 tag 必须升版本：v2 的 peer 不认识 `mac_acc0/mac_acc1`，若被静默接受，
+//    客户端会拿到"没有 tag"的应答 —— 恶意档下这会退化成"只校验数据"，
+//    正是 xmac 要防的那种静默降级。
+inline constexpr uint32_t kMpraqWireProtocolVersion = 3;
 
 // ⚠️ 收包上限（`MPA-09` 任务 B）：本通道与 `GrpcTransportClient` 一样**显式**设置
 //    `kGrpcClientMaxReceiveBytes`（256 MiB，见 `net/grpc_transport.hpp`）——gRPC 默认

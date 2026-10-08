@@ -97,7 +97,8 @@ mpraq::StoreParams FromProto(const ::mpraqwire::StoreParamsProto& p) {
         throw std::invalid_argument(
             "StoreParamsProto.protocol_version = " + std::to_string(p.protocol_version()) +
             " 与本端期望的 " + std::to_string(kMpraqWireProtocolVersion) +
-            " 不符（1 = word 粒度、2 = 列粒度/D41）—— 拒绝按错口径解析，请两端一起重编译");
+            " 不符（1 = word 粒度、2 = 列粒度/D41、3 = 列粒度 + xmac tag）"
+            "—— 拒绝按错口径解析，请两端一起重编译");
     }
     // ⚠️ 档位编码必须落在已知档位上（`static_cast` 对任意整数都能过 ⇒ 非法值会静默错路）
     out.security_mode = mpraq::MpraqSecurityModeFromRaw(p.security_mode());

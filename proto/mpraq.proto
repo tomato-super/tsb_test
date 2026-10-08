@@ -98,7 +98,8 @@ message PlinkoParamsProto {
 }
 
 // ⚠️ 线协议版本：几何口径变更（word 粒度 → 列粒度）时必须 fail-loudly，
-//    绝不静默按旧口径解析。当前 = 2（见 StoreParamsProto.protocol_version）。
+//    绝不静默按旧口径解析。当前 = 3（见 StoreParamsProto.protocol_version）：
+//    1 = word 粒度、2 = 列粒度（D41）、**3 = 列粒度 + xmac tag**。
 message StoreParamsProto {
     uint64 n = 1;              // 记录数 = 列长（bit）
     uint64 entry_words = 2;    // ⌈n/128⌉
