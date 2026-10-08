@@ -70,6 +70,10 @@ add_tsb_test(test_mpraq_entry test_mpraq_entry.cpp LIBS tsb_mpraq tsb_pir tsb_ne
 # 确定性）。它**只依赖 `pir/plinko`**，不碰 MPRAQ —— 这正是"这一层可独立测试"的实证。
 add_tsb_test(test_plinko_contract test_plinko_contract.cpp LIBS tsb_pir tsb_shared)
 
+# `GF(2^128)` 的域公理 / 不可约性 / XOR 同态 —— **xmac 的地基**。
+# 此前它只有一份不在 ctest 里的独立探针（`doc/evidence/gf128/`），等于没有回归网。
+add_tsb_test(test_gf128 test_gf128.cpp LIBS tsb_core)
+
 # 待重写（分层清单见文件末尾注释）：
 #   第 1 层 core   → test_field / test_aes_prf / test_hash / test_config / test_iprf
 #   第 2 层 shared → test_secret_sharing / test_database / test_mpc / test_verify
