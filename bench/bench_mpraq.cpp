@@ -1340,8 +1340,9 @@ private:
 Json RowJson(const Row& r) {
     Json g = GeometryJson(r.geom);
     // "不含补齐"对照：直接用真实层数 levels（D41 取代了 D35 的"×2 升级"口径）
-    const uint64_t feature_no_upgrade = 16ull * r.geom.levels * r.geom.entry_words;
-    const uint64_t total_no_upgrade = feature_no_upgrade + r.attr_bytes;
+    // ⚠️ D41 取代 D35 之后**不再有"×2 升级"口径**，`*_no_upgrade` 系列字段已从 JSON 删除
+    //    （见下方 §JSON 的注释：补齐代价由 `padded` 与 `unpadded` 之差表达）。
+    //    ⇒ 原先在这里算的 `feature_no_upgrade` / `total_no_upgrade` 已**无人读取**，一并删除。
     Json b = r.has_budget ? BudgetJson(r.budget) : Json();
 
     Json init;

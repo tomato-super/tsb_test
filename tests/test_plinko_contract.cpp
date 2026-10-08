@@ -333,8 +333,14 @@ TEST(PlinkoContract, CacheSwitchOffRejectsRepeatQueries) {
         EXPECT_TRUE(f.p.enable_repeat_cache);
         auto [q1, h1] = f.client.QueryGen(5);
         (void)q1;
-        (void)f.client.ClientRecon(h1, PlinkoAnswer{PlinkoEntry(f.p.entry_words, 0),
-                                                    PlinkoEntry(f.p.entry_words, 0)});
+        // 显式构造（`PlinkoAnswer` 现在有 4 个成员 r0/r1/m0/m1）：
+        // 聚合写法只给两个会触发 `-Wmissing-field-initializers`。本用例只关心
+        // `QueryGen` 的**槽位消费**，不校验应答内容，所以 r0/r1 给零值即可、
+        // m0/m1 留空（= 不带 tag，走半诚实式解析）。
+        PlinkoAnswer a1;
+        a1.r0.assign(f.p.entry_words, 0);
+        a1.r1.assign(f.p.entry_words, 0);
+        (void)f.client.ClientRecon(h1, a1);
         auto [q2, h2] = f.client.QueryGen(5);      // 重复 ⇒ 走缓存分支，**不抛**
         (void)q2; (void)h2;
         EXPECT_TRUE(h2.cache_hit);
@@ -350,8 +356,10 @@ TEST(PlinkoContract, CacheSwitchOffRejectsRepeatQueries) {
         c.HintInit(f.plain);
         auto [q1, h1] = c.QueryGen(5);
         (void)q1;
-        (void)c.ClientRecon(h1, PlinkoAnswer{PlinkoEntry(f.p.entry_words, 0),
-                                             PlinkoEntry(f.p.entry_words, 0)});
+        PlinkoAnswer a2;
+        a2.r0.assign(f.p.entry_words, 0);
+        a2.r1.assign(f.p.entry_words, 0);
+        (void)c.ClientRecon(h1, a2);
         // 已答复过的索引再次 QueryGen ⇒ 拒绝
         EXPECT_THROW(c.QueryGen(5), PlinkoRepeatedQueryRejected);
         // 而**未答复过**的索引仍然正常工作（开关只影响"重复"，不是把功能关掉）

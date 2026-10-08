@@ -435,7 +435,6 @@ VooPirQuery VooPirClient::Query(uint64_t index) {
 
     const VooPirHint& h = hints_[last_slot_];
     const bool beta = h.indicator;
-    const uint32_t c = h.select_cutoff;
 
     // 命中方式：case A 表示查询索引恰为 hint 的 extra 项
     const bool via_extra = (h.extra_part == ell && h.extra_offset == off);
@@ -575,7 +574,12 @@ VooPirClient::RefreshMaterial VooPirClient::GenerateRefreshMaterial(
         return m;  // 无效材料，调用方应重试
     }
 
-    const VooPirHint tmp{m.hint_id, m.select_cutoff};
+    // 显式赋值而非聚合初始化：`VooPirHint` 有 6 个成员，聚合写法只给前两个会触发
+    // `-Wmissing-field-initializers`（其余成员靠默认成员初值，语义其实相同，
+    // 但显式写出来既无警告、也让人一眼看清"这里只覆盖两个字段"）。
+    VooPirHint tmp;
+    tmp.hint_id = m.hint_id;
+    tmp.select_cutoff = m.select_cutoff;
     for (uint32_t k = 0; k < params_.part_num; ++k) {
         const uint32_t off = HintOffset(params_, prf_, tmp, k);
         const uint64_t idx = static_cast<uint64_t>(k) * params_.part_size + off;

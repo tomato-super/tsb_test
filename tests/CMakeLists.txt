@@ -56,6 +56,12 @@ function(add_tsb_test name)
         RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BIN_OUTPUT_DIR}
     )
     add_test(NAME ${name} COMMAND ${name})
+    # ⚠️ **必须给超时**：`ctest` 默认**不**限时，一条挂住的用例（尤其是将来加进来的
+    #    gRPC 集成用例：起服务器、等端口、等应答）会让整个 `ctest` 无限期等待，
+    #    CI 上表现为"卡住"而不是"失败" —— 那是极难排查的失败模式。
+    #    300 s 对当前最慢的用例（`test_gf128` 0.24 s）是极宽的余量，
+    #    只用来把"挂死"变成"失败"。
+    set_tests_properties(${name} PROPERTIES TIMEOUT 300)
 endfunction()
 
 # ---------------------------------------------------------------------------

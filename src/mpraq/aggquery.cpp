@@ -29,7 +29,10 @@ double MsSince(const std::chrono::steady_clock::time_point& t0) {
 // 该计划涉及的记录数 N：
 //   * `MPA-02` 从属性的 `lcte.window_size` 推出（不一致时它自己已经报错）；
 //   * 属性的 `window_size` 允许为 0（"未声明"）⇒ 退回到 `Init` 实际用的记录数。
-size_t ResolveNumRecords(const Schema& schema, const PredicatePlan& plan,
+// ⚠️ `schema` 参数已**不再被使用**（记录数只从 `plan.n` / `client.store_params().n` 取；
+//    属性 `window_size` 的一致性由 `MPA-02` 自己报错）。保留参数是为了不动调用点，
+//    用 `[[maybe_unused]]` 显式标注，而不是靠"看起来没用但可能有用"。
+size_t ResolveNumRecords([[maybe_unused]] const Schema& schema, const PredicatePlan& plan,
                          const MpraqClient& client) {
     if (plan.n != 0) return plan.n;
     const size_t n = client.store_params().n;

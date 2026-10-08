@@ -1,9 +1,9 @@
 // MPRAQ 客户端进程（任务 `MPA-08`：端到端 demo 的**客户端侧**，真实 gRPC）。
 //
 // 用法（规模来源 = JSON 配置 + CLI 逐项覆盖；不给 `--config` 时走同一套派生逻辑的默认值）：
-//   ./mpraq_client --server0 127.0.0.1:P0 --server1 127.0.0.1:P1 \
-//                  [--config config/mpraq_scale.json] \
-//                  [--rows 4096] [--columns 32] [--attributes 2] [--predicates 3] \
+//   ./mpraq_client --server0 127.0.0.1:P0 --server1 127.0.0.1:P1
+//                  [--config config/mpraq_scale.json]
+//                  [--rows 4096] [--columns 32] [--attributes 2] [--predicates 3]
 //                  [--lambda 80] [--eps 1e-4] [--seed 7] [--prng-seed 11] [--sum-attr 1]
 //
 // 规模口径（**负责人只管三个量**：行数 N、每属性列数、谓词数 k；其余全部自动派生，
@@ -473,11 +473,16 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(client->upload_bytes()));
             // 几何：m = PIR 条目数（一列 = 一个条目）；λw = 常规 hint；N_T = λw/2（备份）；
             //       H = λw+N_T（槽位）。
+            // ⚠️ 实参必须与格式串**一一对应**。这里曾经多传了一个 `n_entries`
+            //    （它等于 `store.m`，已由 `m=` 打印）⇒ `-Wformat-extra-args` 报警，
+            //    而且实际输出是**从 `w=` 起每个值都错位一格**、`H` 完全不打印：
+            //        w=<m> kappa=<w> lw=<kappa> N_T=<λw> H=<N_T>   ← 错
+            //        w=<w> kappa=<kappa> lw=<λw> N_T=<N_T> H=<H>  ← 对
+            //    （实测错值：`lw=8 N_T=640 H=320`，真值 `lw=640 N_T=320 H=960`。）
             std::printf("        geom n=%zu entry_words=%zu levels=%zu m=%zu pad=%zu w=%llu kappa=%llu "
                         "lw=%llu N_T=%llu H=%llu\n",
                         store.n, entry_words, store.levels,
                         store.m, store.padding_columns(),
-                        static_cast<unsigned long long>(n_entries),
                         static_cast<unsigned long long>(plinko.w),
                         static_cast<unsigned long long>(plinko.blocks()),
                         static_cast<unsigned long long>(plinko.main_hints()),

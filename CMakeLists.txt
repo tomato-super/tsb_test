@@ -11,6 +11,23 @@ list(APPEND CMAKE_PREFIX_PATH
 
 set(PROJECT_BIN_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
 
+
+
+# 导出 `compile_commands.json` —— 供 `.vscode/c_cpp_properties.json` 的
+# `compileCommands` 使用（该文件此前**指向一个不存在的路径**，R12）。
+# 只影响生成物，不影响编译选项。
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ---------------------------------------------------------------------------
+# 警告开关（R12）
+# ---------------------------------------------------------------------------
+# 先测量再打开：对 13 个代表文件试跑 `-Wall -Wextra`，全树**只有 2 条**警告
+# （一条 `-Wcomment`、一条 `-Wformat-extra-args`），且两条都指向**真实缺陷**
+# —— `mpraq_client` 的 `geom` 行实参比格式串多一个，导致 `w=` 之后每个值错位一格、
+# `H` 完全不打印。两条都已修。
+#
+# `-Werror` **刻意不开**：未使用参数之类的警告不该阻断构建；但警告必须可见。
+add_compile_options(-Wall -Wextra)
 project(
     tsdb
     LANGUAGES CXX

@@ -647,14 +647,17 @@ MpraqScaleEstimate EstimateScale(const MpraqScaleConfig& config) {
 
     // 内部一致性（几何与公式必须自洽；不一致说明本层公式漂移了）
     // ⚠️ 列粒度下**不再要求 m 是 2 的幂**：只要求 `m >= levels`、`w | m`、`κ = m/w` 为偶数。
-    //    （旧口径的 `m = m · ⌈n/128⌉` 也已经变成 `m = m`。）
+    // ⚠️ 这里曾有一条 `e.m != e.m` —— **自己和自己比、恒为 false**，等于这个校验从来没生效。
+    //    它是 D41 迁移的机械残迹：旧口径的条件是 `e.m != e.m * e.entry_words`
+    //    （条目还是一个 word 时 `m` 与"列数 × entry_words"要对齐），D41 把条目改成一整列之后
+    //    那个因子消失了，替换时留下了这个恒假式。错误消息里 `m=` 也重复打印了两次，同源。
+    //    ⇒ 直接删掉该子条件（旧的有效性约束已被 `m % w == 0` 与 `κ` 偶数的组合覆盖）。
     if (e.m < e.levels || e.w == 0 ||
         e.m % e.w != 0 || e.kappa % 2 != 0 ||
-        e.m != e.kappa * e.w || e.m != e.m) {
+        e.m != e.kappa * e.w) {
         std::ostringstream oss;
-        oss << "规模派生的内部一致性被破坏：m=" << e.m
-            << "（levels=" << e.levels << "）、m=" << e.m
-            << "、w=" << e.w << "、kappa=" << e.kappa;
+        oss << "规模派生的内部一致性被破坏：levels=" << e.levels
+            << "、m=" << e.m << "、w=" << e.w << "、kappa=" << e.kappa;
         throw std::logic_error(oss.str());
     }
     return e;
