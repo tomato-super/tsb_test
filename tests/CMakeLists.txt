@@ -84,6 +84,10 @@ add_tsb_test(test_gf128 test_gf128.cpp LIBS tsb_core)
 # 此前只有两进程 demo 的 `baseline_match=1` 间接证明"没算错"。
 add_tsb_test(test_aggvalue test_aggvalue.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_shared tsb_core)
 
+# MPRAQ 的 **gRPC 线协议层**（`net/grpc_mpraq`）—— 用 `InProcessMpraqNode`
+# （进程内**真实** gRPC 服务器，不是 mock）走真实链路。此前这一层只有 1 条用例。
+add_tsb_test(test_grpc_mpraq test_grpc_mpraq.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_net_mpraq tsb_net_mpraq_remote mpraq_proto)
+
 # 待重写（分层清单见文件末尾注释）：
 #   第 1 层 core   → test_field / test_aes_prf / test_hash / test_config / test_iprf
 #   第 2 层 shared → test_secret_sharing / test_database / test_mpc / test_verify
