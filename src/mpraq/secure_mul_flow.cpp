@@ -368,11 +368,13 @@ Phase2Response SecureMulServerState::RunPhase2(const Phase2Request& req) {
 SecureMulClientState SecureMulClientState::GenerateMacKey(uint128_t q) {
     RequireSecureMulModulus(q);
     // 全局一份的 α（TASK_PLAN §7.6 Q3(a)）：只在 Init 阶段生成一次。
-    return SecureMulClientState(tsb::GenerateMacKey(2, q), q);
+    // 本静态入口供**测试/工具**使用；默认恶意档（安全侧）。
+    return SecureMulClientState(tsb::GenerateMacKey(2, q), q, kDefaultMpraqSecurityMode);
 }
 
-SecureMulClientState::SecureMulClientState(MacKeyShares keys, uint128_t q)
-    : keys_(std::move(keys)), q_(q) {
+SecureMulClientState::SecureMulClientState(MacKeyShares keys, uint128_t q,
+                                           MpraqSecurityMode mode)
+    : keys_(std::move(keys)), q_(q), security_mode_(mode) {
     RequireSecureMulModulus(q_);
     if (keys_.alpha_shares.size() != 2) {
         throw std::invalid_argument(
@@ -400,7 +402,8 @@ SecureMulClientState::SecureMulClientState(uint128_t alpha,
     keys.alpha = alpha;
     keys.alpha_shares = std::move(alpha_shares);
     // 复用上面那个构造函数的全部校验（2 份分享、α≠0、分享之和 == α）
-    *this = SecureMulClientState(std::move(keys), q);
+    // 本构造没有档位参数（测试用固定 α 的场景）⇒ 取安全侧默认（恶意档）。
+    *this = SecureMulClientState(std::move(keys), q, kDefaultMpraqSecurityMode);
 }
 
 const ModShare& SecureMulClientState::AlphaShare(int server_id) const {
@@ -818,22 +821,47 @@ SecureMulFlowResult VerifyAndReconstruct(
     //       改成客户端补之后，若这里不加，`z` 会**静默偏小 `e·d`**。
     //    ⚠️ 特征 2 的理由：`GF(2^ℓ)` / `Z_{2^k}` 里 `2` 不可逆，"服务端各给一半"不成立
     //       （且特征 2 下 `x ⊕ x = 0`，没有"各给一半"的类比）⇒ 客户端补是唯一可行做法。
+    // 公开项 `e·d` 与"是否校验通过"**无关**：它就是 `f·E − (c + d·b + e·a)` 那一项，
+    // 客户端知道 `f` 与 `a` 就永远能算。恶意档下**只在 MAC 通过后**才把它写进 `out.z`
+    // （否则等于把一个"看起来合法"的乘积交给上层）；半诚实档下没有 MAC 判据，
+    // 直接算出来即可 —— 所以这里先把两项都备好，由下面按档位选择。
+    if (triple == nullptr) {
+        // 客户端不知道 `a` ⇒ 算不出 `d` ⇒ 补不出公开项 ⇒ **两种档位都无法重建完整乘积**。
+        // 不能静默返回偏小的 z：那会让上层聚合出错误结果。
+        out.error =
+            "SecureMulFlow: 需要 triple 才能补公开项 e·d（客户端必须知道 a 以算 d = f − a）"
+            "；调用方传了 triple = nullptr ⇒ 无法重建完整乘积，abort 当前查询";
+        out.failure = SecureMulFailure::kClientLocalCheckFailed;
+        return out;
+    }
+    const uint128_t d_public = subMod(reduce(f, q), reduce(triple->a, q), q);
+    const uint128_t added_z = addMod(reduce(v.z, q), mulMod(reduce(e_sent, q), d_public, q), q);
+
     if (v.ok) {
-        if (triple == nullptr) {
-            // 客户端不知道 `a` ⇒ 算不出 `d` ⇒ 补不出公开项。
-            // **不能静默返回偏小的 z**：那会让上层聚合出错误结果。
-            out.error =
-                "SecureMulFlow: 需要 triple 才能补公开项 e·d（客户端必须知道 a 以算 d = f − a）"
-                "；调用方传了 triple = nullptr ⇒ 无法重建完整乘积，abort 当前查询";
-            out.failure = SecureMulFailure::kClientLocalCheckFailed;
-            return out;
-        }
-        const uint128_t d_public = subMod(reduce(f, q), reduce(triple->a, q), q);
-        out.z = addMod(reduce(v.z, q), mulMod(reduce(e_sent, q), d_public, q), q);
+        out.z = added_z;
     } else {
-        // 校验失败：z 无意义（上层按失败处理并置 0）。保持与旧行为一致地写出重建值，
-        // 便于诊断；**绝不**允许调用方把它当有效值（见下面 out.ok 的语义）。
+        // 校验失败：z 无意义（上层按失败处理并置 0）。写出**重建值**便于诊断；
+        // **绝不**允许调用方把它当有效值（见 `out.ok` 的语义）。
         out.z = v.z;
+    }
+
+    // ===========================================================================
+    // ⚠️ **半诚实档：到此为止，不做任何验证**
+    // ===========================================================================
+    // 半诚实档的威胁模型里服务器**不会偏离协议** ⇒ SPDZ MAC 校验与 §4.5-A/B
+    // 两条纯客户端复核**全部跳过**（论文的 MPC 层是恶意模型，这里是显式的降档）。
+    //
+    // ⚠️ **这是如实声明的边界，不是缺陷**：半诚实档下服务器篡改 `z`/`mac` 会被
+    //    **静默接受**并进入聚合结果。若要验证，请用恶意档（默认档）。
+    // ⚠️ 仍然保留的部分：`session` 一致性检查（上面）、以及**绝不能随档位省掉**的
+    //    hint 消费 + 每轮 `Refresh`（D17）与查询预算预检（这两条在 PIR 层，与此无关）。
+    if (client.security_mode() == MpraqSecurityMode::kSemiHonest) {
+        out.z = added_z;          // 线性部分 + 公开项 e·d（见上面的推导）
+        out.mac = v.mac;          // 仍回填，**仅供诊断**（不作为判据）
+        out.expected_mac = v.expected_mac;
+        out.ok = true;            // ← **不看** `v.ok`
+        out.failure = SecureMulFailure::kNone;
+        return out;
     }
 
     // =======================================================================

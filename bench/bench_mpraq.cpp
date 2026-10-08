@@ -964,8 +964,10 @@ public:
     }
 
     void SetMac() {
+        // ⚠️ 档位必须显式传入（与 demo 同一纪律；构造无默认值 ⇒ 忘记 = 编译错误）。
         mac_ = std::make_unique<SecureMulClientState>(client_->mac_key_shares(),
-                                                      client_->modulus());
+                                                      client_->modulus(),
+                                                      o_.security_mode);
         prng_ = std::make_unique<random::DeterministicPrng>(
             MakeAesSeed(std::vector<uint8_t>{'m', 'p', 'a', '0', '9', 'b', 'e', 'n'}),
             o_.prng_seed);

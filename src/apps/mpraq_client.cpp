@@ -566,7 +566,10 @@ int main(int argc, char** argv) {
         }
 
         // 客户端侧 SecureMul 状态（α **全局一份**，来自 Init 的 mac_key_shares()）
-        SecureMulClientState mac(client->mac_key_shares(), client->modulus());
+        // ⚠️ 档位必须显式传入（构造无默认值）：半诚实档下 `VerifyAndReconstruct`
+        //    **不做任何验证**（跳过 SPDZ MAC 与 §4.5-A/B）—— 这是如实声明的边界。
+        SecureMulClientState mac(client->mac_key_shares(), client->modulus(),
+                                 client->store_params().security_mode);
         random::DeterministicPrng prng(MakeAesSeed(std::vector<uint8_t>{'m', 'p', 'a', '0', '8'}),
                                        opt.prng_seed);
 

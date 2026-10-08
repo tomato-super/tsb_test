@@ -466,6 +466,7 @@
 #include "core/field.hpp"
 #include "core/random.hpp"
 #include "net/transport.hpp"
+#include "mpraq/security_mode.hpp"
 #include "shared/mpc.hpp"
 #include "shared/secret_sharing.hpp"
 #include "shared/verify.hpp"
@@ -723,9 +724,16 @@ public:
 
     // 由 MacKeyShares 构造（要求恰好 2 份 ⟨α⟩，且两份之和 == α）。
     // 便于测试直接复用 shared/verify 的 GenerateMacKey 产物。
-    SecureMulClientState(MacKeyShares keys, uint128_t q);
+    //
+    // ⚠️ **档位必须显式传入**（没有默认值）：忘记传 = **编译错误**。
+    //    给默认值会让"忘了设"静默变成某一档 —— 若静默变成半诚实档就是**静默降级安全性**，
+    //    正是本仓库最忌讳的失败模式。判定结果见 `security_mode()`。
+    SecureMulClientState(MacKeyShares keys, uint128_t q, MpraqSecurityMode mode);
 
     uint128_t alpha() const { return keys_.alpha; }
+    // 运行方式（安全档位）。**半诚实档下 `VerifyAndReconstruct` 不做任何验证**
+    // （跳过 SPDZ MAC 与 §4.5-A/B）—— 这是如实声明的边界，不是缺陷。
+    MpraqSecurityMode security_mode() const { return security_mode_; }
     const MacKeyShares& keys() const { return keys_; }
     uint128_t modulus() const { return q_; }
 
@@ -735,6 +743,9 @@ public:
 private:
     MacKeyShares keys_{};
     uint128_t q_ = kSecureMulModulus;
+    // 默认恶意档（**安全侧**）：即使某条路径漏设，也是"多校验"而不是"少校验"。
+    // 生产路径由构造函数**强制**显式给出（见上面的 ⚠️）。
+    MpraqSecurityMode security_mode_ = kDefaultMpraqSecurityMode;
     // AlphaShare() 返回引用的落点（ModShare 是 POD，这里只是让返回类型
     // 保持 const ModShare& 而不必对外暴露裸 uint128_t）
     mutable std::array<ModShare, 2> alpha_share_cache_{};

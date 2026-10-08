@@ -30,6 +30,7 @@
 #include "mpraq/aggquery.hpp"
 #include "mpraq/init.hpp"
 #include "net/grpc_mpraq.hpp"
+#include "mpraq/secure_mul_flow.hpp"
 #include "mpraq/node.hpp"
 #include "mpraq/predicate.hpp"
 #include "mpraq/scale_config.hpp"
@@ -661,4 +662,99 @@ TEST(MpraqEntry, WireProtocolVersionMismatchIsRejected) {
     ::mpraqwire::InitTableResponse resp2;
     const grpc::Status st2 = svc.InitTable(&ctx, &req2, &resp2);
     EXPECT_FALSE(st2.ok());
+}
+
+// ---------------------------------------------------------------------------
+// P1-A：半诚实档的 SecureMul **不做任何验证**（如实声明的边界）
+// ---------------------------------------------------------------------------
+
+TEST(MpraqEntry, SemiHonestSecureMulDoesNotVerify) {
+    using tsb::mpraq::kDefaultMpraqSecurityMode;
+    using tsb::mpraq::MpraqSecurityMode;
+    using tsb::mpraq::Phase2Response;
+    using tsb::mpraq::SecureMulClientState;
+    using tsb::mpraq::SecureMulFailure;
+    using tsb::mpraq::SecureMulStatus;
+    using tsb::mpraq::VerifyAndReconstruct;
+
+    const uint128_t q = tsb::mpraq::kSecureMulModulus;
+
+    // 构造一组**诚实**的两轮应答（单条记录）：
+    //   z_lin = c + d·b + e·a（服务端线性部分，论文 :554）
+    //   mac   = α·z_lin
+    // 然后**篡改 `mac_share`**，看两种档位怎么判。
+    auto build = [&](MpraqSecurityMode mode, bool tamper_mac, bool* ok_out,
+                     SecureMulFailure* fail_out) {
+        const uint128_t alpha = 0x1234567890ABCDEFull;   // 任意非零
+        const uint128_t s0 = 0x1111ull;
+        const uint128_t s1 = tsb::subMod(alpha, s0, q);   // ⟨α⟩_0 + ⟨α⟩_1 == α
+        tsb::MacKeyShares keys;
+        keys.alpha = alpha;
+        keys.alpha_shares.clear();
+        keys.alpha_shares.push_back(s0);
+        keys.alpha_shares.push_back(s1);
+        SecureMulClientState client(std::move(keys), q, mode);
+
+        // 客户端本地的 triple 与公开量
+        const uint128_t a = 100, b = 200, c = tsb::mulMod(a, b, q);
+        const uint128_t f = 1;                        // filter 位
+        const uint128_t e_sent = 7;                   // 客户端重建出的 e
+        const uint128_t d = tsb::subMod(f, a, q);
+        const uint128_t z_lin = tsb::addMod(
+            tsb::addMod(c, tsb::mulMod(d, b, q), q), tsb::mulMod(e_sent, a, q), q);
+        const uint128_t mac = tsb::mulMod(alpha, z_lin, q);
+
+        const uint64_t session = 42;
+        Phase2Response r0;
+        r0.session = session; r0.status = static_cast<uint8_t>(SecureMulStatus::kOk);
+        r0.z_share = 0xAAAAull;
+        r0.mac_share = 0xBBBBull;
+        Phase2Response r1;
+        r1.session = session; r1.status = static_cast<uint8_t>(SecureMulStatus::kOk);
+        // 让两台之和恰好等于 z_lin / mac（「诚实」的定义）
+        r1.z_share = tsb::subMod(z_lin, r0.z_share, q);
+        r1.mac_share = tsb::subMod(mac, r0.mac_share, q);
+        if (tamper_mac) {
+            r1.mac_share = tsb::addMod(r1.mac_share, 1, q);   // 篡改 MAC 分片
+        }
+
+        tsb::BeaverTriple triple;
+        triple.a = a; triple.b = b; triple.c = c;
+
+        const auto res = VerifyAndReconstruct(
+            session, {r0, r1}, client, /*ctx=*/nullptr, f, e_sent, &triple, 0, 0);
+        *ok_out = res.ok;
+        *fail_out = res.failure;
+        // 无论哪种档位，重建出的 `z` 都应当是**正确**的乘积（z 分片本身没被改）
+        const uint128_t want = tsb::mulMod(f, tsb::addMod(e_sent, b, q), q);
+        return std::make_pair(res.z, want);
+    };
+
+    // ① 恶意档 + 诚实应答 ⇒ 通过
+    {
+        bool ok = false; SecureMulFailure f = SecureMulFailure::kNone;
+        auto [z, want] = build(MpraqSecurityMode::kMalicious, /*tamper_mac=*/false, &ok, &f);
+        EXPECT_TRUE(ok);
+        EXPECT_TRUE(f == SecureMulFailure::kNone);
+        EXPECT_EQ(z, want);
+    }
+
+    // ② **恶意档 + 篡改 MAC ⇒ 必须拒绝**（这是 xmac/SPDZ MAC 的意义）
+    {
+        bool ok = true; SecureMulFailure f = SecureMulFailure::kNone;
+        (void)build(MpraqSecurityMode::kMalicious, /*tamper_mac=*/true, &ok, &f);
+        EXPECT_FALSE(ok);
+        EXPECT_TRUE(f == SecureMulFailure::kMacMismatch);
+    }
+
+    // ③ **半诚实档 + 同样的篡改 ⇒ 被静默接受**
+    //    ⚠️ 这是**如实声明的边界**，不是缺陷：半诚实档的威胁模型里服务器不偏离协议。
+    //       若要验证，必须用恶意档（默认档）。
+    {
+        bool ok = false; SecureMulFailure f = SecureMulFailure::kNone;
+        auto [z, want] = build(MpraqSecurityMode::kSemiHonest, /*tamper_mac=*/true, &ok, &f);
+        EXPECT_TRUE(ok);                                   // ← 不看 mac
+        EXPECT_TRUE(f == SecureMulFailure::kNone);
+        EXPECT_EQ(z, want);                                // z 仍正确（z 分片没被改）
+    }
 }
