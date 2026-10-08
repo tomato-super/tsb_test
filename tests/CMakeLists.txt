@@ -66,6 +66,10 @@ endfunction()
 # 这是迁移后第一批重写的用例（负责人：测试在迁移时重写）。
 add_tsb_test(test_mpraq_entry test_mpraq_entry.cpp LIBS tsb_mpraq tsb_pir tsb_net tsb_net_mpraq tsb_net_mpraq_remote mpraq_proto)
 
+# Plinko 检索底座的**契约测试**（hint 生命周期 / 精确重建 / XOR 线性 / 备份耗尽 /
+# 确定性）。它**只依赖 `pir/plinko`**，不碰 MPRAQ —— 这正是"这一层可独立测试"的实证。
+add_tsb_test(test_plinko_contract test_plinko_contract.cpp LIBS tsb_pir tsb_shared)
+
 # 待重写（分层清单见文件末尾注释）：
 #   第 1 层 core   → test_field / test_aes_prf / test_hash / test_config / test_iprf
 #   第 2 层 shared → test_secret_sharing / test_database / test_mpc / test_verify
