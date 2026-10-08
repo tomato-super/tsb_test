@@ -372,6 +372,8 @@ public:
     // ⚠️ 这是 `MpraqRecord::feature`（**死字段**，D36）**唯一**的去处：纯客户端明文副本，
     //    不参与编码/上传/查询。用途 = 给测试与 demo 一个确定的逐记录标签，便于预估/手算结果。
     const std::vector<int64_t>& plain_feature_values() const { return plain_features_; }
+    // ⚠️ 返回的是 **`[属性][记录]`**（`|attrs| × N`）—— 用 `plain_attribute_values()[attr][rec]`，
+    //    不要写成 `[rec][attr]`（会越界）。见 `plain_attrs_` 的声明处。
     const std::vector<std::vector<int64_t>>& plain_attribute_values() const {
         return plain_attrs_;
     }
@@ -465,7 +467,11 @@ private:
     std::unique_ptr<PlinkoClient> plinko_;
     std::vector<uint128_t> plain_words_;                  // 明文特征表（列主序）
     std::vector<int64_t> plain_features_;                 // 明文 feature 列（N 条）
-    std::vector<std::vector<int64_t>> plain_attrs_;       // 明文属性值（N × |attrs|）
+    // ⚠️ 布局是 **`[属性][记录]`**（= `|attrs| × N`），**不是** `[记录][属性]`。
+    //    定义处见 `init.cpp`：`plain_attrs_.assign(store_.attrs.size(), vector<int64_t>(N, 0))`。
+    //    （本条注释曾误写成 "N × |attrs|"，把 `tests/test_aggvalue.cpp` 的编写者引到
+    //     `pa[record][attr]` 上去 ⇒ 在"全集 filter"上越界段错误。已订正。）
+    std::vector<std::vector<int64_t>> plain_attrs_;       // 明文属性值（|attrs| × N）
     std::vector<uint128_t> feature_share0_, feature_share1_;  // 特征 word 的 XOR 共享
     // ---- xmac（**仅恶意档**；半诚实档全部为空）----
     // γ：tag 密钥，`GF(2^128)\{0}`，**只在客户端**，绝不下发（论文 :116）。
