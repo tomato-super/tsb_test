@@ -751,11 +751,15 @@ int main(int argc, char** argv) {
             std::printf("\naccounts mode=grpc_two_process local_transport=0\n");
         }
 
-        // ---- 服务器存储：公式双报（含补齐 / 不含补齐）+ 服务器**实测**值 ----
+        // ---- 服务器存储：公式**三项双报**（数据 / tag / 属性）+ 服务器**实测**值 ----
+        // ⚠️ xmac 的 tag 表与数据表**等大**（tag 与条目等宽，ℓ = 128 = 一个字）；
+        //    只有**恶意档**存在（半诚实档不生成/不存/不传/不校验 tag ⇒ 存储减半）。
         const uint64_t feature_padded =
             16ull * store.m * entry_words;
         const uint64_t feature_unpadded =
             16ull * store.levels * entry_words;
+        const uint64_t tag_bytes =
+            store.has_tags() ? 16ull * store.m * entry_words : 0ull;
         const uint64_t attr_bytes =
             16ull * store.n * store.num_attributes();
         if (g_verbose) {
@@ -764,15 +768,22 @@ int main(int argc, char** argv) {
             //   不含补齐 = 16·levels·entry_words + 16·n·|attrs|；
             //   属性值部分 = 16·N·|attrs|（每属性一条长度 N 的向量）。
             std::printf("storage_formula per_server=1\n");
-            std::printf("  srv_padded m=%zu entry_words=%zu n=%zu attrs=%zu bytes=%llu\n",
+            std::printf("  srv_padded m=%zu entry_words=%zu n=%zu attrs=%zu security=%s "
+                        "bytes=%llu\n",
                         store.m, entry_words, store.n,
                         store.num_attributes(),
-                        static_cast<unsigned long long>(feature_padded + attr_bytes));
+                        MpraqSecurityModeName(store.security_mode),
+                        static_cast<unsigned long long>(feature_padded + tag_bytes + attr_bytes));
+            std::printf("  srv_data_bytes bytes=%llu\n",
+                        static_cast<unsigned long long>(feature_padded));
+            std::printf("  srv_tag_bytes bytes=%llu has_tags=%d\n",
+                        static_cast<unsigned long long>(tag_bytes),
+                        store.has_tags() ? 1 : 0);
             std::printf("  srv_unpadded levels=%zu entry_words=%zu n=%zu attrs=%zu bytes=%llu diff=%llu "
-                        "pad_cols=%zu\n",
+                        "pad_entries=%zu\n",
                         store.levels, entry_words, store.n,
                         store.num_attributes(),
-                        static_cast<unsigned long long>(feature_unpadded + attr_bytes),
+                        static_cast<unsigned long long>(feature_unpadded + tag_bytes + attr_bytes),
                         static_cast<unsigned long long>(feature_padded - feature_unpadded),
                         store.padding_columns());
             std::printf("  srv_attr_bytes bytes=%llu\n",
@@ -829,11 +840,11 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(d_phase),
                             static_cast<unsigned long long>(d_records));
             }
-            if (st.storage_bytes != feature_padded + attr_bytes) {
+            if (st.storage_bytes != feature_padded + tag_bytes + attr_bytes) {
                 throw std::runtime_error(
                     "服务器 " + Num(static_cast<uint64_t>(sid)) + " 实测存储 " +
-                    Num(st.storage_bytes) + " ≠ §1 公式 " +
-                    Num(feature_padded + attr_bytes));
+                    Num(st.storage_bytes) + " ≠ 公式（数据 " + Num(feature_padded) +
+                    " + tag " + Num(tag_bytes) + " + 属性 " + Num(attr_bytes) + "）");
             }
             if (d_rpc != reports.size()) {
                 throw std::runtime_error("服务器数据 RPC 增量 ≠ Count 次数（一次 RunBatch = 1 RPC）");
@@ -878,7 +889,7 @@ int main(int argc, char** argv) {
         std::printf("\naccounts storage_bytes_per_server=%llu query_sets=%llu "
                     "pir_rpc0=%llu pir_rpc1=%llu sm_rounds=%llu sm_wire_messages=%llu "
                     "install_rounds=%llu install_frames=%llu\n",
-                    static_cast<unsigned long long>(feature_padded + attr_bytes),
+                    static_cast<unsigned long long>(feature_padded + tag_bytes + attr_bytes),
                     static_cast<unsigned long long>(total_query_sets),
                     static_cast<unsigned long long>(total_pir_rpc[0]),
                     static_cast<unsigned long long>(total_pir_rpc[1]),

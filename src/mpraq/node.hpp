@@ -112,6 +112,12 @@ struct StoreParams {
     // 这是唯一会静默降级安全性的失败模式（见 `mpraq/security_mode.hpp`）。
     MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
 
+    // 本档是否**必须**带 xmac 的 tag（论文 §sec:xmac）。
+    // ⚠️ **由档位推出，不另设字段** —— 避免出现"标志说带 tag、档位说半诚实"这种自相矛盾。
+    //    恶意档 ⇒ 必须有 tag（xmac 是恶意档的值层完整性机制，没有它就无法检出篡改）；
+    //    半诚实档 ⇒ 不生成、不存、不传、不校验 tag（存储与应答各减半）。
+    bool has_tags() const { return security_mode == MpraqSecurityMode::kMalicious; }
+
     // ---- 派生量 ----
     size_t num_attributes() const { return attrs.size(); }
     uint64_t entry_count() const { return static_cast<uint64_t>(m); }  // PIR 条目数 = m
@@ -157,6 +163,19 @@ public:
         UploadFeatureWords(base_index, words, words.size());
     }
 
+    // 写入一段**本方**特征 **tag** 共享（xmac，论文 §sec:xmac）。
+    // ⚠️ 与 `UploadFeatureWords` **同形状、同规则**（`base_index` 语义、`entry_words`
+    //    对齐、长度校验都一样）——因为 tag 与条目**等宽**（ℓ = 128 = 一个字）。
+    // ⚠️ **仅恶意档**调用；半诚实档该表为空（`tag_words_` 不分配）。
+    //    在未分配时调用 ⇒ 抛异常（绝不静默写入别处）。
+    void UploadFeatureTags(uint64_t base_index, const std::vector<uint128_t>& tags,
+                           size_t count);
+
+    // 便捷版（长度即 count）
+    void UploadFeatureTags(uint64_t base_index, const std::vector<uint128_t>& tags) {
+        UploadFeatureTags(base_index, tags, tags.size());
+    }
+
     // 写入某属性的**本方**加法共享（mod q）。长度必须等于 N；attr_id 越界抛异常。
     void SetAttributeShares(uint32_t attr_id, const std::vector<ModShare>& shares);
 
@@ -193,13 +212,23 @@ public:
     // 某条目整列的起始指针（entry_words 个连续 word）—— 供 `ServerRespShared` 使用。
     // ⚠️ 生命周期与节点绑定；调用方不得持有超过本次调用。
     const uint128_t* FeatureEntryData(uint64_t entry) const;
+    // ---- xmac 的 tag（与特征表**同形状**）：仅恶意档存在 ----
+    // 读取某条目第 `word` 个 tag 共享分量（按值返回，理由同 `FeatureEntryWord`）。
+    uint128_t FeatureTagWord(uint64_t entry, size_t word) const;
+    // 某条目整列的 tag 共享起始指针 —— 供 `ServerRespSharedTagged` 使用。
+    const uint128_t* FeatureTagData(uint64_t entry) const;
+    bool has_tag_table() const { return !tag_words_.empty(); }
     // 读取某属性某记录的共享分量
     ModShare AttributeShare(uint32_t attr_id, size_t record) const;
 
     // 存储口径：16·m·entry_words + 16·n·|attrs|
     // ⚠️ **含补齐列**（补齐列是 PIR 数据库的一部分，服务器必须真的存）。
+    // ⚠️ **双报**：`FeatureStorageBytes()` 只算数据；tag 单独一项。
+    //    恶意档 `StorageBytes() = Feature + FeatureTag + Attribute`；
+    //    半诚实档 `FeatureTagStorageBytes() == 0`（该档不存在 tag 表）。
     uint64_t StorageBytes() const;
-    uint64_t FeatureStorageBytes() const;    // 特征表部分（含补齐）
+    uint64_t FeatureStorageBytes() const;    // 特征**数据**表（含补齐条目）
+    uint64_t FeatureTagStorageBytes() const; // xmac 的 tag 表（仅恶意档；与数据表等大）
     uint64_t AttributeStorageBytes() const;  // 属性值部分
 
     // 统计（只增不减，供测试与基准量出"实际发生了多少次 PIR"，而不是靠公式估算）
@@ -226,7 +255,9 @@ private:
     // 本机（服务器进程）配置的档位；`InitTable` 用它做一致性校验（防静默降级）。
     MpraqSecurityMode configured_security_mode_ = kDefaultMpraqSecurityMode;
     StoreParams params_;
-    std::vector<uint128_t> words_;                          // 特征表（列主序，含补齐列）
+    std::vector<uint128_t> words_;                          // 特征表（字典布局，含补齐条目）
+    // xmac 的 tag 表（与 `words_` **同形状**）。**仅恶意档**分配；半诚实档为空。
+    std::vector<uint128_t> tag_words_;
     std::vector<std::vector<ModShare>> attr_shares_;        // 每属性一条长度 N 的向量
     mutable uint64_t rpc_count_ = 0;
     mutable uint64_t batch_rpc_count_ = 0;
@@ -252,6 +283,11 @@ public:
     virtual void UploadFeatureWords(uint64_t base_index,
                                     const std::vector<uint128_t>& words,
                                     size_t count) = 0;
+    // xmac 的 tag 上传（**仅恶意档**调用；半诚实档的客户端根本不调）。
+    // ⚠️ 同样保持**纯虚**：忘记覆写 = 编译期错误，而不是运行期静默少传（本仓库纪律）。
+    virtual void UploadFeatureTags(uint64_t base_index,
+                                   const std::vector<uint128_t>& tags,
+                                   size_t count) = 0;
     virtual void SetAttributeShares(uint32_t attr_id,
                                     const std::vector<ModShare>& shares) = 0;
 
@@ -295,6 +331,10 @@ public:
                             const std::vector<uint128_t>& words,
                             size_t count) override {
         node_.UploadFeatureWords(base_index, words, count);
+    }
+    void UploadFeatureTags(uint64_t base_index, const std::vector<uint128_t>& tags,
+                           size_t count) override {
+        node_.UploadFeatureTags(base_index, tags, count);
     }
     void SetAttributeShares(uint32_t attr_id,
                             const std::vector<ModShare>& shares) override {
@@ -340,6 +380,7 @@ public:
     void Connect() override;
     void InitTable(const StoreParams&) override;
     void UploadFeatureWords(uint64_t, const std::vector<uint128_t>&, size_t) override;
+    void UploadFeatureTags(uint64_t, const std::vector<uint128_t>&, size_t) override;
     void SetAttributeShares(uint32_t, const std::vector<ModShare>&) override;
     PlinkoAnswer ServerResp(const PlinkoQuery&) override;
     // 同上：占位通道**任何**远程调用都抛（绝不静默退化成本地调用）

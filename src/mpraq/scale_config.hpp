@@ -190,8 +190,9 @@ struct MpraqScaleEstimate {
     uint64_t rpc_per_server = 1;          // 恒 1（一次 RunBatch）
 
     // ---- 账目 ----
-    uint64_t storage_bytes_padded = 0;    // 16·m·entry_words + 16·n·attributes
-    uint64_t storage_bytes_unpadded = 0;  // 16·levels·entry_words + 16·n·attributes
+    uint64_t storage_bytes_padded = 0;    // 数据 + tag(恶意档) + 属性
+    uint64_t storage_bytes_unpadded = 0;  // 把 m 换成 levels 的同一公式（双报）
+    // ⚠️ **tag 项**：恶意档 = `16·m·entry_words`（与数据表等大）；半诚实档 = 0。
 
     // ---- 查询预算 ----
     uint64_t pool_m = 0;              // 新鲜索引池 = m

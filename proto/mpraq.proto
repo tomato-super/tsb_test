@@ -44,6 +44,12 @@ service MpraqService {
     rpc UploadFeatureWords (UploadFeatureWordsRequest)
         returns (UploadFeatureWordsResponse) {}
 
+    // 装载：上传一段**只属于本服务器**的特征 **tag** 共享（xmac，论文 §sec:xmac）。
+    // ⚠️ **仅恶意档**使用：半诚实档不生成、不存、不传、不校验 tag
+    //    ⇒ 该档的客户端**根本不调**这条 RPC。
+    rpc UploadFeatureTags (UploadFeatureTagsRequest)
+        returns (UploadFeatureTagsResponse) {}
+
     // 装载：上传某属性的**本方** mod q 加法共享（长度必须等于 N）
     rpc SetAttributeShares (SetAttributeSharesRequest)
         returns (SetAttributeSharesResponse) {}
@@ -132,6 +138,22 @@ message UploadFeatureWordsResponse {
     string error = 2;
 }
 
+// xmac 的 tag 共享上传（**仅恶意档**）。
+// ⚠️ 与 `UploadFeatureWords` **同形状**（一列 = 一个条目 = `entry_words` 个 16 字节元素），
+//    因为 tag 与条目**等宽**（ℓ = 128 恰好等于一个字 ⇒ 一个 chunk 一个字）。
+//    因此 `base_index` 的语义、`entry_words` 对齐要求、长度校验全部沿用同一套规则。
+message UploadFeatureTagsRequest {
+    uint64 base_index = 1;
+    // 每个元素 16 字节小端的 tag 共享分量（GF(2^128) 元素，bit k ↔ x^k，多项式
+    // x^128+x^7+x^2+x+1）。不得上传明文 tag —— 两台服务器的 tag 共享异或才是 γ⊙D。
+    repeated bytes tags = 2;
+}
+
+message UploadFeatureTagsResponse {
+    bool ok = 1;
+    string error = 2;
+}
+
 message SetAttributeSharesRequest {
     uint32 attr_id = 1;
     // 每个元素 16 字节小端 uint128 的 `ModShare`（mod q = 2^127−1 的加法共享）。
@@ -166,8 +188,13 @@ message PirQueryRequest {
 }
 
 message PirAnswer {
-    bytes acc0 = 1;  // 16 字节小端：分组比特为 0 的区块上的 XOR 累加
-    bytes acc1 = 2;  // 16 字节小端：分组比特为 1 的区块上的 XOR 累加
+    bytes acc0 = 1;  // 16 字节小端：分组比特为 0 的区块上的 XOR 累加（数据）
+    bytes acc1 = 2;  // 16 字节小端：分组比特为 1 的区块上的 XOR 累加（数据）
+    // xmac 的 tag 累加（论文 :293 的 `(R_0, M_0, R_1, M_1)`）—— **仅恶意档**。
+    // ⚠️ 长度必须与 `acc0`/`acc1` **相等**（tag 与条目等宽）；不符即拒绝（不变量 I5）。
+    //    恶意档收到空 tag ⇒ 拒绝，绝不降级为"只校验数据"。
+    bytes mac_acc0 = 3;  // M_0：分组比特为 0 的区块上的 tag XOR 累加
+    bytes mac_acc1 = 4;  // M_1：分组比特为 1 的区块上的 tag XOR 累加
 }
 
 message PirQueryResponse {

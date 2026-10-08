@@ -52,7 +52,8 @@ struct Fix {
 };
 
 // 取值域 [0, C-2] ⇒ 跨度 = C-2，range_size = C 满足无损条件 `range_size >= 跨度+2`。
-Fix MakeFix(size_t n, uint32_t cols_per_attr = 2, uint32_t attrs = 2, uint32_t lambda = 24) {
+Fix MakeFix(size_t n, uint32_t cols_per_attr = 2, uint32_t attrs = 2, uint32_t lambda = 24,
+            MpraqSecurityMode mode = MpraqSecurityMode::kMalicious) {
     Fix f;
     f.n = n;
     f.cols_per_attr = cols_per_attr;
@@ -79,6 +80,7 @@ Fix MakeFix(size_t n, uint32_t cols_per_attr = 2, uint32_t attrs = 2, uint32_t l
     p.lambda = lambda;
     p.prp_epsilon = 1e-6;
     p.seed = 7;
+    p.security_mode = mode;
     f.client = MpraqClient::Init(f.schema, f.records, p);
     return f;
 }
@@ -438,5 +440,65 @@ TEST(MpraqEntry, SecurityModeInterfaceIsStrictAndGateIsLive) {
         MpraqScaleConfig cfg;
         cfg.security_mode = MpraqSecurityMode::kMalicious;
         EXPECT_TRUE(ApplyOverrides(cfg, ov).security_mode == MpraqSecurityMode::kSemiHonest);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xmac 的 tag 存储契约（**半诚实档保留**的落点）
+// ---------------------------------------------------------------------------
+
+TEST(MpraqEntry, TagStorageIsPresentOnlyInMaliciousMode) {
+    using tsb::mpraq::MpraqSecurityMode;
+
+    // ① 恶意档：tag 表存在，且与数据表**等大**（tag 与条目等宽，ℓ = 128 = 一个字）
+    {
+        Fix f = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kMalicious);
+        const StoreParams& sp = f.client->store_params();
+        EXPECT_TRUE(sp.has_tags());
+        for (int srv = 0; srv < 2; ++srv) {
+            const MpraqNode& node = f.client->node(srv);
+            EXPECT_TRUE(node.has_tag_table());
+            EXPECT_EQ(node.FeatureTagStorageBytes(), node.FeatureStorageBytes());
+            EXPECT_EQ(node.StorageBytes(),
+                      node.FeatureStorageBytes() + node.FeatureTagStorageBytes() +
+                          node.AttributeStorageBytes());
+        }
+        // tag 与数据同形状：同一 (entry, word) 下标两边都能读
+        EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 0), 0u);   // 未上传 ⇒ 全 0
+    }
+
+    // ② 半诚实档：**没有** tag 表 ⇒ 存储减半（这是"半诚实档保留"的核心契约）
+    {
+        Fix f = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kSemiHonest);
+        const StoreParams& sp = f.client->store_params();
+        EXPECT_FALSE(sp.has_tags());
+        for (int srv = 0; srv < 2; ++srv) {
+            const MpraqNode& node = f.client->node(srv);
+            EXPECT_FALSE(node.has_tag_table());
+            EXPECT_EQ(node.FeatureTagStorageBytes(), 0u);
+            EXPECT_EQ(node.StorageBytes(),
+                      node.FeatureStorageBytes() + node.AttributeStorageBytes());
+        }
+        // 半诚实档下碰 tag ⇒ **抛异常**（绝不静默返回 0 或写入别处）
+        EXPECT_THROW(f.client->node(0).FeatureTagWord(0, 0), std::logic_error);
+        EXPECT_THROW(f.client->node(0).FeatureTagData(0), std::logic_error);
+        std::vector<uint128_t> junk(static_cast<size_t>(sp.entry_words), 0);
+        EXPECT_THROW(f.client->node(0).UploadFeatureTags(0, junk), std::logic_error);
+    }
+
+    // ③ tag 上传的对齐检查（不变量 I5：tag 与条目等宽 ⇒ 必须是 entry_words 的整数倍）
+    {
+        Fix f = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kMalicious);
+        const StoreParams& sp = f.client->store_params();
+        EXPECT_TRUE(sp.entry_words >= 2);
+        std::vector<uint128_t> bad(static_cast<size_t>(sp.entry_words) - 1, 0);
+        EXPECT_THROW(f.client->node(0).UploadFeatureTags(0, bad), std::invalid_argument);
+        // 合法长度：能写入且能读回
+        std::vector<uint128_t> good = {0x1234u, 0x5678u};
+        if (sp.entry_words == 2) {
+            f.client->node(0).UploadFeatureTags(0, good);
+            EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 0), static_cast<uint128_t>(0x1234u));
+            EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 1), static_cast<uint128_t>(0x5678u));
+        }
     }
 }

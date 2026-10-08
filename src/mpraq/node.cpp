@@ -144,9 +144,11 @@ void MpraqNode::InitTable(const StoreParams& params) {
     params_ = params;
 
     // 特征表：m 个条目 × entry_words 个字（一个条目 = 一整列）
-    words_.assign(static_cast<size_t>(params_.entry_count()) *
-                      static_cast<size_t>(params_.entry_words),
-                  0);
+    const size_t total_words =
+        static_cast<size_t>(params_.entry_count()) * static_cast<size_t>(params_.entry_words);
+    words_.assign(total_words, 0);
+    // xmac 的 tag 表：**仅恶意档**分配（与数据表等大）。半诚实档留空（该档不生成/不存 tag）。
+    tag_words_.assign(params_.has_tags() ? total_words : 0, 0);
     attr_shares_.assign(params_.attrs.size(),
                         std::vector<ModShare>(params_.n, ModShare{0}));
 
@@ -186,6 +188,43 @@ void MpraqNode::UploadFeatureWords(uint64_t base_index,
     }
     std::copy(words.begin(), words.begin() + static_cast<ptrdiff_t>(count),
               words_.begin() + static_cast<ptrdiff_t>(base_index));
+}
+
+// xmac 的 tag 上传：规则与 `UploadFeatureWords` **逐条相同**（同形状、同对齐、同越界检查），
+// 唯一的区别是目标表是 `tag_words_` 且**半诚实档没有这张表**（不分配 ⇒ 一律拒绝）。
+void MpraqNode::UploadFeatureTags(uint64_t base_index,
+                                  const std::vector<uint128_t>& tags, size_t count) {
+    if (!inited_) {
+        throw std::logic_error("MpraqNode::UploadFeatureTags: 尚未 InitTable");
+    }
+    if (tag_words_.empty()) {
+        throw std::logic_error(
+            "MpraqNode::UploadFeatureTags: 本节点没有 tag 表（半诚实档不存 tag）"
+            "—— 客户端与服务端的档位可能不一致；绝不静默丢弃这批 tag");
+    }
+    if (count != tags.size()) {
+        throw std::invalid_argument(
+            "MpraqNode::UploadFeatureTags: count=" + Num(count) + " 与 tags.size()=" +
+            Num(tags.size()) + " 不一致（调用方算错了分块长度）");
+    }
+    if (count == 0) {
+        throw std::invalid_argument("MpraqNode::UploadFeatureTags: 分块长度不能为 0");
+    }
+    // ⚠️ 不变量 I1/I5：tag 与条目**等宽** ⇒ 同样必须是 entry_words 的整数倍
+    if (count % params_.entry_words != 0) {
+        throw std::invalid_argument(
+            "MpraqNode::UploadFeatureTags: 上传长度必须是 entry_words = " +
+            Num(params_.entry_words) + " 的整数倍（实际 count = " + Num(count) + "）"
+            "—— tag 与条目等宽（ℓ = 128 = 一个字），不变量 I5");
+    }
+    if (base_index >= tag_words_.size() || count > tag_words_.size() - base_index) {
+        throw std::out_of_range(
+            "MpraqNode::UploadFeatureTags: 上传区间越界 [base=" + Num(base_index) +
+            ", count=" + Num(count) + ") vs tag 表字数 " + Num(tag_words_.size()) +
+            "（= m·entry_words = " + Num(params_.m) + "·" + Num(params_.entry_words) + "）");
+    }
+    std::copy(tags.begin(), tags.begin() + static_cast<ptrdiff_t>(count),
+              tag_words_.begin() + static_cast<ptrdiff_t>(base_index));
 }
 
 void MpraqNode::SetAttributeShares(uint32_t attr_id,
@@ -310,9 +349,39 @@ ModShare MpraqNode::AttributeShare(uint32_t attr_id, size_t record) const {
     return attr_shares_[attr_id][record];
 }
 
+uint128_t MpraqNode::FeatureTagWord(uint64_t entry, size_t word) const {
+    if (tag_words_.empty()) {
+        throw std::logic_error(
+            "MpraqNode::FeatureTagWord: 本节点没有 tag 表（半诚实档不生成/不存 tag）"
+            "—— 调用方必须先确认档位（StoreParams::has_tags()）");
+    }
+    if (entry >= params_.entry_count() || word >= params_.entry_words) {
+        throw std::out_of_range("MpraqNode::FeatureTagWord: 下标越界");
+    }
+    // ⚠️ **按值返回**：绝不返回内部缓冲区的引用（见文件头 §2 的历史缺陷）。
+    return tag_words_[static_cast<size_t>(entry) * params_.entry_words + word];
+}
+
+const uint128_t* MpraqNode::FeatureTagData(uint64_t entry) const {
+    if (tag_words_.empty()) {
+        throw std::logic_error(
+            "MpraqNode::FeatureTagData: 本节点没有 tag 表（半诚实档不生成/不存 tag）");
+    }
+    if (entry >= params_.entry_count()) {
+        throw std::out_of_range("MpraqNode::FeatureTagData: 条目号越界");
+    }
+    return tag_words_.data() + static_cast<size_t>(entry) * params_.entry_words;
+}
+
 uint64_t MpraqNode::FeatureStorageBytes() const {
-    // 16 B/字 × m × entry_words（**含补齐列**）
+    // 16 B/字 × m × entry_words（**含补齐条目**）—— 只算**数据**
     return static_cast<uint64_t>(kUint128Bytes) * words_.size();
+}
+
+uint64_t MpraqNode::FeatureTagStorageBytes() const {
+    // xmac 的 tag 表：与数据表等大（tag 与条目等宽，ℓ = 128 = 一个字）。
+    // ⚠️ 半诚实档为 0（`tag_words_` 不分配）—— 这是"存储减半"的落地处。
+    return static_cast<uint64_t>(kUint128Bytes) * tag_words_.size();
 }
 
 uint64_t MpraqNode::AttributeStorageBytes() const {
@@ -320,11 +389,13 @@ uint64_t MpraqNode::AttributeStorageBytes() const {
 }
 
 uint64_t MpraqNode::StorageBytes() const {
-    return FeatureStorageBytes() + AttributeStorageBytes();
+    // 恶意档 = 数据 + tag + 属性；半诚实档 tag 项为 0。
+    return FeatureStorageBytes() + FeatureTagStorageBytes() + AttributeStorageBytes();
 }
 
 void MpraqNode::Clear() {
     inited_ = false;
+    tag_words_.clear();
     params_ = StoreParams{};
     words_.clear();
     words_.shrink_to_fit();
@@ -362,6 +433,12 @@ void PlaceholderRemoteMpraqChannel::UploadFeatureWords(uint64_t,
                                                        const std::vector<uint128_t>&,
                                                        size_t) {
     Unsupported("UploadFeatureWords");
+}
+
+void PlaceholderRemoteMpraqChannel::UploadFeatureTags(uint64_t,
+                                                       const std::vector<uint128_t>&,
+                                                       size_t) {
+    Unsupported("UploadFeatureTags");
 }
 void PlaceholderRemoteMpraqChannel::SetAttributeShares(uint32_t,
                                                        const std::vector<ModShare>&) {

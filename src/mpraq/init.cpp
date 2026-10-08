@@ -438,6 +438,10 @@ std::unique_ptr<MpraqClient> MpraqClient::Init(const Schema& schema,
     client->owned_channels_.reserve(2);
     for (int i = 0; i < 2; ++i) {
         client->owned_nodes_.push_back(std::make_unique<MpraqNode>());
+        // ⚠️ 必须把档位告诉节点：`InitTable` 会拿它和 `StoreParams.security_mode` 比对，
+        //    不一致即拒绝装载（唯一的静默降级失败模式）。漏掉这一步的后果是
+        //    "客户端说半诚实、本地节点按恶意档准备" —— 正是闸门要拦的情形。
+        client->owned_nodes_.back()->SetSecurityMode(params.security_mode);
         client->owned_channels_.push_back(
             std::make_unique<LocalMpraqChannel>(*client->owned_nodes_.back()));
         client->channels_[i] = client->owned_channels_.back().get();

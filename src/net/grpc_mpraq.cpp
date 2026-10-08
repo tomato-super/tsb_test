@@ -189,6 +189,27 @@ grpc::Status MpraqServiceImpl::UploadFeatureWords(
     }
 }
 
+grpc::Status MpraqServiceImpl::UploadFeatureTags(
+    grpc::ServerContext*, const ::mpraqwire::UploadFeatureTagsRequest* req,
+    ::mpraqwire::UploadFeatureTagsResponse* resp) {
+    try {
+        std::vector<uint128_t> tags;
+        tags.reserve(static_cast<size_t>(req->tags_size()));
+        for (const auto& t : req->tags()) {
+            tags.push_back(FromBytes(t));
+        }
+        // 与数据侧同规则；服务端会拒绝"半诚实档却上传 tag"（该档没有 tag 表）。
+        node_.UploadFeatureTags(req->base_index(), tags, tags.size());
+        ++rpc_count_;
+        resp->set_ok(true);
+        return grpc::Status::OK;
+    } catch (const std::exception& e) {
+        resp->set_ok(false);
+        resp->set_error(e.what());
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+    }
+}
+
 grpc::Status MpraqServiceImpl::SetAttributeShares(
     grpc::ServerContext*, const ::mpraqwire::SetAttributeSharesRequest* req,
     ::mpraqwire::SetAttributeSharesResponse* resp) {
@@ -339,6 +360,35 @@ void GrpcMpraqChannel::UploadFeatureWords(uint64_t base_index,
     }
     if (!resp.ok()) {
         throw std::runtime_error("UploadFeatureWords 被拒绝（" + target_ +
+                                 "）: " + resp.error());
+    }
+}
+
+void GrpcMpraqChannel::UploadFeatureTags(uint64_t base_index,
+                                        const std::vector<uint128_t>& tags, size_t count) {
+    // 与本地通道同一纪律：在**发请求之前**拒绝不一致的长度，
+    // 否则错误会被网络层掩盖成另一种错误。
+    if (count != tags.size()) {
+        throw std::invalid_argument(
+            "GrpcMpraqChannel::UploadFeatureTags: count=" + std::to_string(count) +
+            " 与 tags.size()=" + std::to_string(tags.size()) + " 不一致");
+    }
+    ::mpraqwire::UploadFeatureTagsRequest req;
+    req.set_base_index(base_index);
+    for (uint128_t t : tags) {
+        req.add_tags(ToBytes(t));
+    }
+    ::mpraqwire::UploadFeatureTagsResponse resp;
+    grpc::ClientContext ctx;
+    ++rpc_count_;
+    const grpc::Status st = stub_->UploadFeatureTags(&ctx, req, &resp);
+    if (!st.ok()) {
+        throw std::runtime_error("UploadFeatureTags RPC 失败（" + target_ +
+                                 "）: " + st.error_message() +
+                                 (resp.error().empty() ? "" : " / " + resp.error()));
+    }
+    if (!resp.ok()) {
+        throw std::runtime_error("UploadFeatureTags 被拒绝（" + target_ +
                                  "）: " + resp.error());
     }
 }

@@ -618,7 +618,13 @@ MpraqScaleEstimate EstimateScale(const MpraqScaleConfig& config) {
     e.rpc_per_server = 1;
 
     const uint64_t attr_blob = 16ull * config.rows * static_cast<uint64_t>(config.attributes);
-    e.storage_bytes_padded = 16ull * e.m * e.entry_words + attr_blob;    e.storage_bytes_unpadded = 16ull * e.levels * e.entry_words + attr_blob;
+    // ⚠️ xmac 的 tag 表与数据表**等大**（tag 与条目等宽，ℓ = 128 = 一个字），
+    //    且**只有恶意档**存在（半诚实档不生成/不存/不传/不校验 tag ⇒ 存储减半）。
+    const uint64_t tag_blob = config.security_mode == MpraqSecurityMode::kMalicious
+                                  ? 16ull * e.m * e.entry_words
+                                  : 0ull;
+    e.storage_bytes_padded = 16ull * e.m * e.entry_words + tag_blob + attr_blob;
+    e.storage_bytes_unpadded = 16ull * e.levels * e.entry_words + tag_blob + attr_blob;
 
     e.pool_m = e.m;
     e.budget = std::min(e.backup_hints, e.pool_m);
@@ -772,7 +778,10 @@ std::string CompareEstimateWithStore(const MpraqScaleEstimate& e, const StorePar
     }
     const uint64_t attr_blob =
         16ull * store.n * static_cast<uint64_t>(store.num_attributes());
-    const uint64_t storage = 16ull * store.m * store.entry_words + attr_blob;
+    // 与 `EstimateScale` 同口径：恶意档要算上 xmac 的 tag 表（与数据表等大）。
+    const uint64_t storage = 16ull * store.m * store.entry_words +
+                             (store.has_tags() ? 16ull * store.m * store.entry_words : 0ull) +
+                             attr_blob;
     if (storage != e.storage_bytes_padded || store.n != e.rows ||
         store.num_attributes() != e.attributes) {
         oss << "存储不一致：预估 " << e.storage_bytes_padded << " B（n=" << e.rows

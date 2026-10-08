@@ -69,6 +69,11 @@ public:
     grpc::Status UploadFeatureWords(grpc::ServerContext* ctx,
                                     const ::mpraqwire::UploadFeatureWordsRequest* req,
                                     ::mpraqwire::UploadFeatureWordsResponse* resp) override;
+    // xmac 的 tag 上传（**仅恶意档**）。半诚实档的客户端不调它；
+    // 若被调到，`MpraqNode::UploadFeatureTags` 会因"本节点没有 tag 表"而拒绝。
+    grpc::Status UploadFeatureTags(grpc::ServerContext* ctx,
+                                   const ::mpraqwire::UploadFeatureTagsRequest* req,
+                                   ::mpraqwire::UploadFeatureTagsResponse* resp) override;
 
     grpc::Status SetAttributeShares(grpc::ServerContext* ctx,
                                     const ::mpraqwire::SetAttributeSharesRequest* req,
@@ -123,6 +128,8 @@ public:
     void UploadFeatureWords(uint64_t base_index,
                             const std::vector<uint128_t>& words,
                             size_t count) override;
+    void UploadFeatureTags(uint64_t base_index, const std::vector<uint128_t>& tags,
+                           size_t count) override;
     void SetAttributeShares(uint32_t attr_id,
                             const std::vector<ModShare>& shares) override;
     PlinkoAnswer ServerResp(const PlinkoQuery& q) override;

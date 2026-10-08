@@ -851,6 +851,7 @@ struct Row {
 
     // 服务器存储（公式 + 实测）
     uint64_t feature_bytes_padded = 0, feature_bytes_unpadded = 0, attr_bytes = 0;
+    uint64_t tag_bytes = 0;   // xmac 的 tag 表（恶意档 = 与数据表等大；半诚实档 = 0）
     uint64_t server_storage_formula_padded = 0, server_storage_formula_unpadded = 0;
     uint64_t server_storage_measured[2] = {0, 0};
     uint64_t server_state_peak_bytes[2] = {0, 0};
@@ -1201,9 +1202,14 @@ public:
         const StoreParams& sp = client_->store_params();
         r->feature_bytes_padded = 16ull * sp.m * sp.entry_words;
         r->feature_bytes_unpadded = 16ull * sp.levels * sp.entry_words;
+        // xmac 的 tag 表：与数据表**等大**，且**只有恶意档**存在
+        // （半诚实档不生成/不存/不传/不校验 tag ⇒ 存储减半）。
+        r->tag_bytes = sp.has_tags() ? 16ull * sp.m * sp.entry_words : 0ull;
         r->attr_bytes = 16ull * sp.n * sp.num_attributes();
-        r->server_storage_formula_padded = r->feature_bytes_padded + r->attr_bytes;
-        r->server_storage_formula_unpadded = r->feature_bytes_unpadded + r->attr_bytes;
+        r->server_storage_formula_padded =
+            r->feature_bytes_padded + r->tag_bytes + r->attr_bytes;
+        r->server_storage_formula_unpadded =
+            r->feature_bytes_unpadded + r->tag_bytes + r->attr_bytes;
         for (int i = 0; i < 2; ++i) {
             if (remote()) {
                 r->server_storage_measured[static_cast<size_t>(i)] =
@@ -1413,6 +1419,7 @@ Json RowJson(const Row& r) {
     //    字段随之删除；"补齐代价"由 `padded` 与 `unpadded` 两个字段之差表达。
     srv.U64("feature_bytes_padded", r.feature_bytes_padded)
         .U64("feature_bytes_unpadded", r.feature_bytes_unpadded)
+        .U64("tag_bytes", r.tag_bytes)
         .U64("attribute_bytes", r.attr_bytes)
         .U64("total_bytes_formula_padded", r.server_storage_formula_padded)
         .U64("total_bytes_formula_unpadded", r.server_storage_formula_unpadded)
