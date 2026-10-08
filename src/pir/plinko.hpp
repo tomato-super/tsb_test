@@ -270,11 +270,21 @@ struct PlinkoQuery {
     }
 };
 
-// 应答：两个累加器，各自是**整列**（长度 entry_words 个字）。
-// ⚠️ 两个 parity（S 与补集）是**隐私所必需**的，不属于"多余"。
+// 应答：数据侧两个累加器（**整列**，长度 entry_words 个字）+ xmac 的**两个 tag 累加器**。
+// ⚠️ 两个数据 parity（S 与补集）是**隐私所必需**的，不属于"多余"。
+//
+// **xmac 的 tag（论文 :293）**：服务器**照数据处理那样**聚合 tag，返回
+// `(R_0, M_0, R_1, M_1)`；客户端 `M_b = M_{b,0} ⊕ M_{b,1}` 后逐 chunk 校验
+// `M_b^(c) = γ ⊙ R_b^(c)`。tag 与条目**等宽** ⇒ 应答翻倍。
+//
+// ⚠️ **半诚实档的表示**：`m0`/`m1` **为空**即"本档不生成、不传、不校验 tag"。
+//    这是刻意的设计 —— 半诚实路径直接走不带 tag 的 `ServerRespShared`，
+//    **不需要**任何"按档位分支"的开关。反过来，恶意档若收到空 tag，
+//    必须在校验层**拒绝**（绝不静默跳过校验），见 `XorAnswers` 的一致性检查。
 struct PlinkoAnswer {
-    PlinkoEntry r0;
-    PlinkoEntry r1;
+    PlinkoEntry r0, r1;   // 数据 parity（两条，隐私所必需）
+    PlinkoEntry m0, m1;   // tag parity（xmac；半诚实档为空）
+    bool has_tags() const { return !m0.empty() || !m1.empty(); }
 };
 
 // 客户端私有的查询句柄 h = (i', i, b) + 内部簿记
@@ -294,6 +304,32 @@ struct PlinkoQueryHandle {
     uint64_t candidates_examined = 0;
     uint64_t candidates_containing = 0;
 };
+
+namespace detail {
+
+// 按分组把「宽度 `width` 的条目」累加进两个累加器：`groups[i] == 1` → `acc1`，否则 `acc0`。
+//
+// ⚠️ **数据侧与 tag 侧共用这一份实现**。论文 :293 要求服务器"照数据处理那样聚合 tag"
+//    （"aggregates its tag shares along the same two paths"）—— 共用同一份代码是
+//    "两者确实同构"的**最强保证**：不可能出现"改了一侧忘了另一侧"。
+//
+// `get(idx)` 须返回第 `idx` 个条目（= 一整列）的起始指针，指向 `width` 个连续字。
+template <typename GetFn>
+inline void PlinkoAccumulateGroups(const PlinkoQuery& q, GetFn&& get, size_t width,
+                                   PlinkoEntry& acc0, PlinkoEntry& acc1) {
+    acc0.assign(width, 0);
+    acc1.assign(width, 0);
+    for (size_t i = 0; i < q.offsets.size(); ++i) {
+        const uint64_t idx = q.offsets[i] + static_cast<uint64_t>(i) * q.block_size;
+        const uint128_t* v = get(idx);
+        PlinkoEntry& acc = q.groups[i] ? acc1 : acc0;
+        for (size_t j = 0; j < width; ++j) {
+            acc[j] = static_cast<uint128_t>(acc[j] ^ v[j]);
+        }
+    }
+}
+
+}  // namespace detail
 
 // ---------------------------------------------------------------------------
 // 客户端
@@ -363,27 +399,44 @@ public:
     // XOR 共享版本（MPRAQ 的双服务器实例化）：`entry(i)` 返回第 i 条 entry 的
     // **一个共享分量**的起始指针（指向 entry_words 个连续 word）。
     // 共享是 XOR ⇒ `ServerRespShared(q, s0) ⊕ ServerRespShared(q, s1) == ServerResp(q, 明文)`。
+    // **不带 tag**（半诚实档走这条）：签名与行为与 xmac 之前完全一致。
     template <typename Fn>
     static PlinkoAnswer ServerRespShared(const PlinkoQuery& q, Fn&& entry, size_t entry_words) {
         PlinkoAnswer a;
-        a.r0.assign(entry_words, 0);
-        a.r1.assign(entry_words, 0);
-        for (size_t i = 0; i < q.offsets.size(); ++i) {
-            const uint64_t idx = q.offsets[i] + static_cast<uint64_t>(i) * q.block_size;
-            const uint128_t* v = entry(idx);
-            PlinkoEntry& acc = q.groups[i] ? a.r1 : a.r0;
-            for (size_t j = 0; j < entry_words; ++j) {
-                acc[j] = static_cast<uint128_t>(acc[j] ^ v[j]);
-            }
-        }
+        detail::PlinkoAccumulateGroups(q, entry, entry_words, a.r0, a.r1);
+        return a;
+    }
+
+    // **带 tag**（恶意档走这条）：论文 :293 —— 除两条数据 parity 外，
+    // 再沿**同样的两条路径**聚合 tag，返回 `(R_0, M_0, R_1, M_1)`。
+    // `tag(idx)` 返回第 idx 条目的 tag 共享起始指针（同样 `entry_words` 个字）。
+    // ⚠️ tag 与数据**等宽**（ℓ = 128 恰好等于一个字 ⇒ 一个 chunk 一个字）。
+    template <typename Fn, typename TagFn>
+    static PlinkoAnswer ServerRespSharedTagged(const PlinkoQuery& q, Fn&& entry, TagFn&& tag,
+                                               size_t entry_words) {
+        PlinkoAnswer a;
+        detail::PlinkoAccumulateGroups(q, entry, entry_words, a.r0, a.r1);
+        detail::PlinkoAccumulateGroups(q, tag, entry_words, a.m0, a.m1);
         return a;
     }
 
     // 两台服务器的应答合并（⊕ 与 XOR 共享线性相容，D12/D3），随后直接送 ClientRecon。
+    // ⚠️ **tag 字段有无必须一致**：一台带 tag、另一台不带 ⇒ 这是"档位/实现不一致"，
+    //    直接拒绝，**绝不**降级成"只校验数据"（那等于静默关掉 xmac）。
     static PlinkoAnswer XorAnswers(const PlinkoAnswer& a, const PlinkoAnswer& b) {
+        if (a.has_tags() != b.has_tags()) {
+            throw std::invalid_argument(
+                "PlinkoClient::XorAnswers: 两台的 tag 字段有无不一致"
+                "（一台带 tag、另一台不带）—— 档位或实现不一致，拒绝合并；"
+                "绝不降级为『只校验数据』（那等于静默关掉 xmac）");
+        }
         PlinkoAnswer out;
         out.r0 = XorEntries(a.r0, b.r0);
         out.r1 = XorEntries(a.r1, b.r1);
+        if (a.has_tags()) {
+            out.m0 = XorEntries(a.m0, b.m0);
+            out.m1 = XorEntries(a.m1, b.m1);
+        }
         return out;
     }
 
