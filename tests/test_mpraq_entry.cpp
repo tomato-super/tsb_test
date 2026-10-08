@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "core/gf128.hpp"
 #include "mpraq/aggquery.hpp"
 #include "mpraq/init.hpp"
 #include "mpraq/node.hpp"
@@ -463,8 +464,40 @@ TEST(MpraqEntry, TagStorageIsPresentOnlyInMaliciousMode) {
                       node.FeatureStorageBytes() + node.FeatureTagStorageBytes() +
                           node.AttributeStorageBytes());
         }
-        // tag 与数据同形状：同一 (entry, word) 下标两边都能读
-        EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 0), 0u);   // 未上传 ⇒ 全 0
+        // ---- tag 分片的**代数契约**（比"未上传 ⇒ 全 0"强得多）----
+        // 真实条目：两台的 tag 异或 == γ ⊙ 明文（论文 :122-123 的定义式）
+        const uint128_t gamma = f.client->tag_key();
+        EXPECT_TRUE(gamma != 0);                       // γ ←$ GF(2^128)\{0}，绝不为 0
+        const std::vector<uint128_t>& plain = f.client->plain_feature_words();
+        const std::vector<uint128_t>& t0 = f.client->tag_share(0);
+        const std::vector<uint128_t>& t1 = f.client->tag_share(1);
+        EXPECT_EQ(t0.size(), plain.size());
+        EXPECT_EQ(t1.size(), plain.size());
+        for (size_t e = 0; e < sp.levels; ++e) {       // 真实条目
+            for (size_t w = 0; w < sp.entry_words; ++w) {
+                const size_t i = e * sp.entry_words + w;
+                if (static_cast<uint128_t>(t0[i] ^ t1[i]) !=
+                    tsb::Gf128Mul(gamma, plain[i])) {
+                    TSB_FAIL_("条目 " + std::to_string(e) + " 第 " + std::to_string(w) +
+                              " 字的 tag 不满足 mac1 ^ mac2 == γ ⊙ D");
+                    break;
+                }
+            }
+        }
+        for (size_t e = sp.levels; e < sp.m; ++e) {    // 补齐条目：两台**恒 0**（与 I2 同纪律）
+            for (size_t w = 0; w < sp.entry_words; ++w) {
+                const size_t i = e * sp.entry_words + w;
+                if (t0[i] != 0 || t1[i] != 0) {
+                    TSB_FAIL_("补齐条目 " + std::to_string(e) + " 的 tag 非 0（留下了结构性痕迹）");
+                    break;
+                }
+            }
+        }
+        // 服务器的 tag 表内容 == 客户端上传的分片（确实上传了，不是预留空表）
+        for (size_t w = 0; w < sp.entry_words; ++w) {
+            EXPECT_EQ(f.client->node(0).FeatureTagWord(1, w), t0[sp.entry_words + w]);
+            EXPECT_EQ(f.client->node(1).FeatureTagWord(1, w), t1[sp.entry_words + w]);
+        }
     }
 
     // ② 半诚实档：**没有** tag 表 ⇒ 存储减半（这是"半诚实档保留"的核心契约）
@@ -500,5 +533,101 @@ TEST(MpraqEntry, TagStorageIsPresentOnlyInMaliciousMode) {
             EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 0), static_cast<uint128_t>(0x1234u));
             EXPECT_EQ(f.client->node(0).FeatureTagWord(0, 1), static_cast<uint128_t>(0x5678u));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// xmac 的**核心**：篡改必须被拒（论文 Lemma `lem:pir` 的场景）
+// ---------------------------------------------------------------------------
+
+TEST(MpraqEntry, XmacRejectsTamperedAnswers) {
+    using tsb::mpraq::MpraqSecurityMode;
+
+    // ① 诚实流程能过，且校验**确实执行了**
+    {
+        Fix f = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kMalicious);
+        const StoreParams& sp = f.client->store_params();
+        EXPECT_TRUE(sp.has_tags());
+        EXPECT_TRUE(f.client->tag_key() != 0);      // γ ←$ GF(2^128)\{0}
+        MpraqQueryBatch b = f.client->CreateColumnQuery(0, 0);
+        EXPECT_EQ(f.client->RunBatch(b).size(), 1u);
+        EXPECT_TRUE(f.client->tag_checks() >= 1);
+    }
+
+    // ② **确定性**地测校验入口本身（不走 Plinko 全流程）。
+    //    ⚠️ 为什么不走全流程：篡改落在 `r_b` 还是 `r_{1-b}` 取决于查询集的分组位，
+    //       只有约一半概率被本次校验看到 —— 我第一版测试就因此出现"篡改却没抛"的假阴性。
+    //       直接构造 `(R_b, M_b)` 才能把判定**钉死**。
+    Fix f = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kMalicious);
+    const size_t ew = f.client->store_params().entry_words;
+    const uint128_t gamma = f.client->tag_key();
+
+    auto make_answer = [&](uint128_t r, uint128_t m) {
+        PlinkoAnswer a;
+        a.r0.assign(ew, r); a.r1.assign(ew, r);
+        a.m0.assign(ew, m); a.m1.assign(ew, m);
+        return a;
+    };
+    const uint128_t rv = 0xDEADBEEFu;
+    const uint128_t mv = tsb::Gf128Mul(gamma, rv);
+
+    // ②a 自洽的 `(R, M = γ⊙R)` ⇒ **通过**（不抛）
+    {
+        PlinkoAnswer a = make_answer(rv, mv);
+        f.client->VerifyXmacOrThrow(a, 0);          // 不抛
+        f.client->VerifyXmacOrThrow(a, 1);          // 两侧都查
+    }
+
+    // ②b 篡改**数据**、tag 不动 ⇒ 必须抛
+    {
+        PlinkoAnswer a = make_answer(rv, mv);
+        a.r0[0] = static_cast<uint128_t>(a.r0[0] ^ 1u);
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 0), std::runtime_error);
+    }
+
+    // ②c 篡改 **tag**、数据不动 ⇒ 必须抛
+    {
+        PlinkoAnswer a = make_answer(rv, mv);
+        a.m1[0] = static_cast<uint128_t>(a.m1[0] ^ 1u);
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 1), std::runtime_error);
+    }
+
+    // ②d **两台一致偏移**（论文 Lemma `lem:pir` 的场景）：`R ← R ⊕ δ`、`M` 不动。
+    //     服务器**不知道 γ**，因此算不出配平的 `ε = γ⊙δ` ⇒ 必然被拒。
+    //     （若攻击者知道 γ 并能算出 ε，则会通过 —— 这正是安全界 `1/(2^128−1)` 的含义：
+    //       盲猜 `ε` 命中 `γ⊙δ` 的概率是 2^{-128} 量级。）
+    {
+        PlinkoAnswer a = make_answer(rv, mv);
+        const uint128_t delta = 0x1234u;
+        a.r0[0] = static_cast<uint128_t>(a.r0[0] ^ delta);
+        a.r1[0] = static_cast<uint128_t>(a.r1[0] ^ delta);
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 0), std::runtime_error);
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 1), std::runtime_error);
+    }
+
+    // ②e 恶意档收到**空 tag** ⇒ 必须抛（绝不降级为"只校验数据"）
+    {
+        PlinkoAnswer a;
+        a.r0.assign(ew, rv); a.r1.assign(ew, rv);   // m0/m1 为空
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 0), std::runtime_error);
+    }
+
+    // ②f **宽度不符**（不变量 I5）⇒ 必须抛
+    {
+        PlinkoAnswer a = make_answer(rv, mv);
+        a.m0.resize(ew + 1, mv);
+        EXPECT_THROW(f.client->VerifyXmacOrThrow(a, 0), std::runtime_error);
+    }
+
+    // ③ 半诚实档：调用校验入口是**逻辑错误** ⇒ 必须抛（该档不生成 γ、不校验）
+    {
+        Fix g = MakeFix(256, 2, 2, 24, MpraqSecurityMode::kSemiHonest);
+        EXPECT_FALSE(g.client->store_params().has_tags());
+        PlinkoAnswer a = make_answer(rv, mv);
+        EXPECT_THROW(g.client->VerifyXmacOrThrow(a, 0), std::logic_error);
+        // 该档跑完整流程也**不校验**（tag_checks 恒 0）
+        MpraqQueryBatch b = g.client->CreateColumnQuery(0, 0);
+        EXPECT_EQ(g.client->RunBatch(b).size(), 1u);
+        EXPECT_EQ(g.client->tag_checks(), 0u);
     }
 }

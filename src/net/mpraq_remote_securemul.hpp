@@ -271,6 +271,12 @@ public:
     grpc::Status UploadFeatureWords(grpc::ServerContext* ctx,
                                     const ::mpraqwire::UploadFeatureWordsRequest* req,
                                     ::mpraqwire::UploadFeatureWordsResponse* resp) override;
+    // ⚠️ 本类**逐条**实现 RPC（不继承 `MpraqServiceImpl`）⇒ 每新增一条 RPC 都必须在
+    //    这里补一条转发，否则 gRPC 会走基类默认实现返回 **UNIMPLEMENTED**（消息为空，
+    //    很难从客户端报错看出原因）。加 tag 上传时就踩过这个坑。
+    grpc::Status UploadFeatureTags(grpc::ServerContext* ctx,
+                                   const ::mpraqwire::UploadFeatureTagsRequest* req,
+                                   ::mpraqwire::UploadFeatureTagsResponse* resp) override;
     grpc::Status SetAttributeShares(grpc::ServerContext* ctx,
                                     const ::mpraqwire::SetAttributeSharesRequest* req,
                                     ::mpraqwire::SetAttributeSharesResponse* resp) override;

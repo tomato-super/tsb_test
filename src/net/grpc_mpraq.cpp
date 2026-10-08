@@ -277,6 +277,12 @@ grpc::Status MpraqServiceImpl::ServerResp(grpc::ServerContext*,
             auto* out = resp->add_answers();
             out->set_acc0(EntryToBytes(a.r0));
             out->set_acc1(EntryToBytes(a.r1));
+            // xmac 的 tag 累加（**仅恶意档**）。半诚实档 `m0` 为空 ⇒ 这两个字段不设，
+            // 客户端按档位判断"该有却没有" ⇒ 拒绝（不变量 I5 / 防静默降级）。
+            if (a.has_tags()) {
+                out->set_mac_acc0(EntryToBytes(a.m0));
+                out->set_mac_acc1(EntryToBytes(a.m1));
+            }
         }
         ++rpc_count_;
         ++batch_rpc_count_;  // 本 RPC **恰好**一次批量调用（不变量的落地位置）
@@ -499,7 +505,23 @@ std::vector<PlinkoAnswer> GrpcMpraqChannel::SendQuerySets(
         const auto& a = resp.answers(static_cast<int>(i));
         // ⚠️ 不变量 I4：按该查询集声明的 entry_words 校验应答宽度（不符即抛）
         const size_t ew = static_cast<size_t>(qs[i].entry_words);
-        out.push_back(PlinkoAnswer{EntryFromBytes(a.acc0(), ew), EntryFromBytes(a.acc1(), ew)});
+        PlinkoAnswer one;
+        one.r0 = EntryFromBytes(a.acc0(), ew);
+        one.r1 = EntryFromBytes(a.acc1(), ew);
+        // xmac 的 tag（**仅恶意档**存在）。两个字段**要么都有、要么都没有** ——
+        // 只出现一个是"实现不一致"，直接拒绝，不在通道层做任何修补。
+        const bool has0 = !a.mac_acc0().empty();
+        const bool has1 = !a.mac_acc1().empty();
+        if (has0 != has1) {
+            throw std::runtime_error(
+                "ServerRespBatch: 应答的 tag 字段只有一侧存在（mac_acc0/mac_acc1 不成对）"
+                "—— 实现不一致，拒绝");
+        }
+        if (has0) {
+            one.m0 = EntryFromBytes(a.mac_acc0(), ew);
+            one.m1 = EntryFromBytes(a.mac_acc1(), ew);
+        }
+        out.push_back(std::move(one));
     }
     queries_served_ += static_cast<uint64_t>(qs.size());
     return out;

@@ -487,6 +487,12 @@ grpc::Status MpraqDemoService::UploadFeatureWords(
     return data_.UploadFeatureWords(ctx, req, resp);
 }
 
+grpc::Status MpraqDemoService::UploadFeatureTags(
+    grpc::ServerContext* ctx, const ::mpraqwire::UploadFeatureTagsRequest* req,
+    ::mpraqwire::UploadFeatureTagsResponse* resp) {
+    return data_.UploadFeatureTags(ctx, req, resp);
+}
+
 grpc::Status MpraqDemoService::SetAttributeShares(
     grpc::ServerContext* ctx, const ::mpraqwire::SetAttributeSharesRequest* req,
     ::mpraqwire::SetAttributeSharesResponse* resp) {

@@ -331,6 +331,28 @@ public:
 
     // 明文副本（**仿真约定**：真实部署里它属于 offline server，见文件头 §1 的 ④）
     const std::vector<uint128_t>& plain_feature_words() const { return plain_words_; }
+
+    // ---- xmac 的客户端状态与账目（**仅恶意档**；半诚实档 `tag_key()` 为 0）----
+    // γ **绝不出客户端**：本访问器只供本进程内的账目/测试使用。
+    uint128_t tag_key() const { return tag_key_; }
+    bool has_tags() const { return store_.has_tags(); }
+    // 已通过 xmac 校验的查询集个数（半诚实档恒 0 —— 该档不校验）
+    uint64_t tag_checks() const { return tag_checks_; }
+
+    // **xmac 的纯校验入口**：给定两台合并后的应答与侧位 `b`，逐 chunk 校验
+    // `M_b = γ ⊙ R_b`（论文 :243-245 / :296）；不成立即抛 `std::runtime_error`。
+    //
+    // ⚠️ 单独暴露成公开方法有**两个**理由（不是为了方便）：
+    //   ① `FinishOne` 内部就用它 —— 校验只有一份实现；
+    //   ② 它让这条检查**可被确定性地测试**。走完整 Plinko 流程做篡改测试是**不确定的**：
+    //      篡改落在 `r_b` 还是 `r_{1-b}` 取决于查询集的分组位，只有约一半概率被本次
+    //      校验看到（我自己就在测试里踩过：三次篡改断言两次"未抛出"）。
+    //      有了这个入口，测试可以直接构造 `(R_b, M_b)` 并断言判定结果。
+    // 半诚实档（`has_tags()` 为假）下本方法**直接拒绝**：该档根本不该走到校验路径。
+    void VerifyXmacOrThrow(const PlinkoAnswer& merged, uint8_t b) const;
+    const std::vector<uint128_t>& tag_share(int server) const {
+        return server == 0 ? tag_share0_ : tag_share1_;
+    }
     // ⚠️ 这是 `MpraqRecord::feature`（**死字段**，D36）**唯一**的去处：纯客户端明文副本，
     //    不参与编码/上传/查询。用途 = 给测试与 demo 一个确定的逐记录标签，便于预估/手算结果。
     const std::vector<int64_t>& plain_feature_values() const { return plain_features_; }
@@ -429,6 +451,15 @@ private:
     std::vector<int64_t> plain_features_;                 // 明文 feature 列（N 条）
     std::vector<std::vector<int64_t>> plain_attrs_;       // 明文属性值（N × |attrs|）
     std::vector<uint128_t> feature_share0_, feature_share1_;  // 特征 word 的 XOR 共享
+    // ---- xmac（**仅恶意档**；半诚实档全部为空）----
+    // γ：tag 密钥，`GF(2^128)\{0}`，**只在客户端**，绝不下发（论文 :116）。
+    uint128_t tag_key_ = 0;
+    // 已通过 xmac 校验的**查询集**个数（账目/测试用：证明校验确实跑了）。
+    // `mutable`：校验是**只读**操作（不改任何状态），计数只是账目。
+    mutable uint64_t tag_checks_ = 0;
+    // tag 分片：`mac1 ←$ GF(2^128)`、`mac2 = mac1 ⊕ (γ ⊙ D)`（论文 :122-123）。
+    // ⚠️ 与 `feature_share0_/1_` **同形状**（tag 与条目等宽，ℓ = 128 = 一个字）。
+    std::vector<uint128_t> tag_share0_, tag_share1_;
     std::vector<std::vector<ModShare>> attr_share0_, attr_share1_;  // 属性值 mod q 共享
 
     // ⚠️ 声明顺序：两台服务器节点必须在通道之前销毁（通道持有节点的引用）。

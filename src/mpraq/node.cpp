@@ -280,6 +280,18 @@ void MpraqNode::ValidateQuery(const PlinkoQuery& q) const {
 PlinkoAnswer MpraqNode::AnswerOne(const PlinkoQuery& q) const {
     // 在**本方 XOR 共享**上做分组累加（`PlinkoClient::ServerRespShared`）。
     // 服务器看不到 hint、看不到 parity，也看不到目标索引。
+    //
+    // ⚠️ **按档位选择是否带 tag**（论文 :293 的 `(R_0, M_0, R_1, M_1)`）：
+    //    恶意档 ⇒ 除数据外，再沿**同样的两条路径**聚合 tag（`ServerRespSharedTagged`
+    //    内部复用的就是同一个 `PlinkoAccumulateGroups`）；
+    //    半诚实档 ⇒ 只有数据（该档没有 tag 表，也不该产生 tag 应答）。
+    //    判定完全由 `params_.has_tags()` 决定，**没有第二处开关**。
+    if (params_.has_tags()) {
+        return PlinkoClient::ServerRespSharedTagged(
+            q, [this](uint64_t i) -> const uint128_t* { return FeatureEntryData(i); },
+            [this](uint64_t i) -> const uint128_t* { return FeatureTagData(i); },
+            params_.entry_words);
+    }
     return PlinkoClient::ServerRespShared(
         q, [this](uint64_t i) -> const uint128_t* { return FeatureEntryData(i); },
         params_.entry_words);

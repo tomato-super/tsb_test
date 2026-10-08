@@ -7,6 +7,7 @@
 #include <numeric>
 #include <sstream>
 
+#include "core/gf128.hpp"
 #include "core/iprf.hpp"
 
 namespace tsb {
@@ -605,6 +606,35 @@ void MpraqClient::PrepareShares(const MpraqInitParams& params) {
         }
     }
 
+    // ---------- ③b xmac 的 tag 分片（**仅恶意档**）----------
+    // 论文 :122-123：`mac1[i]^(c) ←$ GF(2^ℓ)`、`mac2[i]^(c) = mac1[i]^(c) ⊕ (γ ⊙ D[i]^(c))`。
+    // ℓ = 128 恰好等于一个字 ⇒ **一个 chunk = 一个字**，`C = entry_words`。
+    //
+    // ⚠️ **半诚实档整段跳过**：不采样 γ、不生成、不存、不传、不校验（存储与应答各减半）。
+    //    判定完全由 `store_.has_tags()`（= 档位）决定，**没有第二处开关**。
+    //
+    // ⚠️ **补齐条目（entry >= levels）两块 tag 都置 0**（与数据侧的 I2 同纪律）：
+    //    按公式若 D = 0 则 `mac2 = mac1 ⊕ 0 = mac1` ⇒ **两台 tag 完全相同**，
+    //    会留下"哪些条目是补齐"的结构性痕迹。置 0 后 `XOR = 0 = γ ⊙ 0` 仍然自洽，
+    //    且补齐条目**不可达**（越界即抛），所以不影响任何可达查询。
+    //
+    // ⚠️ **尾部填充位（末字 j >= n）不做特殊处理**：tag 是对**整字**算的，
+    //    `γ ⊙ D` 自然卷入那些 0 位；由于 `mac1` 是随机的，两台 tag 分片**看起来仍然随机**
+    //    ⇒ 不像数据侧那样需要额外掩码，也**不该**掩（掩了反而制造痕迹）。
+    if (store_.has_tags()) {
+        tag_key_ = Gf128SampleNonZero(*rng_);
+        const size_t total = plain_words_.size();
+        tag_share0_.assign(total, 0);
+        tag_share1_.assign(total, 0);
+        for (size_t i = 0; i < total; ++i) {
+            const size_t col = i / store_.entry_words;   // 一列 = 一个条目
+            if (col >= store_.levels) continue;          // 补齐条目：两台恒 0（见上）
+            const uint128_t mac1 = rng_->Next();
+            tag_share0_[i] = mac1;
+            tag_share1_[i] = static_cast<uint128_t>(mac1 ^ Gf128Mul(tag_key_, plain_words_[i]));
+        }
+    }
+
     // 属性值：**mod q 加法共享**（强类型 `ModShare`）
     const size_t na = store_.attrs.size();
     attr_share0_.assign(na, {});
@@ -664,6 +694,23 @@ void MpraqClient::DistributeUpload() {
         channels_[0]->UploadFeatureWords(base, w0, cnt);
         channels_[1]->UploadFeatureWords(base, w1, cnt);
         upload_bytes_ += 2 * static_cast<uint64_t>(cnt) * kUint128Bytes;
+    }
+
+    // xmac 的 tag 共享：**仅恶意档**上传；分块与对齐规则与特征侧完全相同
+    // （tag 与条目等宽 ⇒ 同样按 `entry_words` 对齐，不变量 I5）。
+    if (store_.has_tags()) {
+        const auto& t0 = tag_share0_;
+        const auto& t1 = tag_share1_;
+        for (size_t base = 0; base < total_words; base += chunk) {
+            const size_t cnt = std::min(chunk, total_words - base);
+            std::vector<uint128_t> w0(t0.begin() + static_cast<ptrdiff_t>(base),
+                                      t0.begin() + static_cast<ptrdiff_t>(base + cnt));
+            std::vector<uint128_t> w1(t1.begin() + static_cast<ptrdiff_t>(base),
+                                      t1.begin() + static_cast<ptrdiff_t>(base + cnt));
+            channels_[0]->UploadFeatureTags(base, w0, cnt);
+            channels_[1]->UploadFeatureTags(base, w1, cnt);
+            upload_bytes_ += 2 * static_cast<uint64_t>(cnt) * kUint128Bytes;
+        }
     }
 
     // 属性值的加法共享：带 attr_id 上传
@@ -797,11 +844,66 @@ MpraqQueryBatch MpraqClient::CreateColumnQuery(uint32_t attr_id, uint32_t column
 // 两条路径共用的**客户端本地**收尾：两台应答 XOR 起来 → `ClientRecon`。
 // ⊕ 与 XOR 共享线性相容（D12/D3）⇒ 合并后的应答就是明文应答。
 // （作为 `MpraqClient` 的成员以访问 `MpraqQuery` 的私有字段；不产生任何通道调用。）
+// xmac 的纯校验：`M_b = γ ⊙ R_b` 逐 chunk 成立，否则抛。
+// 论文 :243-245（合并式）与 :296（`ClientRecon` 里的检查）；安全界见 Lemma `lem:pir`：
+// `Pr[accept ∧ δ_b ≠ 0] ≤ 1/(2^128 − 1)`。
+//
+// ⚠️ 三条**必须**的拒绝（任何一条缺失都会静默丢掉 xmac 的保护）：
+//   ① 半诚实档调用它 ⇒ 拒绝（该档没有 γ，也没有 tag）；
+//   ② 恶意档收到**空 tag** ⇒ 拒绝（绝不降级为"只校验数据"）；
+//   ③ tag 宽度 ≠ 数据宽度 ⇒ 拒绝（不变量 I5）。
+void MpraqClient::VerifyXmacOrThrow(const PlinkoAnswer& merged, uint8_t b) const {
+    if (!store_.has_tags()) {
+        throw std::logic_error(
+            "MpraqClient::VerifyXmacOrThrow: 本客户端是半诚实档（不生成 γ、不校验 tag）"
+            "—— 调用它是逻辑错误，绝不静默返回");
+    }
+    if (b > 1) {
+        throw std::invalid_argument("MpraqClient::VerifyXmacOrThrow: 侧位 b 必须是 0 或 1");
+    }
+    const PlinkoEntry& r_b = (b == 0) ? merged.r0 : merged.r1;
+    const PlinkoEntry& m_b = (b == 0) ? merged.m0 : merged.m1;
+    if (m_b.empty()) {
+        throw std::runtime_error(
+            "MpraqClient: 恶意档下服务器**没有返回 tag** —— 拒绝（绝不降级为『只校验数据』）；"
+            "说明对端按半诚实档应答或实现不一致");
+    }
+    if (m_b.size() != r_b.size()) {
+        throw std::runtime_error(
+            "MpraqClient: tag 宽度与数据宽度不一致（M_b=" + Num(m_b.size()) +
+            " vs R_b=" + Num(r_b.size()) + "）—— 不变量 I5 被破坏");
+    }
+    for (size_t j = 0; j < r_b.size(); ++j) {
+        if (m_b[j] != Gf128Mul(tag_key_, r_b[j])) {
+            throw std::runtime_error(
+                "MpraqClient: PIR 应答的 xmac 校验失败（第 " + Num(j) +
+                " 个 chunk：M != γ⊙R）—— abort 当前查询"
+                "（论文 :296：M_b = γ ⊙ R_b 不成立即拒绝；安全界 1/(2^128−1)）");
+        }
+    }
+    ++tag_checks_;
+}
+
 PlinkoEntry MpraqClient::FinishOne(MpraqQuery& q, const PlinkoAnswer& a0,
                                   const PlinkoAnswer& a1) {
     q.answer0_ = a0;
     q.answer1_ = a1;
-    q.answer_ = PlinkoClient::XorAnswers(a0, a1);
+    q.answer_ = PlinkoClient::XorAnswers(a0, a1);   // 顺带校验两台的 tag 字段有无一致
+
+    // ---------- xmac：逐 chunk 校验 `M_b = γ ⊙ R_b`（论文 :243-245 / :296）----------
+    // ⚠️ **必须在 `ClientRecon` 之前**：先验后取 ⇒ 被篡改的应答**绝不会**被当成明文值，
+    //    而且 hint 不会被消费掉（失败即 abort 当前查询）。
+    // ⚠️ **校验放在应用层**（负责人批注 3）：`pir/plinko` 保持为可独立测试的检索底座，
+    //    不依赖"安全档 + γ"。论文 :296 说的 "inside ClientRecon" 是**表述**差异，
+    //    语义完全一致（同一条检查、同一个位置在流水线上）。
+    // ⚠️ **按档位决定是否校验**：半诚实档不走校验路径（该档不生成 γ、也不该有 tag）。
+    //    `VerifyXmacOrThrow` 自身对半诚实档是**拒绝**的（防误用），所以这里必须先判档位 ——
+    //    漏掉这个 `if` 会让整个半诚实流程直接抛异常（重构时踩过，被
+    //    `XmacRejectsTamperedAnswers` 的第 ③ 例当场抓到）。
+    if (store_.has_tags()) {
+        VerifyXmacOrThrow(q.answer_, q.handle_.b);
+    }
+
     q.value_ = plinko_->ClientRecon(q.handle_, q.answer_);
     q.answered_ = true;
     return q.value_;

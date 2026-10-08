@@ -886,9 +886,11 @@ int main(int argc, char** argv) {
         // ---- 账目一行摘要（默认）；完整账目在 `--verbose` ----
         // 口径：存储/台 = 公式 = 实测；查询集 = Σ 每次 Count 的 列数×⌈N/128⌉；
         // SecureMul rounds 与线上消息（wire）；安装 rounds 与帧数（两台合计）。
+        // `tag_checks` = 已通过 xmac 校验的查询集个数。**恶意档 = 查询集数（校验真的跑了）；
+        // 半诚实档恒 0**（该档不生成 γ、不校验）—— 这是"分档确实生效"的可见证据。
         std::printf("\naccounts storage_bytes_per_server=%llu query_sets=%llu "
                     "pir_rpc0=%llu pir_rpc1=%llu sm_rounds=%llu sm_wire_messages=%llu "
-                    "install_rounds=%llu install_frames=%llu\n",
+                    "install_rounds=%llu install_frames=%llu tag_checks=%llu\n",
                     static_cast<unsigned long long>(feature_padded + tag_bytes + attr_bytes),
                     static_cast<unsigned long long>(total_query_sets),
                     static_cast<unsigned long long>(total_pir_rpc[0]),
@@ -896,7 +898,8 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(total_sm_rounds),
                     static_cast<unsigned long long>(total_sm_wire),
                     static_cast<unsigned long long>(total_install_rounds),
-                    static_cast<unsigned long long>(2 * reports.size()));
+                    static_cast<unsigned long long>(2 * reports.size()),
+                    static_cast<unsigned long long>(client->tag_checks()));
 
         // ---- 查询集 / RPC / 往返 ----
         if (g_verbose) {
