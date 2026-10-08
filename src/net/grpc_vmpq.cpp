@@ -62,7 +62,7 @@ std::vector<uint128_t> FromBytesVec(const std::string& s, uint64_t words) {
 grpc::Status VmpqServiceImpl::InitTable(grpc::ServerContext*,
                                         const vmpq::InitTableRequest* req,
                                         vmpq::InitTableResponse* resp) {
-    ++rpc_count_;
+    rpc_count_.fetch_add(1, std::memory_order_relaxed);
     try {
         std::vector<uint32_t> sizes(req->attr_sizes().begin(),
                                     req->attr_sizes().end());
@@ -79,7 +79,7 @@ grpc::Status VmpqServiceImpl::InitTable(grpc::ServerContext*,
 grpc::Status VmpqServiceImpl::UploadEntries(
     grpc::ServerContext*, const vmpq::UploadEntriesRequest* req,
     vmpq::UploadEntriesResponse* resp) {
-    ++rpc_count_;
+    rpc_count_.fetch_add(1, std::memory_order_relaxed);
     try {
         std::vector<uint128_t> entries;
         entries.reserve(req->entries_size());
@@ -99,7 +99,7 @@ grpc::Status VmpqServiceImpl::UploadEntries(
 grpc::Status VmpqServiceImpl::PirQuery(grpc::ServerContext*,
                                        const vmpq::PirQueryRequest* req,
                                        vmpq::PirQueryResponse* resp) {
-    ++rpc_count_;
+    rpc_count_.fetch_add(1, std::memory_order_relaxed);
     try {
         // ⚠️ 决策 D38：服务端按 entry_words 校验条目宽度（必须等于本节点
         //    登记窗口大小 N），否则"每个查询集 = 一个条目"的口径就不成立。
@@ -120,7 +120,7 @@ grpc::Status VmpqServiceImpl::PirQuery(grpc::ServerContext*,
             queries.push_back(std::move(d));
         }
         const std::vector<PirAnswerData> answers = node_.PirQuery(queries);
-        queries_served_ += queries.size();
+        queries_served_.fetch_add(queries.size(), std::memory_order_relaxed);
         for (const auto& a : answers) {
             auto* out = resp->add_answers();
             out->set_acc0(ToBytesVec(a.acc0));

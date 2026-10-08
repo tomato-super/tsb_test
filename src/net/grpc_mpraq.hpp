@@ -24,6 +24,8 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
+
 #include "mpraq.grpc.pb.h"
 #include "mpraq/node.hpp"
 #include "net/grpc_transport.hpp"
@@ -85,18 +87,25 @@ public:
 
     // 统计（只增不减；只统计**成功**的调用，被拒绝的请求不计入，
     // 这样"一次 RunBatch 恰好 1 次 ServerResp"这类结构性断言才有意义）
-    uint64_t rpc_count() const { return rpc_count_; }
+    uint64_t rpc_count() const { return rpc_count_.load(std::memory_order_relaxed); }
     // 其中**批量入口**（`MpraqNode::ServerRespBatch`）的调用次数（见类注释的 ⚠️）
-    uint64_t batch_rpc_count() const { return batch_rpc_count_; }
+    uint64_t batch_rpc_count() const {
+        return batch_rpc_count_.load(std::memory_order_relaxed);
+    }
     // 累计受理的查询集个数（= Σ 请求里的 queries.size()，与 `MpraqNode::queries_served`
     // 的"区块数"口径不同：这里是**word 数**，别混用）
-    uint64_t queries_served() const { return queries_served_; }
+    uint64_t queries_served() const { return queries_served_.load(std::memory_order_relaxed); }
 
 private:
     mpraq::MpraqNode& node_;
-    uint64_t rpc_count_ = 0;
-    uint64_t batch_rpc_count_ = 0;
-    uint64_t queries_served_ = 0;
+    // ⚠️ **并发安全（R7）**：本类的 RPC 处理器由 gRPC 的**线程池**调用（可能并发），
+    //    因此计数必须是原子的。用 `memory_order_relaxed` 足够 —— 它是**纯计数**，
+    //    没有通过它发布任何其它数据，不需要 acquire/release 语义。
+    //    ⚠️ 原子化只修**计数**；`node_` 本身仍**不是**线程安全的（同一进程当前只支持
+    //    一个客户端会话，见 `MPRAQ_IMPL` §6 限制②）。不要把这条当成"服务器已支持并发"。
+    std::atomic<uint64_t> rpc_count_{0};
+    std::atomic<uint64_t> batch_rpc_count_{0};
+    std::atomic<uint64_t> queries_served_{0};
 };
 
 // ---------------------------------------------------------------------------

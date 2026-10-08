@@ -158,7 +158,7 @@ grpc::Status MpraqServiceImpl::InitTable(grpc::ServerContext*,
     try {
         const mpraq::StoreParams params = FromProto(req->params());
         node_.InitTable(params);
-        ++rpc_count_;
+        rpc_count_.fetch_add(1, std::memory_order_relaxed);
         resp->set_ok(true);
         return grpc::Status::OK;
     } catch (const std::exception& e) {
@@ -180,7 +180,7 @@ grpc::Status MpraqServiceImpl::UploadFeatureWords(
         // count = words.size()：线上请求没有独立的 count 字段（它就是 words 的长度），
         // 因此这里不可能出现"count 与 words 长度不一致"这种客户端算错分块的情形。
         node_.UploadFeatureWords(req->base_index(), words, words.size());
-        ++rpc_count_;
+        rpc_count_.fetch_add(1, std::memory_order_relaxed);
         resp->set_ok(true);
         return grpc::Status::OK;
     } catch (const std::exception& e) {
@@ -201,7 +201,7 @@ grpc::Status MpraqServiceImpl::UploadFeatureTags(
         }
         // 与数据侧同规则；服务端会拒绝"半诚实档却上传 tag"（该档没有 tag 表）。
         node_.UploadFeatureTags(req->base_index(), tags, tags.size());
-        ++rpc_count_;
+        rpc_count_.fetch_add(1, std::memory_order_relaxed);
         resp->set_ok(true);
         return grpc::Status::OK;
     } catch (const std::exception& e) {
@@ -222,7 +222,7 @@ grpc::Status MpraqServiceImpl::SetAttributeShares(
                                             static_cast<size_t>(i)));
         }
         node_.SetAttributeShares(req->attr_id(), shares);
-        ++rpc_count_;
+        rpc_count_.fetch_add(1, std::memory_order_relaxed);
         resp->set_ok(true);
         return grpc::Status::OK;
     } catch (const std::exception& e) {
@@ -285,9 +285,10 @@ grpc::Status MpraqServiceImpl::ServerResp(grpc::ServerContext*,
                 out->set_mac_acc1(EntryToBytes(a.m1));
             }
         }
-        ++rpc_count_;
-        ++batch_rpc_count_;  // 本 RPC **恰好**一次批量调用（不变量的落地位置）
-        queries_served_ += static_cast<uint64_t>(req->queries_size());
+        rpc_count_.fetch_add(1, std::memory_order_relaxed);
+        batch_rpc_count_.fetch_add(1, std::memory_order_relaxed);  // 本 RPC **恰好**一次批量调用（不变量的落地位置）
+        queries_served_.fetch_add(static_cast<uint64_t>(req->queries_size()),
+                                std::memory_order_relaxed);
         return grpc::Status::OK;
     } catch (const std::exception& e) {
         resp->set_error(e.what());

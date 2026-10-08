@@ -17,6 +17,8 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include <atomic>
+
 #include "net/grpc_limits.hpp"   // 收包上限常量（零依赖，不含任何 proto）
 #include "vmpq.grpc.pb.h"
 #include "vmpq/node.hpp"
@@ -44,13 +46,18 @@ public:
                           vmpq::PirQueryResponse* resp) override;
 
     // 统计：服务器收到的查询集总数（诊断用）
-    uint64_t queries_served() const { return queries_served_; }
-    uint64_t rpc_count() const { return rpc_count_; }
+    uint64_t queries_served() const { return queries_served_.load(std::memory_order_relaxed); }
+    uint64_t rpc_count() const { return rpc_count_.load(std::memory_order_relaxed); }
 
 private:
     VmpqNode& node_;
-    uint64_t queries_served_ = 0;
-    uint64_t rpc_count_ = 0;
+    // ⚠️ **并发安全（R7）**：本类的 RPC 处理器由 gRPC 的**线程池**调用（可能并发），
+    //    因此计数必须是原子的。用 `memory_order_relaxed` 足够 —— 它是**纯计数**，
+    //    没有通过它发布任何其它数据，不需要 acquire/release 语义。
+    //    ⚠️ 原子化只修**计数**；`node_` 本身仍**不是**线程安全的（同一进程当前只支持
+    //    一个客户端会话，见 `MPRAQ_IMPL` §6 限制②）。不要把这条当成"服务器已支持并发"。
+    std::atomic<uint64_t> queries_served_{0};
+    std::atomic<uint64_t> rpc_count_{0};
 };
 
 // ---------------------------------------------------------------------------
