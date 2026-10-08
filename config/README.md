@@ -47,3 +47,23 @@
 | `server_vmpq_0.json` / `server_vmpq_1.json` | **`vmpq_server_0.json`** / **`vmpq_server_1.json`** | 重命名 |
 | `client_cfg.json` | — | **删除**：无任何代码/文档引用，且 schema 早于 `attr_sizes`/`lambda`（被 `client_vmpq.json` 取代） |
 | `server_cfg_0.json` / `server_cfg_1.json` | — | **删除**：同上（内容与新版逐字重复，仅 JSON 空格风格不同） |
+
+### `enable_repeat_query_cache`（布尔，**默认 `true`**）
+
+Plinko 的**重复查询缓存**开关（`Q`，论文 Fig 7 的 `Query`）。
+
+| 取值 | 重复查询的行为 | 后果 |
+|---|---|---|
+| `true`（默认） | 另挑一个**从未查过**的索引做 PIR，返回缓存里的值 | 服务器看到的索引序列**永不重复** ⇒ 访问模式不可关联 |
+| `false` | **直接拒绝**（抛 `PlinkoRepeatedQueryRejected`） | 更严格；**绝不**退化成"对同一索引再查一次"（那会让访问模式可关联，是静默的隐私降级） |
+
+对应 CLI：`--repeat-query-cache on|off`（严格解析，只认 `on/off/true/false/1/0`）。
+
+⚠️ **关掉它要求上层不对同一列重复查询**。当前 MPRAQ 的 `RunBatch` **不做跨查询去重**
+⇒ 同一列出现在两个谓词里（例如 demo 的 `q0` 与 `q1` 都用到 `attr0`）时，第二次会**失败**。
+这是**如实行为，不是缺陷**：宁可报错，也不让服务器看到重复索引。
+（`config/mpraq_scale.json` 的默认 workload 就会触发它 —— 若要在此 workload 下关缓存，
+须先给上层加列去重。）
+
+⚠️ 它**不延长查询额度**：每条查询仍消耗 1 条备份 hint（`N_T` 上限不变）。
+⚠️ 关掉后**省下** `m · entry_words · 16` 字节（该档不分配明文缓存值数组）。

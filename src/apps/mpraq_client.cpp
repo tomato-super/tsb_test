@@ -137,7 +137,11 @@ Options ParseArgs(int argc, char** argv) {
                    "  --eps E             iPRF 的 PRP 目标 ε（默认 1e-4）\n"
                    "  --seed S            合成数据与 Init 的确定性种子（默认 7）\n"
                    "  --security-mode M   运行方式：malicious（默认）| semi-honest\n"
-                   "                        （接口预留；必须与两台服务器的档位一致）\n"
+                   "                        （必须与两台服务器的档位一致）\n"
+                   "  --repeat-query-cache on|off\n"
+                   "                       Plinko 的重复查询缓存（**默认 on**）。\n"
+                   "                       off ⇒ 重复查询**直接拒绝**（绝不重查同一索引，\n"
+                   "                       那会让访问模式可关联）；要求上层不对同一列重复查询\n"
                    "\n"
                    "其余：\n"
                    "  --prng-seed P       SecureMul triple 的确定性种子（默认 11）\n"
@@ -893,7 +897,8 @@ int main(int argc, char** argv) {
         // 半诚实档恒 0**（该档不生成 γ、不校验）—— 这是"分档确实生效"的可见证据。
         std::printf("\naccounts storage_bytes_per_server=%llu query_sets=%llu "
                     "pir_rpc0=%llu pir_rpc1=%llu sm_rounds=%llu sm_wire_messages=%llu "
-                    "install_rounds=%llu install_frames=%llu tag_checks=%llu\n",
+                    "install_rounds=%llu install_frames=%llu tag_checks=%llu "
+                    "pir_cache=%s\n",
                     static_cast<unsigned long long>(feature_padded + tag_bytes + attr_bytes),
                     static_cast<unsigned long long>(total_query_sets),
                     static_cast<unsigned long long>(total_pir_rpc[0]),
@@ -902,7 +907,8 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(total_sm_wire),
                     static_cast<unsigned long long>(total_install_rounds),
                     static_cast<unsigned long long>(2 * reports.size()),
-                    static_cast<unsigned long long>(client->tag_checks()));
+                    static_cast<unsigned long long>(client->tag_checks()),
+                    client->pir_query_cache_enabled() ? "on" : "off");
 
         // ---- 查询集 / RPC / 往返 ----
         if (g_verbose) {

@@ -104,6 +104,9 @@ struct MpraqScaleConfig {
     //    ⚠️ 本 gate **不改变行为**：两档目前走同一条代码路径，它的作用是
     //       随 `StoreParams` 上线并被服务端一致性校验（防静默降级）。
     MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
+    // Plinko 的"重复查询缓存"开关（负责人要求；默认开）。
+    // 关掉 ⇒ 重复查询**直接拒绝**（抛 `PlinkoRepeatedQueryRejected`），绝不退化重查同一索引。
+    bool enable_repeat_query_cache = true;
 
     // 默认值（与 `config/mpraq_scale.json` 逐字段一致）
     static MpraqScaleConfig Defaults() { return MpraqScaleConfig{}; }
@@ -145,6 +148,8 @@ struct MpraqScaleOverrides {
     std::optional<double> eps;
     std::optional<uint64_t> seed;
     std::optional<std::string> security_mode;   // 字符串档位（严格解析在 ApplyOverrides 里做）
+    // Plinko 重复查询缓存的开关（`on|off`，严格解析）。**默认 on**。
+    std::optional<std::string> repeat_query_cache;
 
     bool any() const;
     // 该旗标是否属于规模层（接受 "--rows" 与 "rows" 两种写法）
@@ -172,6 +177,7 @@ struct MpraqScaleEstimate {
     uint32_t lambda = 0;
     double eps = 0.0;
     MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;   // 配置回声
+    bool enable_repeat_query_cache = true;                          // 配置回声
 
     // ---- 几何（符号向论文看齐，D41）----
     uint64_t entry_words = 0;      // ⌈n/128⌉：条目宽度（字）

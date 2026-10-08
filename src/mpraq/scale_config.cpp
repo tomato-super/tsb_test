@@ -50,7 +50,8 @@ uint64_t NextPow2Local(uint64_t v) {
 
 const char* const kKnownFields[] = {"rows",       "columns_per_attribute", "attributes",
                                     "predicates", "lambda",                "eps",
-                                    "seed",       "security_mode"};
+                                    "seed",       "security_mode",
+                                    "enable_repeat_query_cache"};
 
 bool IsKnownField(const std::string& k) {
     for (const char* f : kKnownFields) {
@@ -251,6 +252,8 @@ MpraqScaleConfig ParseDoc(const JsonConfig& doc) {
     // 档位：字符串键，**严格解析**（非法值在这里就拒绝启动，不静默回落）
     c.security_mode = ParseMpraqSecurityMode(
         root.StringOr("security_mode", MpraqSecurityModeName(c.security_mode)));
+    // Plinko 的重复查询缓存开关（**默认开**）。关掉 ⇒ 重复查询直接拒绝，见 `init.hpp`。
+    c.enable_repeat_query_cache = root.BoolOr("enable_repeat_query_cache", true);
     return c;
 }
 
@@ -431,7 +434,7 @@ bool MpraqScaleOverrides::any() const {
 
 std::string MpraqScaleOverrides::FlagList() {
     return "--rows, --columns（= 每属性列数）, --attributes, --predicates, --lambda, "
-           "--eps, --seed, --security-mode";
+           "--eps, --seed, --security-mode, --repeat-query-cache";
 }
 
 namespace {
@@ -484,7 +487,9 @@ bool MpraqScaleOverrides::IsScaleFlag(const std::string& flag) {
     const std::string f = NormalizeFlag(flag);
     return f == "rows" || f == "columns" || f == "columns_per_attribute" ||
            f == "attributes" || f == "predicates" || f == "lambda" || f == "eps" ||
-           f == "seed" || f == "security_mode" || f == "security-mode";
+           f == "seed" || f == "security_mode" || f == "security-mode" ||
+           f == "enable_repeat_query_cache" || f == "repeat_query_cache" ||
+           f == "repeat-query-cache";
 }
 
 void MpraqScaleOverrides::Set(const std::string& flag, const std::string& value) {
@@ -507,6 +512,16 @@ void MpraqScaleOverrides::Set(const std::string& flag, const std::string& value)
         // 先严格解析（非法值立刻拒绝），再存字符串
         (void)ParseMpraqSecurityMode(value);
         security_mode = value;
+    } else if (f == "repeat_query_cache" || f == "repeat-query-cache") {
+        // **严格**布尔解析：只认 on/off/true/false/1/0。非法值立刻拒绝 ——
+        // 这个开关控制"重复查询是拒绝还是走缓存"，猜错方向会改变隐私语义。
+        if (value == "on" || value == "true" || value == "1") {
+            repeat_query_cache = "on";
+        } else if (value == "off" || value == "false" || value == "0") {
+            repeat_query_cache = "off";
+        } else {
+            BadConfig("--repeat-query-cache 只认 on|off（true/false/1/0 亦可），实际 = " + value);
+        }
     } else {
         BadConfig("旗标 --" + flag + " 不是规模旗标（规模旗标： " + FlagList() + "）");
     }
@@ -521,6 +536,7 @@ MpraqScaleConfig ApplyOverrides(MpraqScaleConfig base, const MpraqScaleOverrides
     if (ov.eps) base.eps = *ov.eps;
     if (ov.seed) base.seed = *ov.seed;
     if (ov.security_mode) base.security_mode = ParseMpraqSecurityMode(*ov.security_mode);
+    if (ov.repeat_query_cache) base.enable_repeat_query_cache = (*ov.repeat_query_cache == "on");
     return base;
 }
 
@@ -752,6 +768,8 @@ MpraqScaleSetup Build(const MpraqScaleConfig& config) {
     setup.init.seed = config.seed;
     // 档位随 `MpraqInitParams` 进入 `StoreParams`（服务端据此做一致性校验）
     setup.init.security_mode = config.security_mode;
+    // Plinko 的重复查询缓存开关（默认开；关掉 ⇒ 重复查询**直接拒绝**）
+    setup.init.enable_repeat_query_cache = config.enable_repeat_query_cache;
     return setup;
 }
 

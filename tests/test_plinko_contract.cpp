@@ -321,3 +321,57 @@ TEST(PlinkoContract, SameSeedGivesIdenticalStateAndQueries) {
         EXPECT_EQ(q1.groups[i], q2.groups[i]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// C11：**重复查询缓存的开关**（负责人要求）—— 关掉即拒绝，绝不重查同一索引
+// ---------------------------------------------------------------------------
+
+TEST(PlinkoContract, CacheSwitchOffRejectsRepeatQueries) {
+    // 开（默认）：重复查询照常服务（见 C6）。
+    {
+        Fixture f;
+        EXPECT_TRUE(f.p.enable_repeat_cache);
+        auto [q1, h1] = f.client.QueryGen(5);
+        (void)q1;
+        (void)f.client.ClientRecon(h1, PlinkoAnswer{PlinkoEntry(f.p.entry_words, 0),
+                                                    PlinkoEntry(f.p.entry_words, 0)});
+        auto [q2, h2] = f.client.QueryGen(5);      // 重复 ⇒ 走缓存分支，**不抛**
+        (void)q2; (void)h2;
+        EXPECT_TRUE(h2.cache_hit);
+        EXPECT_TRUE(h2.target != h2.requested);
+    }
+    // 关：同一情形**必须拒绝**，且异常类型是专属的
+    // `PlinkoRepeatedQueryRejected`（调用方要能把"被开关拒绝"与备份耗尽/覆盖失败区分开）。
+    {
+        Fixture f;
+        f.p.enable_repeat_cache = false;
+        // ⚠️ 光改 `p` 不够：`PlinkoClient` 在构造时就把参数拷走了 ⇒ 必须重建客户端。
+        PlinkoClient c(f.p, 7);
+        c.HintInit(f.plain);
+        auto [q1, h1] = c.QueryGen(5);
+        (void)q1;
+        (void)c.ClientRecon(h1, PlinkoAnswer{PlinkoEntry(f.p.entry_words, 0),
+                                             PlinkoEntry(f.p.entry_words, 0)});
+        // 已答复过的索引再次 QueryGen ⇒ 拒绝
+        EXPECT_THROW(c.QueryGen(5), PlinkoRepeatedQueryRejected);
+        // 而**未答复过**的索引仍然正常工作（开关只影响"重复"，不是把功能关掉）
+        auto [q3, h3] = c.QueryGen(6);
+        (void)q3;
+        EXPECT_EQ(h3.target, 6u);
+        EXPECT_FALSE(h3.cache_hit);
+
+        // ⚠️ 关掉缓存**不是静默降级**：它让行为**更严格**（拒绝而非重查）——
+        //    这正是负责人选 C 的理由：宁可报错，也不让服务器看到重复索引。
+        //    若将来有人把它改成"重查同一索引"，本断言会失败：
+        bool threw = false;
+        try { (void)c.QueryGen(5); } catch (const PlinkoRepeatedQueryRejected&) { threw = true; }
+        EXPECT_TRUE(threw);
+        // 缓存值数组在关闭时**不分配**（省 m·entry_words·16 字节）
+        EXPECT_TRUE(c.cache_value_bytes() == 0);
+    }
+    // 开着的实例：缓存值数组**必须**分配
+    {
+        Fixture f;
+        EXPECT_TRUE(f.client.cache_value_bytes() > 0);
+    }
+}

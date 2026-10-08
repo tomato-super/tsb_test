@@ -141,6 +141,17 @@ struct MpraqInitParams {
     //    落地机制（按档位跳过 xmac / SPDZ MAC / §4.5-A/B / 逐记录校验）见
     //    `src/mpraq/security_mode.hpp` 的文件头。
     MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;
+
+    // ---------- Plinko 的"重复查询缓存"开关（负责人的要求）----------
+    // **true（默认）**：重复查询另挑一个**从未查过**的索引做 PIR，返回缓存里的值
+    //   ⇒ 服务器看到的索引序列永不重复（论文 Fig 7 的行为）。
+    // **false**：重复查询**直接拒绝**（抛 `PlinkoRepeatedQueryRejected`）。
+    //   ⚠️ **绝不**退化成"对同一索引再查一次"—— 那会让访问模式可关联，是**静默的
+    //      隐私降级**。所以这个开关**只让行为更严格**，不会悄悄变弱。
+    //   ⚠️ 关掉后**要求上层不对同一列重复查询**：当前 MPRAQ 的 `RunBatch` **不做**
+    //      跨查询去重 ⇒ 同一列出现在两个谓词里会**报错**（如实行为，非缺陷）。
+    //   ⚠️ 顺带省下 `m · entry_words · 16` 字节（该档不保存明文缓存值）。
+    bool enable_repeat_query_cache = true;
 };
 
 // 各阶段的实测耗时（毫秒；供验收报告与基准使用，**不是**估算）
@@ -350,6 +361,11 @@ public:
     //      有了这个入口，测试可以直接构造 `(R_b, M_b)` 并断言判定结果。
     // 半诚实档（`has_tags()` 为假）下本方法**直接拒绝**：该档根本不该走到校验路径。
     void VerifyXmacOrThrow(const PlinkoAnswer& merged, uint8_t b) const;
+    // Plinko 的重复查询缓存是否开启（账目/测试用；关掉后重复查询会被**拒绝**）
+    bool pir_query_cache_enabled() const {
+        return store_.plinko.enable_repeat_cache;
+    }
+
     const std::vector<uint128_t>& tag_share(int server) const {
         return server == 0 ? tag_share0_ : tag_share1_;
     }

@@ -409,7 +409,8 @@ std::unique_ptr<MpraqClient> MpraqClient::Init(const Schema& schema,
     client->store_.m = g.m;
     client->store_.plinko = g.plinko;
     client->store_.security_mode = params.security_mode;
-    client->store_.security_mode = params.security_mode;
+    // Plinko 的重复查询缓存开关（默认开；关掉 ⇒ 重复查询**直接拒绝**，见 init.hpp）
+    client->store_.plinko.enable_repeat_cache = params.enable_repeat_query_cache;
     client->store_.attrs.clear();
     for (const AttributeSchema& a : schema.attributes()) {
         client->store_.attrs.push_back(
@@ -483,6 +484,9 @@ std::unique_ptr<MpraqClient> MpraqClient::InitWithChannels(
     client->store_.m = g.m;
     client->store_.plinko = g.plinko;
     client->store_.security_mode = params.security_mode;
+    // 与 `Init` 同一纪律：**两条初始化路径都必须透传这个开关**（漏掉一处会让
+    // "配置说关、实际开着"这种不一致悄悄发生）。
+    client->store_.plinko.enable_repeat_cache = params.enable_repeat_query_cache;
     client->store_.attrs.clear();
     for (const AttributeSchema& a : schema.attributes()) {
         client->store_.attrs.push_back(

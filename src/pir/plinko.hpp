@@ -142,6 +142,14 @@ public:
 };
 
 // Verify 的占位语义：本层**没有**验证算法（PLINKO_SPEC §3.6）。
+// 缓存关闭（`PlinkoParams::enable_repeat_cache == false`）时，对**已答复过**的索引再次
+// `QueryGen` ⇒ 抛本异常。**故意不复用别的异常**：调用方需要能把"被缓存开关拒绝"与
+// "备份耗尽""覆盖失败""索引池耗尽"区分开。
+class PlinkoRepeatedQueryRejected : public std::runtime_error {
+public:
+    explicit PlinkoRepeatedQueryRejected(const std::string& what) : std::runtime_error(what) {}
+};
+
 class PlinkoVerificationUnsupported : public std::logic_error {
 public:
     explicit PlinkoVerificationUnsupported(const std::string& what) : std::logic_error(what) {}
@@ -157,6 +165,20 @@ struct PlinkoParams {
     uint64_t w = 0;              // 区块大小（w 个连续**条目**一块）：**必须是 2 的幂**（D21）
     uint32_t lambda = 80;        // 安全参数
     double prp_epsilon = 1e-10;  // iPRF 的 PRP 目标 ε（D22-1：默认 1e-10；测试可调小）
+
+    // ---- 重复查询缓存 `Q` 的开关（论文 Fig 7 的 `Query`）----
+    // **开（默认）**：重复查询另挑一个**从未查过**的索引做 PIR，返回缓存里的值。
+    //   服务器看到的索引序列**永不重复** ⇒ 访问模式不可关联。
+    // **关**：重复查询**直接拒绝**（抛 `PlinkoRepeatedQueryRejected`）——
+    //   绝不退化成"对同一索引再查一次"（那会让服务器看到重复索引 ⇒ 访问模式可关联，
+    //   是**静默的隐私降级**，正是本仓库最忌讳的失败模式）。
+    //
+    // ⚠️ 关掉它**不会**延长查询额度：每条查询仍消耗 1 条备份 hint（`N_T` 上限不变），
+    //   它只是把"能否用旧答案顶替"这件事从"能"改成"明确报错"。
+    // ⚠️ 关掉它要求**上层自己保证不对同一列重复查询**（见 `MPRAQ_IMPL` §4b）：
+    //   同一列被查两次时，第二次会**失败**。当前 MPRAQ 的 `RunBatch` 不做跨查询去重
+    //   ⇒ 关掉后"同一列出现在两个谓词里"的查询会直接报错（这是**如实**的行为）。
+    bool enable_repeat_cache = true;
 
     // 按 §1 的默认口径派生：w = 2^⌈log₂√m⌉、λw 条主 hint、N_T = λw/2 条备份。
     // ⚠️ 要求 `m = κ·w` 且 κ 为偶数；不满足时抛 std::invalid_argument 并给出"应补齐到多少"。
@@ -494,6 +516,11 @@ public:
 
     // 重复查询缓存 Q
     bool cached(uint64_t index) const;
+    // 缓存**明文值数组**占用的字节数（诊断/测试用）。
+    // ⚠️ `enable_repeat_cache == false` 时**恒为 0**：该档永不从缓存取值，
+    //    因此根本不分配 —— 省下 `m · entry_words · 16` 字节。
+    //    但 `cached()` 仍然有效（"已答复过"的标记是**正确性**所需，不随开关消失）。
+    size_t cache_value_bytes() const;
     PlinkoEntry cached_value(uint64_t index) const;
     size_t cached_slot(uint64_t index) const;
     uint64_t answered_count() const { return answered_; }

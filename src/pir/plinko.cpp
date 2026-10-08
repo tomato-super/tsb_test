@@ -164,7 +164,17 @@ PlinkoClient::PlinkoClient(const PlinkoParams& params,
     subset_words_ = BitmapWordsFor(p_.blocks());
     slots_.assign(static_cast<size_t>(p_.hint_slots()), PlinkoHintSlot{});
     subsets_.assign(static_cast<size_t>(p_.hint_slots()) * subset_words_, 0);
-    cache_value_.assign(static_cast<size_t>(p_.m), PlinkoEntry(static_cast<size_t>(p_.entry_words), 0));
+    // ⚠️ 缓存关闭（`enable_repeat_cache == false`）时**不分配明文值数组**：该档永不
+    //    从缓存取值（重复查询直接拒绝），存了也没人读 —— 省下
+    //    `m · entry_words · 16` 字节。`cache_valid_`/`cache_slot_` **仍要分配**：
+    //    前者用于"已答复过 ⇒ 拒绝"，后者是**正确性**所需（被提升的 hint 不得作为
+    //    该索引自己的候选，论文 §5.2）—— 两者都不是"缓存"，不随开关消失。
+    if (p_.enable_repeat_cache) {
+        cache_value_.assign(static_cast<size_t>(p_.m),
+                            PlinkoEntry(static_cast<size_t>(p_.entry_words), 0));
+    } else {
+        cache_value_.clear();
+    }
     cache_valid_.assign(static_cast<size_t>(p_.m), 0);
     cache_slot_.assign(static_cast<size_t>(p_.m), kPlinkoNoSlot);
     next_backup_ = static_cast<size_t>(p_.main_hints());
@@ -210,7 +220,7 @@ void PlinkoClient::InitializeHintTables() {
         RandomSubset(static_cast<size_t>(j), p_.backup_hint_blocks());
     }
     std::fill(cache_valid_.begin(), cache_valid_.end(), 0);  // 离线完成 ⇒ Q 清空（论文 Fig 7）
-    for (PlinkoEntry& v : cache_value_) v.assign(static_cast<size_t>(p_.entry_words), 0);
+    for (PlinkoEntry& v : cache_value_) v.assign(static_cast<size_t>(p_.entry_words), 0);  // 空容器时是 no-op
     std::fill(cache_slot_.begin(), cache_slot_.end(), kPlinkoNoSlot);
     answered_ = 0;
     next_backup_ = static_cast<size_t>(lw);
@@ -564,6 +574,16 @@ std::pair<PlinkoQuery, PlinkoQueryHandle> PlinkoClient::QueryGen(uint64_t index)
     //    这样服务器看到的索引序列仍然是"全新"的，而调用方拿到的是缓存里的值。
     const uint64_t requested = index;
     uint64_t target = index;
+    // ⚠️ **缓存关闭**：已答复过的索引 ⇒ **直接拒绝**（C 语义）。
+    //    绝不"对同一索引再查一次"：那会让服务器看到重复索引 ⇒ 访问模式可关联，
+    //    是**静默的隐私降级**。调用方应当重跑离线阶段，或改用开缓存的档位。
+    if (!p_.enable_repeat_cache && cached(requested)) {
+        throw PlinkoRepeatedQueryRejected(
+            "PlinkoClient::QueryGen: 索引 " + Num(requested) +
+            " 已答复过，而**重复查询缓存已关闭**（PlinkoParams::enable_repeat_cache = false）"
+            "—— 拒绝服务。绝不退化成『对同一索引再查一次』（那会让访问模式可关联）。"
+            "上层应保证不对同一列重复查询，或改用开启缓存的配置。");
+    }
     if (cached(target)) {
         if (answered_ >= p_.m) {
             throw std::runtime_error(
@@ -717,8 +737,12 @@ PlinkoEntry PlinkoClient::ClientRecon(PlinkoQueryHandle& h, const PlinkoAnswer& 
     h.promotion_eta = t.eta;
 
     // ④ Q[i] ← (a, j')：被提升的 hint 不会作为 x 自己的候选出现（论文 §5.2），
-    //    因此已答复的索引必须留在缓存里。
-    cache_value_[static_cast<size_t>(h.target)] = a;
+    //    因此**已答复的标记必须留下**（无论缓存开关如何 —— 它管的是正确性，不是缓存）。
+    //    ⚠️ 缓存关闭时**不保存明文值**（`cache_value_` 保持空）：该档永不从缓存取值，
+    //       存了也没人读，白占 `m · entry_words · 16` 字节。开关同样不影响 `cache_slot_`。
+    if (cache_value_.size() == cache_valid_.size()) {
+        cache_value_[static_cast<size_t>(h.target)] = a;
+    }
     cache_valid_[static_cast<size_t>(h.target)] = 1;
     cache_slot_[static_cast<size_t>(h.target)] = jp;
     ++answered_;
@@ -821,6 +845,12 @@ const Iprf& PlinkoClient::block_iprf(uint64_t block) const {
 
 bool PlinkoClient::cached(uint64_t index) const {
     return index < p_.m && cache_valid_[static_cast<size_t>(index)] != 0;
+}
+
+size_t PlinkoClient::cache_value_bytes() const {
+    size_t total = 0;
+    for (const PlinkoEntry& e : cache_value_) total += e.size() * sizeof(uint128_t);
+    return total;
 }
 
 PlinkoEntry PlinkoClient::cached_value(uint64_t index) const {
