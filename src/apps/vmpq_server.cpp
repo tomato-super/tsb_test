@@ -10,6 +10,7 @@
 //    部署到真实环境前必须补上 TLS 与身份认证。
 
 #include "core/config.hpp"
+#include "net/grpc_limits.hpp"
 #include "net/grpc_vmpq.hpp"
 
 #include <grpcpp/grpcpp.h>
@@ -44,6 +45,10 @@ int main(int argc, char** argv) {
         tsb::VmpqServiceImpl service(node);
 
         grpc::ServerBuilder builder;
+        // ⚠️ 与客户端**成对**放宽收包上限（默认 4 MiB）。客户端的大上传
+        //    （`UploadEntries` 的整列分块）与客户端侧的大应答是两个方向，
+        //    任一侧漏设都会在某个 N 上失败。见 `net/grpc_transport.hpp` 的说明。
+        builder.SetMaxReceiveMessageSize(kGrpcClientMaxReceiveBytes);
         builder.AddListeningPort(address, grpc::InsecureServerCredentials());
         builder.RegisterService(&service);
         std::unique_ptr<grpc::Server> server = builder.BuildAndStart();

@@ -17,6 +17,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "net/grpc_limits.hpp"   // 收包上限常量（零依赖，不含任何 proto）
 #include "vmpq.grpc.pb.h"
 #include "vmpq/node.hpp"
 
@@ -58,6 +59,11 @@ private:
 
 class GrpcChannel : public IVmpqChannel {
 public:
+    // 本通道**显式设置**的收包上限（账目/测试用；= `kGrpcClientMaxReceiveBytes`）。
+    // ⚠️ 它曾经**漏设**（走 gRPC 默认 4 MiB）⇒ D38 之后 `N >= 2^17` 的一列应答会被拒。
+    //    见 `net/grpc_limits.hpp`。
+    static constexpr int max_receive_bytes() { return kGrpcClientMaxReceiveBytes; }
+
     // target 形如 "localhost:50051"
     explicit GrpcChannel(const std::string& target);
 

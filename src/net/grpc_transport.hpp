@@ -58,31 +58,7 @@ class RelayEndpointService;
 // `test_mpraq_securemul.cpp` 的篡改用例原样搬到真实 gRPC 链路上。
 using TransportTamperHook = std::function<void(int server_id, Payload& response)>;
 
-// ---------------------------------------------------------------------------
-// 客户端 **收包上限**（`MPA-09` 任务 B）：这是"**能不能跑大规模**"的硬天花板
-// ---------------------------------------------------------------------------
-//
-// gRPC 的默认 `max_receive_message_length` 只有 **4 MiB**（发送侧默认无上限）。
-// MPRAQ 的 SecureMul 走**通用 `Relay`**，一次查询的两类**应答帧**都随 N 线性增长：
-//   * Phase1 应答 = `13 + 6 + 43·N` 字节；
-//   * Phase2 应答 = `13 + 6 + 58·N` 字节。
-// ⇒ 客户端若用默认值，`N > 72 315` 时**第 1 轮**就会失败：
-//     `CLIENT: Received message larger than max (5636122 vs. 4194304)`
-//   （`MPA-09` 在 `N = 2^17` 上实测到；`N = 2^16` 的 3.80 MB 恰好还在 4 MiB 内 ⇒ 侥幸能跑）。
-//
-// 🔴 纪律：**服务器侧与客户端侧必须成对设置**，否则大帧会在**收包方**被拒绝 ——
-//    * 服务器进程侧：`mpraq_server.cpp` / `test_mpraq_e2e.cpp` 的夹具已设 **256 MiB**；
-//    * 客户端侧（本常量）：`GrpcTransportClient` 与 `GrpcMpraqChannel` 都显式设置。
-//    任一侧漏设 ⇒ 大帧失败；**且失败是 fail-loudly 的**（gRPC 返回可读的
-//    `RESOURCE_EXHAUSTED: Received message larger than max (X vs. Y)`，
-//    经 `Response::Err` 冒到上层 ⇒ `SecureMulBatchAbort`，**绝不静默截断**）。
-//
-// ⚠️ 本常量只放宽**收包**上限；发送侧保持 gRPC 的默认（无限），因此不会给
-//    "离线安装帧"（`2×(13+152·N)`）引入新的上限。
-inline constexpr int kGrpcClientMaxReceiveBytes = 256 * 1024 * 1024;
-// 默认 4 MiB 是 gRPC 的既有取值：这里断言我们**确实放宽了**（防止有人改小/删掉）
-static_assert(kGrpcClientMaxReceiveBytes >= 4 * 1024 * 1024,
-              "客户端收包上限必须 >= gRPC 默认的 4 MiB");
+#include "net/grpc_limits.hpp"
 
 // ---------------------------------------------------------------------------
 // 客户端侧：ITransportClient

@@ -1,3 +1,4 @@
+#include "net/grpc_limits.hpp"
 #include "net/grpc_vmpq.hpp"
 
 #include <cstring>
@@ -137,7 +138,18 @@ grpc::Status VmpqServiceImpl::PirQuery(grpc::ServerContext*,
 // ---------------------------------------------------------------------------
 
 GrpcChannel::GrpcChannel(const std::string& target) {
-    channel_ = grpc::CreateChannel(target, grpc::InsecureChannelCredentials());
+    // ⚠️ **必须显式放宽收包上限**（`kGrpcClientMaxReceiveBytes`，见
+    //    `net/grpc_transport.hpp` 的说明）。gRPC 默认只有 **4 MiB**，而 D38 之后
+    //    **一列查询的应答就是 `2·N·16` 字节**（两台服务器各一份整列）：
+    //        N = 2^17  ⇒ 2·131072·16 = 4 194 304 B = **恰好 4 MiB** ⇒ 越界
+    //    此前这里用的是无参 `CreateChannel`（走默认 4 MiB），因此 **N >= 2^17 会断**。
+    //    失败是 fail-loudly 的（`RESOURCE_EXHAUSTED: Received message larger than max`），
+    //    绝不静默截断 —— 但功能上就是不可用。
+    // ⚠️ 两侧**必须成对设置**：本函数管"客户端收服务器的大应答"，
+    //    `vmpq_server` 管"服务器收客户端的大上传"。
+    grpc::ChannelArguments args;
+    args.SetMaxReceiveMessageSize(kGrpcClientMaxReceiveBytes);
+    channel_ = grpc::CreateCustomChannel(target, grpc::InsecureChannelCredentials(), args);
     stub_ = vmpq::VmpqService::NewStub(channel_);
 }
 
