@@ -1,12 +1,7 @@
 #include "pir/voo_pir.hpp"
 
-#include "core/hash.hpp"
-#include "core/mset_hash.hpp"
-#include "shared/verify.hpp"
-
 #include <algorithm>
 #include <cmath>
-#include <memory>
 
 namespace tsb {
 
@@ -21,6 +16,28 @@ uint32_t Log2Exact(uint64_t v) {
     uint32_t r = 0;
     while ((static_cast<uint64_t>(1) << r) < v) ++r;
     return r;
+}
+
+// ---- 逐分量向量运算（决策 D38）----
+//
+// 条目是 entry_words 个 128 位分量，群运算必须在**同一分量下标**上进行。
+// `missing` 的一方按 0 补齐（例如"第二台服务器的全零应答" VooPirAnswer{}）。
+
+// 长度以 `words` 为准；short 中缺的分量按 0 处理
+inline uint128_t WordAt(const std::vector<uint128_t>& v, uint64_t j) {
+    return j < v.size() ? v[j] : 0;
+}
+
+// below/above 各自累加 db[idx] 的全部分量
+inline void AddEntryInto(std::vector<uint128_t>& acc, const PirEntry& entry,
+                         uint64_t words, const char* what) {
+    if (entry.size() < words) {
+        throw std::invalid_argument(std::string(what) +
+                                    ": 条目的分量数少于 entry_words");
+    }
+    for (uint64_t j = 0; j < words; ++j) {
+        acc[j] = add(acc[j], entry[j]);
+    }
 }
 
 }  // namespace
@@ -79,6 +96,10 @@ void VooPirParams::Validate() const {
     }
     if (lambda == 0) {
         throw std::invalid_argument("VooPirParams: lambda 必须 > 0");
+    }
+    // 决策 D38：每个条目至少要有一个 128 位分量
+    if (entry_words == 0) {
+        throw std::invalid_argument("VooPirParams: entry_words 必须 >= 1");
     }
 }
 
@@ -193,24 +214,16 @@ VooPirClient::VooPirClient(const VooPirParams& params, const AesPrf& prf)
     params_.Validate();
 }
 
-VooPirClient::VooPirClient(const VooPirParams& params, const AesPrf& prf,
-                           const std::vector<uint8_t>& mac_key)
-    : params_(params), prf_(prf), mac_key_(mac_key) {
-    params_.Validate();
-    if (mac_key_.empty()) {
-        throw std::invalid_argument(
-            "VooPirClient: 传入 mac_key 时不能为空（省略该参数即表示不启用证明）");
-    }
-}
-
 uint16_t VooPirClient::NextDummyOffset() {
     return prf_.NextDummyOffset(dummy_counter_++, params_.part_size);
 }
 
-void VooPirClient::HintInit(const std::vector<uint128_t>& db) {
+void VooPirClient::HintInit(const PirDatabase& db) {
     if (db.size() < params_.n) {
         throw std::invalid_argument("VooPirClient::HintInit: 数据库长度不足 n");
     }
+    // 决策 D38：条目是 entry_words 个 128 位分量
+    const uint64_t words = params_.entry_words;
 
     // ⚠️ M = λ·√n 是**可用** hint 的数量，不是尝试次数。
     //
@@ -220,30 +233,17 @@ void VooPirClient::HintInit(const std::vector<uint128_t>& db) {
     // 因此这里**持续生成直到攒够 M 条有效 hint**，保证 λ 的语义。
     const uint64_t m_target = params_.num_hints();
     hints_.clear();
-    proofs_.clear();
     consumed_.clear();
     hints_.reserve(static_cast<size_t>(m_target));
-    proofs_.reserve(static_cast<size_t>(m_target));
 
     // ⚠️ 必须置为非零：select_cutoff == 0 是本实现中"无效 hint"的哨兵，
     // 否则一个 cutoff 恰为 0 的有效 hint 会被误判为无效。
     next_hint_id_ = 1;
 
-    // ⚠️ 半诚实版本不计算任何证明：hint 的 parity 已足够重建明文，
-    // 而 F_j（每个 hint 覆盖集合的标签 XOR）在半诚实模型下毫无用处，
-    // 却要按 hint 数 × 每 hint 覆盖项数做 HMAC，代价很高。
-    //
-    // 论文把 Mset-XOR-Hash 用在这里本身也有问题：客户端并不持有服务器的
-    // 共享，无法对共享数据预计算标签；而 HMAC 不是线性的，
-    // C_0 ⊕ C_1 ≠ C(明文)，验证等式在共享域上并不成立。
-    const bool with_proofs = verification_enabled();
-    std::unique_ptr<PIRVerifier> verifier;
-    std::string tag_domain;
-    if (with_proofs) {
-        verifier = std::make_unique<PIRVerifier>(mac_key_);
-        // 用与 hint 相同的域计算标签（验证时客户端与服务器必须一致）
-        tag_domain = std::string(domain::kRecord) + "/hint";
-    }
+    // ⚠️ **没有证明层**（决策 D39）：VMPQ 只做半诚实。论文把 Mset-XOR-Hash 用在这里
+    // 本身不成立 —— 客户端并不持有服务器的共享，无法对共享数据预计算标签；而 HMAC
+    // 不是线性的，`C_0 ⊕ C_1 ≠ C(明文)` ⇒ 验证等式在共享域上不闭合（决策 D16、
+    // `doc/design/mparq_review/REPORT.md`）。恶意模型由 MPRAQ 那条线承担。
 
     uint64_t attempts = 0;
     const uint64_t kMaxAttempts = m_target * 16 + 1024;
@@ -301,42 +301,33 @@ void VooPirClient::HintInit(const std::vector<uint128_t>& db) {
         if (h.select_cutoff != 0) {
             // ⚠️ extra 项**要**计入 parity。官方 generateOfflineHints
             // （server.cpp:109）在循环开始前就把 ExtraPart/ExtraOffset 处的
-            // 条目 XOR 进了 parity，随后才累加真实半区的各项。
+            // 条目累加进了 parity，随后才累加真实半区的各项。
             //
             // 原因：查询时 extra 所在的槽位 (ePart, eOffset) 属于真实组
             // （bvec[ePart] = b_indicator），因此它同时出现在 parity 与应答
-            // 子集里，会在 ⊕ 中相消 —— 相消正是我们需要的：
-            //     P_h ⊕ acc_true = DB[x]
+            // 子集里，会在群运算中相消 —— 相消正是我们需要的（决策 D37：
+            // 群是 Z_{2^128} 加法）：
+            //     sub(P_h, acc_true) = DB[x]
             const uint64_t eidx =
                 static_cast<uint64_t>(h.extra_part) * params_.part_size +
                 h.extra_offset;
-            uint128_t parity = db[eidx];
-            std::vector<MacTag> tags;
-            if (with_proofs) {
-                tags.push_back(verifier->ItemTag(tag_domain, eidx, db[eidx]));
-            }
+            // 决策 D38：parity 是逐分量的和（标量条目时长度为 1）
+            std::vector<uint128_t> parity(static_cast<size_t>(words), 0);
+            AddEntryInto(parity, db[eidx], words, "VooPirClient::HintInit");
 
             for (uint32_t k = 0; k < params_.part_num; ++k) {
                 if ((sel[k] < h.select_cutoff) != h.indicator) continue;
                 const uint32_t off = HintOffset(params_, prf_, h, k);
                 const uint64_t idx =
                     static_cast<uint64_t>(k) * params_.part_size + off;
-                parity = static_cast<uint128_t>(parity ^ db[idx]);
-                if (with_proofs) {
-                    tags.push_back(verifier->ItemTag(tag_domain, idx, db[idx]));
-                }
+                // D37：Z_{2^128} 加法（原为 ⊕）；D38：逐分量
+                AddEntryInto(parity, db[idx], words, "VooPirClient::HintInit");
             }
-            h.parity = parity;
-            if (with_proofs) {
-                proofs_.push_back(MSetXorHash::Combine(MacTag{}, tags));
-            }
+            h.parity = std::move(parity);
         }
 
         if (h.select_cutoff == 0) {
             // 无效 hint：丢弃（其 hint_id 已被消耗，保证 PRF 输入不重复）
-            if (with_proofs && proofs_.size() > hints_.size()) {
-                proofs_.pop_back();
-            }
             continue;
         }
         hints_.push_back(h);
@@ -524,17 +515,33 @@ VooPirQuery VooPirClient::Query(uint64_t index) {
 VooPirClient::Reconstructed VooPirClient::Reconstruct(const VooPirQuery& q,
                                                       const VooPirAnswer& a0,
                                                       const VooPirAnswer& a1) {
-    // 服务器各自计算两个累加器；客户端把两服务器的对应累加器 XOR 起来，
-    // 得到"按组"聚合后的共享重建值。
-    const uint128_t acc0 = static_cast<uint128_t>(a0.acc0 ^ a1.acc0);
-    const uint128_t acc1 = static_cast<uint128_t>(a0.acc1 ^ a1.acc1);
-    const uint128_t selected = q.take_accumulator_1 ? acc1 : acc0;
+    // 服务器各自计算两个累加器；客户端把两服务器的对应累加器**逐分量相加**
+    // （Z_{2^128} 加法，决策 D37/D38；两个加法共享之和 = 明文之和），
+    // 得到"按组"聚合后的重建值。
+    const uint64_t words = params_.entry_words;
+    if (q.hint_parity.size() != words) {
+        throw std::invalid_argument(
+            "VooPirClient::Reconstruct: q.hint_parity 的长度必须等于 entry_words");
+    }
+    std::vector<uint128_t> acc0(static_cast<size_t>(words), 0);
+    std::vector<uint128_t> acc1(static_cast<size_t>(words), 0);
+    for (uint64_t j = 0; j < words; ++j) {
+        acc0[j] = add(WordAt(a0.acc0, j), WordAt(a1.acc0, j));
+        acc1[j] = add(WordAt(a0.acc1, j), WordAt(a1.acc1, j));
+    }
+    const std::vector<uint128_t>& selected =
+        q.take_accumulator_1 ? acc1 : acc0;
 
-    // P_h ⊕ acc_true 已经等于 DB[x]：hint 覆盖集合与应答子集的交集在 ⊕ 中
-    // 全部抵消，剩下的正是目标项本身。q.filler_index 记录的是**验证**所需的
-    // 填充项（每轮各不相同），不参与重建。
+    // sub(P_h, acc_true) 已经等于 DB[x]：hint 覆盖集合与应答子集的**对称差**
+    // 恰为 {x}，两集合的公共部分在群运算中全部抵消，剩下的正是目标项本身。
+    // ⚠️ 方向固定为 `parity − acc`，反向恒错（实测见
+    // `doc/design/vmpq_parity_alignment.md` §5）。q.filler_index 记录的是
+    // **验证**所需的填充项（每轮各不相同），不参与重建。
     Reconstructed r;
-    r.value = static_cast<uint128_t>(selected ^ q.hint_parity);
+    r.value.resize(static_cast<size_t>(words));
+    for (uint64_t j = 0; j < words; ++j) {
+        r.value[j] = sub(q.hint_parity[j], selected[j]);
+    }
     r.filler_value = 0;
     return r;
 }
@@ -544,15 +551,19 @@ VooPirClient::Reconstructed VooPirClient::Reconstruct(const VooPirQuery& q,
 // ---------------------------------------------------------------------------
 
 VooPirClient::RefreshMaterial VooPirClient::GenerateRefreshMaterial(
-    const std::vector<uint128_t>& db, uint64_t target_index) {
+    const PirDatabase& db, uint64_t target_index) {
     // 对齐官方 server.cpp:41-77 `replenishHint`：
     //   * 计算新 hint 的 cutoff
-    //   * result[0] = ⊕{ PRF 偏移项 : sel[k] <  c }   （below 半区）
-    //   * result[1] = ⊕{ PRF 偏移项 : sel[k] >= c }   （above 半区）
+    //   * result[0] = Σ{ PRF 偏移项 : sel[k] <  c }   （below 半区）
+    //   * result[1] = Σ{ PRF 偏移项 : sel[k] >= c }   （above 半区）
     //   * **不含** extra 项；**不跳过**任何分区（包括目标分区 ℓ）
-    // 客户端随后取"不含 ℓ 的那一半"，再 XOR 上 DB[x] 即得新 parity。
+    // 客户端随后取"不含 ℓ 的那一半"，再**加上** DB[x] 即得新 parity。
+    // ⚠️ 决策 D37：群是 Z_{2^128} 加法（原实现为 ⊕）；D38：逐分量。
+    const uint64_t words = params_.entry_words;
     RefreshMaterial m;
     m.hint_id = next_hint_id_++;
+    m.parity_below.assign(static_cast<size_t>(words), 0);
+    m.parity_above.assign(static_cast<size_t>(words), 0);
     (void)target_index;  // 官方实现里 ℓ 只用于客户端选择半区
 
     std::vector<uint32_t> sel(params_.part_num);
@@ -565,18 +576,14 @@ VooPirClient::RefreshMaterial VooPirClient::GenerateRefreshMaterial(
     }
 
     const VooPirHint tmp{m.hint_id, m.select_cutoff};
-    uint128_t parity_below = 0, parity_above = 0;
     for (uint32_t k = 0; k < params_.part_num; ++k) {
         const uint32_t off = HintOffset(params_, prf_, tmp, k);
         const uint64_t idx = static_cast<uint64_t>(k) * params_.part_size + off;
-        if (sel[k] < m.select_cutoff) {
-            parity_below = static_cast<uint128_t>(parity_below ^ db[idx]);
-        } else {
-            parity_above = static_cast<uint128_t>(parity_above ^ db[idx]);
-        }
+        std::vector<uint128_t>& half =
+            (sel[k] < m.select_cutoff) ? m.parity_below : m.parity_above;
+        AddEntryInto(half, db[idx], words,
+                     "VooPirClient::GenerateRefreshMaterial");
     }
-    m.parity_below = parity_below;
-    m.parity_above = parity_above;
 
     // extra：必须落在"新 hint 真实集合"之外。新 hint 的真实集合是
     // "不含 ℓ 的那一半"，故 extra 必须落在**含 ℓ 的那一半**，
@@ -588,12 +595,22 @@ VooPirClient::RefreshMaterial VooPirClient::GenerateRefreshMaterial(
 
 void VooPirClient::Refresh(size_t hint_slot, const VooPirQuery& q,
                            const RefreshMaterial& material,
-                           uint128_t reconstructed_value) {
+                           const std::vector<uint128_t>& reconstructed_value) {
     if (hint_slot >= hints_.size()) {
         throw std::out_of_range("VooPirClient::Refresh: 槽位越界");
     }
     if (material.select_cutoff == 0) {
         throw std::invalid_argument("VooPirClient::Refresh: 补充材料无效");
+    }
+    const uint64_t words = params_.entry_words;
+    if (material.parity_below.size() != words ||
+        material.parity_above.size() != words) {
+        throw std::invalid_argument(
+            "VooPirClient::Refresh: 补充材料的 parity 分量数必须等于 entry_words");
+    }
+    if (reconstructed_value.size() != words) {
+        throw std::invalid_argument(
+            "VooPirClient::Refresh: 重建值的分量数必须等于 entry_words");
     }
 
     const auto [ell, off] = Locate(params_, q.target_index);
@@ -604,7 +621,7 @@ void VooPirClient::Refresh(size_t hint_slot, const VooPirQuery& q,
 
     // 对齐官方 client.cpp:194-201：
     //   b_indicator = !(PRF4Select(J', ℓ) < c_J')
-    //   Parity       = hint_parities[b_indicator] ^ result
+    //   Parity       = hint_parities[b_indicator] + result   （D37：加法，原为 ⊕）
     // 即：新 hint 的真实集合是**不含 ℓ** 的那一半，再把目标项换进来。
     // 这样查询 ℓ 时，case B 会用 extra=(ℓ,off) 把 ℓ 处补上，
     // 而真实集合的其余部分的 PRF 项与 parity 一一对应。
@@ -615,29 +632,22 @@ void VooPirClient::Refresh(size_t hint_slot, const VooPirQuery& q,
 
     // 真实半区 = !below 的那一半 ⇒ 取"相反半区"的 parity
     // （below 为真时真实集合是 above 半区，其 parity 为 material.parity_above）
-    const uint128_t base =
+    const std::vector<uint128_t>& base =
         below ? material.parity_above : material.parity_below;
-    h.parity = static_cast<uint128_t>(base ^ reconstructed_value);
+    // D37：Z_{2^128} 加法；D38：逐分量（原为 ⊕）
+    h.parity.resize(static_cast<size_t>(words));
+    for (uint64_t j = 0; j < words; ++j) {
+        h.parity[j] = add(base[j], reconstructed_value[j]);
+    }
 
     // extra 指向目标项自身：新 hint 通过 case A 提供该索引
     h.extra_part = ell;
     h.extra_offset = off;
 
-    hints_[hint_slot] = h;
+    hints_[hint_slot] = std::move(h);
     // 槽位已被全新的 hint 替换 ⇒ 重新可用（决策 D17）
     if (hint_slot < consumed_.size()) consumed_[hint_slot] = 0;
-    // 半诚实版本不维护证明；启用证明时这里需要服务器侧标签输入（尚未实现）
-}
-
-const MacTag& VooPirClient::proof(size_t hint_slot) const {
-    if (!verification_enabled()) {
-        throw std::logic_error(
-            "VooPirClient::proof: 半诚实构建未启用证明（构造时未提供 mac_key）");
-    }
-    if (hint_slot >= proofs_.size()) {
-        throw std::out_of_range("VooPirClient::proof: 槽位越界");
-    }
-    return proofs_[hint_slot];
+    // VMPQ 无验证层（决策 D39）：不存在需要维护的证明
 }
 
 }  // namespace tsb

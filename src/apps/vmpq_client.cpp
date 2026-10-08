@@ -2,7 +2,7 @@
 //
 // 用法：./vmpq_client <config.json> [--rows N]
 //
-// 流程：连接两台服务器 → 生成合成时序数据 → Init（编码+XOR 共享+上传+离线 hint）
+// 流程：连接两台服务器 → 生成合成时序数据 → Init（编码+加法共享+上传+离线 hint）
 //       → 执行若干聚合查询 → 与本地明文基准对照
 //
 // ⚠️ 半诚实版本（决策 D16）：不做任何 proof/验证；服务器默认不篡改应答。
@@ -105,16 +105,17 @@ int main(int argc, char** argv) {
         params.lambda = cfg.params.lambda;
         params.Validate();
 
-        std::cout << "=== 配置 ===\n";
+        // 配置摘要（原中文标题「=== 配置 ===」）；取值域 = attr_sizes 列表。
+        std::cout << "config\n";
         for (const auto& s : cfg.servers) {
             std::cout << "  server " << (int)s.id << ": " << s.address << "\n";
         }
-        std::cout << "  window=" << rows << " 属性数=" << sizes.size() << " 取值域=[";
+        std::cout << "  window=" << rows << " attrs=" << sizes.size() << " domain=[";
         for (size_t i = 0; i < sizes.size(); ++i) {
             std::cout << (i ? "," : "") << sizes[i];
         }
-        std::cout << "] lambda=" << params.lambda << "\n";
-        std::cout << "  半诚实模式：无 proof、无 MAC 密钥（决策 D16）\n\n";
+        // 半诚实模式（决策 D16）：无 proof、无 MAC 密钥。
+        std::cout << "] lambda=" << params.lambda << " proof=none mac_key=none\n";
 
         // ---- 连接两台服务器 ----
         GrpcChannel ch0(cfg.servers[0].address);
@@ -123,7 +124,7 @@ int main(int argc, char** argv) {
             std::cerr << "无法连接到服务器，请先启动 ./vmpq_server\n";
             return EXIT_FAILURE;
         }
-        std::cout << "[1/4] 已连接两台服务器\n";
+        std::cout << "[1/4] connected servers=2\n";
 
         // ---- Init：分配存储 + 上传共享 ----
         ch0.InitTable(params.window_size, params.attr_sizes);
@@ -137,8 +138,9 @@ int main(int argc, char** argv) {
         VmpqClient client(params, prf, ch0, ch1);
         auto t0 = std::chrono::steady_clock::now();
         client.Init(recs);
-        std::cout << "[2/4] Init（编码 + XOR 共享 + 上传 + 离线 hint）: "
-                  << std::fixed << std::setprecision(1) << MsSince(t0) << " ms\n";
+        // Init 阶段（原中文说明）：编码 + 加法共享 + 上传 + 离线 hint；打印总耗时。
+        std::cout << "[2/4] init_ms="
+                  << std::fixed << std::setprecision(1) << MsSince(t0) << "\n";
 
         // ---- 单谓词 Count ----
         t0 = std::chrono::steady_clock::now();
@@ -149,8 +151,9 @@ int main(int argc, char** argv) {
             ++checked;
             if (got != want) ++mismatch;
         }
-        std::cout << "[3/4] 单谓词 Count ×" << checked << " (RPC/ch=" << ch0.rpc_count()
-                  << ")  " << MsSince(t0) << " ms  不一致=" << mismatch << "\n";
+        // 单谓词 Count：逐一与明文基准对照（checked 组，mismatch 组不一致）。
+        std::cout << "[3/4] single_count checked=" << checked << " rpc_per_channel=" << ch0.rpc_count()
+                  << " ms=" << MsSince(t0) << " mismatch=" << mismatch << "\n";
 
         // ---- 多谓词 Count（Q5：一次 RPC 发全部谓词）----
         const uint64_t rpc_before = ch0.rpc_count();
@@ -159,45 +162,48 @@ int main(int argc, char** argv) {
         const double both_ms = MsSince(t0);
         const uint64_t rpc_used = ch0.rpc_count() - rpc_before;
         const uint64_t want_both = PlainCountBoth(recs, 3, 5);
-        std::cout << "[4/4] 多谓词 Count(p0=3 ∧ p1=5) = " << both
-                  << "  明文=" << want_both
-                  << (both == want_both ? "  ✓" : "  ✗")
-                  << "  用时 " << std::fixed << std::setprecision(2) << both_ms
-                  << " ms，PirQuery RPC 次数=" << rpc_used
-                  << "（Q5：2 个谓词仍只发 1 次）\n";
+        // 多谓词 Count（Q5：一次 RPC 发全部谓词 ⇒ 2 个谓词仍只 1 次 PirQuery RPC）。
+        std::cout << "[4/4] multi_count p0=3 p1=5 result=" << both
+                  << " plain=" << want_both
+                  << (both == want_both ? " ok=1" : " ok=0")
+                  << " ms=" << std::fixed << std::setprecision(2) << both_ms
+                  << " pir_query_rpc=" << rpc_used << "\n";
 
         // ---- SUM ----
         t0 = std::chrono::steady_clock::now();
         const uint64_t sum = client.SumWithFilter({{0, 2}}, 1);
         const uint64_t want_sum = PlainSum(recs, 1, 2);
-        std::cout << "      SUM(filter p0=2, 求和 p1) = " << sum
-                  << "  明文=" << want_sum << (sum == want_sum ? "  ✓" : "  ✗")
-                  << "  用时 " << MsSince(t0) << " ms\n";
+        // SUM：filter p0=2，对 p1 求和；与明文基准对照。
+        std::cout << "      sum filter_p0=2 sum_attr=1 result=" << sum
+                  << " plain=" << want_sum << (sum == want_sum ? " ok=1" : " ok=0")
+                  << " ms=" << MsSince(t0) << "\n";
 
         // 远程模式下客户端**不持有**服务器存储，只能报告自己这一侧的规模。
         // （这本身就是隐私性的体现：服务端状态对客户端不可见。）
-        const uint64_t words = params.words_per_column();
-        uint64_t total_columns = 0;
-        for (uint32_t s : sizes) total_columns += s;
-        // 服务器存的条目表 = one-hot 区（每取值一列） + value plane 区
-        //（每属性 l_a 个比特面，供 SUM/矩 还原每条记录的取值）。
-        const uint64_t one_hot_entries = total_columns * words;
-        const uint64_t plane_entries =
-            static_cast<uint64_t>(params.num_planes()) * words;
-        std::cout << "\n客户端侧账目：每列 " << words << " 个 word，共 "
-                  << total_columns << " 列 ⇒ one-hot 区 "
-                  << one_hot_entries << " 个共享条目 + value plane 区 "
-                  << params.num_planes() << " 个面 × " << words << " words = "
-                  << plane_entries << " 个 ⇒ 合计 "
-                  << (one_hot_entries + plane_entries) << " 个（"
-                  << ((one_hot_entries + plane_entries) * 16 / 1024)
-                  << " KB，按位打包；PIR 数据库补齐到 2 的幂后为 "
-                  << params.PaddedEntries() << " 个）\n";
-        std::cout << "本通道 RPC 统计：server0=" << ch0.rpc_count()
-                  << "，server1=" << ch1.rpc_count() << "\n";
+        //
+        // 口径（决策 D38）：一个 DB 条目 = 一整列 = N 个 128 位 cell，
+        // 一次列查询 = 1 次 PIR（1 个查询集）。
+        const uint64_t one_hot_cols = params.one_hot_columns();
+        const uint64_t plane_cols = params.plane_columns();
+        const uint64_t total_cols = params.total_columns();
+        const uint64_t padded_cols = params.padded_columns();
+        const uint64_t per_server_kb =
+            padded_cols * params.window_size * 16 / 1024;
+        // 客户端侧账目（原中文说明）：远程模式下客户端**不持有**服务器存储，只能报告自己
+        // 这一侧的规模（服务端状态对客户端不可见）。口径（决策 D38）：一个 DB 条目 = 一整列
+        // = N 个 128 位 cell，一次列查询 = 1 次 PIR（1 个查询集）；PIR 数据库补齐到
+        // padded_cols 个条目。
+        std::cout << "\nclient_accounts total_columns=" << total_cols << " one_hot_columns="
+                  << one_hot_cols << " plane_columns=" << plane_cols
+                  << " entries_per_column=" << params.window_size
+                  << " server_storage_kb_per_server=" << per_server_kb
+                  << " padded_entries=" << padded_cols << " pir_per_column_query=1\n";
+        std::cout << "rpc server0=" << ch0.rpc_count()
+                  << " server1=" << ch1.rpc_count() << "\n";
 
         const int bad = mismatch + (both == want_both ? 0 : 1) + (sum == want_sum ? 0 : 1);
-        std::cout << "\n=== " << (bad == 0 ? "全部一致" : "存在不一致") << " ===\n";
+        // 原中文结论行「=== 全部一致 / 存在不一致 ===」精简为裸键值；退出码不变。
+        std::cout << "result all_match=" << (bad == 0 ? 1 : 0) << " mismatch=" << bad << "\n";
         return bad == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     } catch (const std::exception& e) {
         std::cerr << "客户端失败: " << e.what() << "\n";

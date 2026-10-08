@@ -3,7 +3,8 @@
 // 设计口径（决策 Q5，负责人裁决）：
 //   VMPQ 的 PIR 一次查询产生一个查询集，无法避免"把所有谓词发过去"。
 //   因此在线阶段**一次请求携带全部谓词的全部查询集**，客户端在本地做谓词组合。
-//   这也顺带摊薄了"每列 ⌈N/128⌉ 个 word 各需一次 PIR"带来的往返次数。
+//   决策 D38 起，**一个条目 = 一整列 = N 个 128 位分量**，故一次列查询只发
+//   **1 个查询集**（不再是每 word 一个）。
 //
 // 三层消息：
 //   InitTable   —— 分配服务器侧存储（论文 Algorithm 2）
@@ -20,15 +21,15 @@ service VmpqService {
     // 初始化：按 schema 分配 one-hot 索引表存储
     rpc InitTable (InitTableRequest) returns (InitTableResponse) {}
 
-    // 装载：上传一段只属于**本服务器**的 XOR 共享（决策 D12）
+    // 装载：上传一段只属于**本服务器**的 Z_{2^128} **加法**共享（决策 D37/D38）
     rpc UploadEntries (UploadEntriesRequest) returns (UploadEntriesResponse) {}
 
-    // 在线查询：一次发送全部谓词的全部查询集
+    // 在线查询：一次发送全部谓词的全部查询集（每个查询集 = 一个条目/一整列）
     rpc PirQuery (PirQueryRequest) returns (PirQueryResponse) {}
 }
 
 message InitTableRequest {
-    uint32 window_size = 1;        // N
+    uint32 window_size = 1;        // N（同时是每个条目的分量数 entry_words）
     repeated uint32 attr_sizes = 2;  // 每个属性的取值域 2^{l_a}
 }
 
@@ -38,9 +39,11 @@ message InitTableResponse {
 }
 
 message UploadEntriesRequest {
-    uint64 base_index = 1;   // 起始扁平条目号
-    // 每个元素 16 字节（小端 uint128）。必须恰好是本服务器的共享，
-    // 不得上传明文——服务器之间不共谋是协议的安全前提。
+    // 起始**条目号**（第 0 个条目 = one-hot 区第一列；决策 D38）。
+    uint64 base_index = 1;
+    // `count × N` 个串接的 16 字节小端分量（决策 D38：一个条目 = 一整列 = N
+    // 个 cell）。必须恰好是本服务器的共享，不得上传明文——服务器之间不共谋
+    // 是协议的安全前提。
     repeated bytes entries = 2;
 }
 
@@ -49,7 +52,7 @@ message UploadEntriesResponse {
     string error = 2;
 }
 
-// 单个 word 的一次 PIR 查询：每个分区恰好一个偏移 + 一个分组比特。
+// 单个**条目（一整列）**的一次 PIR 查询：每个分区恰好一个偏移 + 一个分组比特。
 // 服务器视角下不同查询的 (offsets, groups) 联合分布相同，故不泄露目标。
 message PirQuerySet {
     repeated uint32 offsets = 1 [packed = true];  // 长度 = part_num，每个 < part_size
@@ -57,15 +60,25 @@ message PirQuerySet {
 }
 
 message PirQueryRequest {
-    // queries[j] 对应第 j 个待检索目标。
-    // ⚠️ 客户端会把**所有谓词的所有 word** 一次性放进这里（Q5），
+    // queries[j] 对应第 j 个待检索条目（列）。
+    // ⚠️ 客户端会把**所有谓词的所有列**一次性放进这里（Q5），
     //    而不是逐个谓词往返。
     repeated PirQuerySet queries = 1;
+
+    // 每个条目的 128 位分量数（决策 D38：= window_size = N）。
+    // 供服务端校验：与 InitTable 时登记的 N 不一致即拒绝（字段编号按"新增
+    // 一律往后编"的纪律取 3，2 留空）。
+    uint64 entry_words = 3;
 }
 
 message PirAnswer {
-    bytes acc0 = 1;  // 16 字节，分组比特为 0 的条目之 XOR
-    bytes acc1 = 2;  // 16 字节，分组比特为 1 的条目之 XOR
+    // ⚠️ 决策 D37：VMPQ 的累加群是 Z_{2^128} **加法**（不是 XOR）——客户端拿到
+    //    两台应答后先逐分量相加，再 `sub(hint_parity, acc)` 重建。
+    // ⚠️ 决策 D38：每条应答 = `entry_words × 16` 字节的**串接小端**编码
+    //    （第 j 个分量在 [j*16, (j+1)*16)）。字段名 `acc0/acc1` 与 MPRAQ 的
+    //    `PirAnswer` 同名（两协议线格式同构），但**语义的群与条目形状不同**。
+    bytes acc0 = 1;  // 分组比特为 0 的条目之**逐分量**和（mod 2^128）
+    bytes acc1 = 2;  // 分组比特为 1 的条目之**逐分量**和（mod 2^128）
 }
 
 message PirQueryResponse {

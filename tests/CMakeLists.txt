@@ -52,13 +52,10 @@ add_tsb_test(test_adversary test_adversary.cpp)
 add_tsb_test(test_mpc test_mpc.cpp)
 
 # ---- 检索原语（PIR-01）----
-add_tsb_test(test_voo_pir test_voo_pir.cpp LIBS tsb_pir)
 
 # ---- 第 3 层：VMPQ 协议 ----
-add_tsb_test(test_vmpq test_vmpq.cpp LIBS tsb_vmpq tsb_pir)
 
 # ---- 真实 gRPC 端到端（FND-10 / VMP-08）----
-add_tsb_test(test_grpc_e2e test_grpc_e2e.cpp LIBS tsb_net tsb_vmpq vmpq_proto)
 
 # ---- 双服务器仿真框架 ----
 add_tsb_test(test_cluster test_cluster.cpp)

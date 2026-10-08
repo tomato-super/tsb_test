@@ -63,8 +63,9 @@ public:
 
     void InitTable(uint32_t window_size,
                    const std::vector<uint32_t>& attr_sizes) override;
-    void UploadEntries(uint64_t base_index,
-                       const std::vector<uint128_t>& entries) override;
+    // `base_entry` = 条目号；cells 长度必须是 N 的整数倍（决策 D38）
+    void UploadEntries(uint64_t base_entry,
+                       const std::vector<uint128_t>& cells) override;
     std::vector<PirAnswerData> PirQuery(
         const std::vector<PirQuerySetData>& queries) override;
 
@@ -78,6 +79,9 @@ private:
     std::shared_ptr<grpc::Channel> channel_;
     std::unique_ptr<vmpq::VmpqService::Stub> stub_;
     uint64_t rpc_count_ = 0;
+    // `InitTable` 时登记的 N；同时是条目宽度 entry_words（决策 D38）。
+    // 由它填充 `PirQueryRequest.entry_words` 并按同一宽度解码应答。
+    uint32_t window_size_ = 0;
 };
 
 // 启动一个监听 addr 的服务器进程内服务，返回可用的 Server 与内部节点。

@@ -5,7 +5,7 @@
 // 配置示例（见 config/vmpq_server_0.json）：
 //   { "server_id": 0, "host_port": "50051" }
 //
-// ⚠️ 半诚实模型：本进程只持有**自己那一半** XOR 共享。两台服务器之间不通信，
+// ⚠️ 半诚实模型：本进程只持有**自己那一半**加法共享（RSS，决策 D37）。两台服务器之间不通信，
 //    也不共谋（这是协议的安全前提）。传输使用不安全信道（决策 D4），
 //    部署到真实环境前必须补上 TLS 与身份认证。
 
@@ -52,8 +52,8 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        std::cout << "[vmpq_server] id=" << cfg.server_id << " 监听 " << address
-                  << "\n[命中 Ctrl-C 退出]\n";
+        // 人读行：监听地址（原中文说明「监听 + 命中 Ctrl-C 退出」精简为裸键值）。
+        std::cout << "[vmpq_server] id=" << cfg.server_id << " listen=" << address << "\n";
 
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
@@ -61,8 +61,9 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
-        std::cout << "[vmpq_server] 关闭中……已处理 " << service.rpc_count()
-                  << " 次 RPC、" << service.queries_served() << " 个查询集\n";
+        // 关闭摘要（原中文「关闭中……已处理 N 次 RPC、M 个查询集」精简为裸键值）。
+        std::cout << "[vmpq_server] closing rpc=" << service.rpc_count()
+                  << " query_sets=" << service.queries_served() << "\n";
         server->Shutdown();
         server->Wait();
         return EXIT_SUCCESS;

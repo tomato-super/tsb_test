@@ -5,9 +5,17 @@
 // 实现依据：doc/design/PIR_SPEC.md（由 S3PIR 官方实现交叉核对）。
 // 关键规格裁决（决策 D7）：阈值规则以 S3PIR 的 `FindCutoff` 为准，**不取 median**。
 //
-// ⚠️ **parity 语义是 XOR**，因此参与的 entry 必须采用 XOR 共享
-// （等价于 Z_2 上的加法共享）。决策 D12 已证明加法共享不保持 XOR 同态。
-// 本模块的接口因此一律以"entry 的整值"为单位做 ⊕，不涉及域内加法。
+// ⚠️ **群运算：`Z_{2^128}` 环上加法（决策 D37，2026-09-11）。** 重建只依赖
+// "hint 覆盖集与应答子集的**对称差**恰为 `{x}`，两者在群里相消" ⇒ 对任何阿贝尔群都成立。
+// 本模块统一取 `(Z_{2^128}, +, −)`（`core/field.hpp` 的 `add`/`sub`/`neg`）：
+//   * 服务器累加 `acc += entry`；两台合并 `acc = add(acc0, acc1)`；
+//   * 客户端重建 `β = sub(hint_parity, acc)`。
+// ⚠️ **共享类型必须与累加运算同群**：entry 必须是 `Z_{2^128}` 加法共享（RSS），
+// 不能用 XOR 共享（`(a⊕b) + ((s−a)⊕(t−b)) ≠ s⊕t`，见决策 D12 的反例与
+// `doc/design/vmpq_parity_alignment.md` §5 的实测：ASS + ⊕ 累加 = 0% 正确）。
+// 与论文的关系：论文 §IV-B 的 one-hot 就是 `Z_{2^k}` 加法共享，但其 Algorithm 1 写成 ⊕
+// ⇒ 本模块取"加法贯穿到底"的自洽读法（论文自身三处不一致见台账 L15）。
+// ⚠️ 证明层 `F_j`（Mset-XOR-Hash）**仍走 XOR**（论文原文），与数据面是两条独立通道。
 //
 // 参数（n = 数据库条目数，σ = 每分区条目数，P = 分区数）：
 //   P = n / σ               分区数，必须为偶数
@@ -25,9 +33,24 @@
 
 #include "core/aes_prf.hpp"
 #include "core/field.hpp"
-#include "core/hash.hpp"
 
 namespace tsb {
+
+// ---------------------------------------------------------------------------
+// 向量条目（决策 D38）
+// ---------------------------------------------------------------------------
+//
+// 一个 DB 条目由 `VooPirParams::entry_words` 个 128 位分量组成：
+//   * `entry_words == 1` ⇒ 标量条目（一个 16 B 环元素）；
+//   * VMPQ 取 `entry_words == N`（一条目 = 一整列 = N 个 cell），
+//     于是**一次 PIR 取回一整列**，与论文 §V-C 的复杂度口径一致
+//     （查询 `√(2^l)`、服务器应答 `N` 个元素、存储 `|κ|·(N + N·2^l)`）。
+// 群运算仍是 `Z_{2^128}` 加法（决策 D37），**逐分量**进行。
+
+// 一个 PIR 条目：entry_words 个 128 位分量
+using PirEntry = std::vector<uint128_t>;
+// PIR 数据库：n 个条目（每个条目是一个 PirEntry）
+using PirDatabase = std::vector<PirEntry>;
 
 // 查询子集中"没有额外项"的哨兵值
 constexpr uint64_t kNoExtraIndex = std::numeric_limits<uint64_t>::max();
@@ -87,6 +110,14 @@ struct VooPirParams {
     uint32_t part_size = 0;  // 每分区条目数 σ（2 的幂）
     uint32_t lambda = 80;    // 安全参数，M = lambda * sqrt(n)
 
+    // ⭐ **条目宽度（分量数）**：一个 DB 条目由多少个 128 位分量组成（决策 D38）。
+    //   * `entry_words == 1` ⇒ 标量条目（一个 16 B 环元素）；
+    //   * VMPQ 取 `entry_words == N`（一条目 = 一整列 = N 个 cell），
+    //     于是**一次 PIR 取回一整列**，服务器对每个分量分别做环上加法，
+    //     hint 的 parity 也是 N 个分量各一份。
+    // 这对应论文 §V-C 的复杂度：查询 `√n`、应答 `N` 个元素、服务器存储 `|κ|·N·2^l`。
+    uint64_t entry_words = 1;
+
     static VooPirParams Derive(uint64_t n, uint32_t lambda);
 
     void Validate() const;
@@ -105,7 +136,9 @@ struct VooPirHint {
     bool indicator = true;     // β：真实半区是 "v < c" (true) 还是 "v >= c" (false)
     uint32_t extra_part = 0;   // e_j 所在分区
     uint32_t extra_offset = 0;  // e_j 在分区内的偏移
-    uint128_t parity = 0;      // P_j
+    // P_j：覆盖集在 Z_{2^128} 上的**逐分量和**（决策 D37/D38）。
+    // 长度 = `VooPirParams::entry_words`；标量条目时长度为 1。
+    std::vector<uint128_t> parity;
 
     bool valid() const { return select_cutoff != 0 || hint_id != 0; }
 };
@@ -129,16 +162,18 @@ struct VooPirQuery {
     // 它同时出现在 hint parity 与应答子集中，因此在重建时抵消。
     // case A（目标是 extra 项）时为 kNoExtraIndex。
     uint64_t filler_index = kNoExtraIndex;
-    uint128_t hint_parity = 0;  // P_h
+    // P_h：覆盖集在 Z_{2^128} 上的**逐分量和**（决策 D37/D38）。
+    // 长度 = `VooPirParams::entry_words`；标量条目时长度为 1。
+    std::vector<uint128_t> hint_parity;
     bool take_accumulator_1 = false;  // 真实组落在累加器 1（否则累加器 0）
     // 命中方式：true = case A（查询索引恰为 hint 的 extra 项）
     bool hit_via_extra = false;
 };
 
-// 服务器应答：两个累加器
+// 服务器应答：两个累加器，每个都是"逐分量和"（长度 = entry_words）
 struct VooPirAnswer {
-    uint128_t acc0 = 0;
-    uint128_t acc1 = 0;
+    std::vector<uint128_t> acc0;
+    std::vector<uint128_t> acc1;
 };
 
 // ---------------------------------------------------------------------------
@@ -147,16 +182,12 @@ struct VooPirAnswer {
 
 class VooPirClient {
 public:
-    // ⚠️ 半诚实版本**不需要证明**：服务器不会篡改应答，因此不计算 hint 证明 F_j，
-    // 也不需要 MAC 密钥。这是默认行为（两参数构造）。
+    // ⚠️ **VMPQ 只做半诚实**（决策 **D39**，2026-09-11 负责人裁决）：本模块
+    // **没有**证明层 —— 不接收 MAC 密钥、不计算 `F_j`、不提供 `proof()`。
+    // 理由：论文的验证层本身不成立（Mset-XOR-Hash 的 `F ⊕ C` 在共享域上不闭合，
+    // 见决策 D16 与 `doc/design/mparq_review/REPORT.md`），而半诚实模型下服务器
+    // 默认不篡改 ⇒ 保留一个"用不了"的接口只会误导。恶意模型由 MPRAQ 那条线做。
     VooPirClient(const VooPirParams& params, const AesPrf& prf);
-
-    // 需要证明时提供 mac_key（恶意模型 / 后续扩展）。此时才会计算 F_j。
-    VooPirClient(const VooPirParams& params, const AesPrf& prf,
-                 const std::vector<uint8_t>& mac_key);
-
-    // 是否启用证明
-    bool verification_enabled() const { return !mac_key_.empty(); }
 
     const VooPirParams& params() const { return params_; }
 
@@ -175,18 +206,14 @@ public:
 
     // ---- 离线阶段 ----
     //
-    // 客户端本地生成全部 hint。db 只需提供按索引取值的能力
-    // （对测试与单机仿真即明文；真实部署中由两服务器的共享重建）。
-    void HintInit(const std::vector<uint128_t>& db);
+    // 客户端本地生成全部 hint。db 只需提供按**条目**取值的能力：第 i 个条目
+    // 是 `entry_words` 个 128 位分量（决策 D38）。对测试与单机仿真即明文；
+    // 真实部署中由两服务器的共享重建。
+    void HintInit(const PirDatabase& db);
 
     const std::vector<VooPirHint>& hints() const { return hints_; }
     // 有效 hint 数（select_cutoff != 0）
     size_t ValidHintCount() const;
-
-    // F_j：hint 覆盖集合的标签 XOR（纯 XOR，见决策 D13）。
-    // ⚠️ 仅在 verification_enabled() 为真时可用；半诚实构建下调用会抛异常
-    // （而不是返回一个无意义的零标签）。
-    const MacTag& proof(size_t hint_slot) const;
 
     // ---- 在线阶段 ----
 
@@ -202,25 +229,22 @@ public:
 
     // 客户端重建：由两服务器应答恢复明文。
     //
-    // ⚠️ **必须同时提供填充值**。由 hint 的 parity 与应答子集 XOR 得到的是
+    // ⚠️ 群运算是 `Z_{2^128}` 加法（决策 D37）：`β = sub(P_h, acc_true)`。
+    // 依据：hint 覆盖集与应答子集的对称差恰为 `{x}`，在阿贝尔群中相消
+    // ⇒ `Σ_覆盖集 − Σ_应答集 = DB[x]`（**方向固定**，实测见
+    // `doc/design/vmpq_parity_alignment.md` §5：`parity − acc` 正确、反向恒错，
+    // 且与 case A/B 无关）。
     //
-    //       P_h ⊕ acc_true = DB[x] ⊕ DB[filler]
-    //
-    // 而不是裸的 DB[x]：填充项同时出现在 P_h 的覆盖集合与应答子集里，本应
-    // 相互抵消 —— 但它只在"哑组被迫取 e_J 的槽位"时才会出现两次。为避免
-    // 依赖这种偶然性，客户端显式把填充值再 XOR 一次，得到真正的 DB[x]；
-    // 该填充值同时是验证等式 F ⊕ C = MAC(x,v) ⊕ MAC(fill,v_fill) 的输入。
-    //
-    // 注意：若查询分区 ℓ 恰为 hint 的 extra 分区，则 xor_value 已经是
-    // DB[x]（填充项与目标项互相抵消），此时 filler_value 应为 0。
+    // 注意：本实现的构造保证 `filler_index` 项**不参与重建**（它只在验证等式里用），
+    // 故半诚实路径下 `filler_value` 恒为 0。
     struct Reconstructed {
-        uint128_t value = 0;  // DB[x]
-        MacTag combined_c{};  // C_0 ⊕ C_1（半诚实版本为零）
+        // DB[x]：entry_words 个 128 位分量（标量条目时长度为 1）
+        std::vector<uint128_t> value;
         uint128_t filler_value = 0;
     };
     Reconstructed Reconstruct(const VooPirQuery& q, const VooPirAnswer& a0,
                               const VooPirAnswer& a1);
-    // 同义别名（保留以便调用方表达"尚未做验证"的语义）
+    // 同义别名（保留以便调用方表达"不做验证"的语义；VMPQ 无验证层，D39）
     Reconstructed ReconstructRaw(const VooPirQuery& q, const VooPirAnswer& a0,
                                  const VooPirAnswer& a1) {
         return Reconstruct(q, a0, a1);
@@ -232,21 +256,23 @@ public:
         uint64_t hint_id = 0;
         uint32_t select_cutoff = 0;
         // 两个半区的 parity，按选择值命名（避免与"真实/非真实"混淆）：
-        //   parity_below = ⊕{ r_{J,k} · sel[k] <  c }
-        //   parity_above = ⊕{ r_{J,k} · sel[k] >= c }
-        uint128_t parity_below = 0;
-        uint128_t parity_above = 0;
+        //   parity_below = Σ{ r_{J,k} · sel[k] <  c }   (mod 2^128)
+        //   parity_above = Σ{ r_{J,k} · sel[k] >= c }   (mod 2^128)
+        // ⚠️ 决策 D38：每个分量各一份和（长度 = entry_words），逐分量相加。
+        std::vector<uint128_t> parity_below;
+        std::vector<uint128_t> parity_above;
         uint32_t extra_part = 0;
         uint32_t extra_offset = 0;
     };
     void Refresh(size_t hint_slot, const VooPirQuery& q,
-                 const RefreshMaterial& material, uint128_t reconstructed_value);
+                 const RefreshMaterial& material,
+                 const std::vector<uint128_t>& reconstructed_value);
 
     // 由 offline server 生成的补充材料（单进程仿真用；真实部署中由服务器计算）。
     //
     // ⚠️ 必须传入本次查询的目标索引：新 hint 在分区 ℓ 上由 extra 项占据，
     // 其 PRF 偏移项不属于覆盖集合，因此计算半区 parity 时要**跳过 ℓ**。
-    RefreshMaterial GenerateRefreshMaterial(const std::vector<uint128_t>& db,
+    RefreshMaterial GenerateRefreshMaterial(const PirDatabase& db,
                                             uint64_t target_index);
 
     // ---- 统计与调试 ----
@@ -290,19 +316,37 @@ public:
                                const VooPirHint& h, uint32_t k);
 
     // 按"两个累加器"语义处理一个查询（服务器侧）
-    // db_entry(i) 返回第 i 个条目的值（明文或共享值）
+    // db_entry(i) 返回第 i 个条目的**全部分量**（`const std::vector<uint128_t>&`，
+    // 长度必须 >= params.entry_words；明文或本服务器的加法共享值）。
+    //
+    // ⚠️ 群运算是 `Z_{2^128}` 加法（决策 D37），**逐分量**进行（决策 D38）：
+    // 服务器在自己那份**加法共享**上累加。`db_entry` 必须返回加法共享（RSS）；
+    // 配 XOR 共享会静默错值（D12）。
     template <typename Fn>
     static VooPirAnswer Answer(const VooPirParams& params, const VooPirQuery& q,
                                Fn&& db_entry) {
+        if (q.offsets.size() != params.part_num ||
+            q.groups.size() != params.part_num) {
+            throw std::invalid_argument(
+                "VooPirClient::Answer: 查询集的长度必须等于分区数");
+        }
         VooPirAnswer a;
+        a.acc0.assign(static_cast<size_t>(params.entry_words), 0);
+        a.acc1.assign(static_cast<size_t>(params.entry_words), 0);
         for (uint32_t k = 0; k < params.part_num; ++k) {
             const uint64_t idx =
                 static_cast<uint64_t>(k) * params.part_size + q.offsets[k];
-            const uint128_t v = db_entry(idx);
-            if (q.groups[k]) {
-                a.acc1 = static_cast<uint128_t>(a.acc1 ^ v);
-            } else {
-                a.acc0 = static_cast<uint128_t>(a.acc0 ^ v);
+            const std::vector<uint128_t>& v = db_entry(idx);
+            if (v.size() < params.entry_words) {
+                throw std::invalid_argument(
+                    "VooPirClient::Answer: 条目的分量数少于 entry_words");
+            }
+            for (uint64_t j = 0; j < params.entry_words; ++j) {
+                if (q.groups[k]) {
+                    a.acc1[j] = add(a.acc1[j], v[j]);
+                } else {
+                    a.acc0[j] = add(a.acc0[j], v[j]);
+                }
             }
         }
         return a;
@@ -313,9 +357,7 @@ private:
     // AesPrf 持有 unique_ptr（不可拷贝），因此按引用保存。
     // 调用方必须保证 prf 的生命周期长于本对象。
     const AesPrf& prf_;
-    std::vector<uint8_t> mac_key_;
     std::vector<VooPirHint> hints_;
-    std::vector<MacTag> proofs_;
     // 每个槽位是否已被 Query 消费（kForbidReuse），由 Refresh 清除
     std::vector<uint8_t> consumed_;
     HintReusePolicy policy_ = HintReusePolicy::kForbidReuse;
