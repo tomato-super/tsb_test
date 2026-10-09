@@ -139,6 +139,10 @@ public:
     // 本通道**显式设置**的收包上限（账目/测试用；= `kGrpcClientMaxReceiveBytes`）
     static constexpr int max_receive_bytes() { return kGrpcClientMaxReceiveBytes; }
 
+    // **已收到的应答字节**（按 protobuf 的 `ByteSizeLong()` 实测，含框架开销）。
+    // ⚠️ 只有 gRPC 通道有意义；进程内通道恒 0（没有"线上字节"）。
+    uint64_t recv_bytes() const override { return recv_bytes_; }
+
 
     void InitTable(const mpraq::StoreParams& params) override;
     void UploadFeatureWords(uint64_t base_index,
@@ -193,6 +197,7 @@ private:
     uint64_t server_resp_calls_ = 0;
     uint64_t server_resp_batch_calls_ = 0;
     uint64_t queries_served_ = 0;
+    uint64_t recv_bytes_ = 0;        // 下行：已收到的应答字节（实测）
 };
 
 // ---------------------------------------------------------------------------

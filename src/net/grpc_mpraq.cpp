@@ -487,6 +487,9 @@ std::vector<PlinkoAnswer> GrpcMpraqChannel::SendQuerySets(
         ++server_resp_calls_;
     }
     const grpc::Status st = stub_->ServerResp(&ctx, req, &resp);
+    // **下行实测**：按 protobuf 的 `ByteSizeLong()` 计（含框架开销）。
+    // ⚠️ 只在这一处累加（成功路径）；失败的 RPC 不计入 —— 账目只记"真正收到的应答"。
+    recv_bytes_ += static_cast<uint64_t>(resp.ByteSizeLong());
     if (!st.ok()) {
         throw std::runtime_error("ServerResp RPC 失败（" + target_ +
                                  "）: " + st.error_message() +

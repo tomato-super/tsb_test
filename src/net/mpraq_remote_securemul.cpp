@@ -375,6 +375,7 @@ void RemoteSecureMulBatchEndpoint::FlushInstalls() {
     }
     ++install_frames_;
     install_bytes_ += frame.size();
+    recv_bytes_ += raw.payload.size();   // 安装回执（下行）
     expected_records_ = n;
     sessions_.clear();
     setups_.clear();
@@ -402,6 +403,8 @@ Response RemoteSecureMulBatchEndpoint::UnwrapResponse(const Response& raw) {
     if (!raw.ok) {
         return raw;  // 传输层失败：原样向上（口径 = kTransportError）
     }
+    // **下行实测**：相位回执（Phase1Response 27B/条、Phase2Response 43B/条）。
+    recv_bytes_ += raw.payload.size();
     try {
         const RelayFrame ack = DecodeRelayFrame(raw.payload);
         const RelayFrameKind want = last_request_kind_ ==

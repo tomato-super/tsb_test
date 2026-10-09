@@ -378,6 +378,10 @@ public:
     virtual uint64_t processed_phase2() const = 0;  // 第 2 轮实际处理的记录数
     virtual uint64_t install_frames() const = 0;    // 安装帧数（本地 0；远程 1）
     virtual uint64_t install_bytes() const = 0;     // 安装帧字节（本地 0）
+    // **已收到的应答字节**（下行；本地 0 —— 进程内没有"线上字节"，语义正确）。
+    // ⚠️ Sum 的**下行大头不是 PIR 应答而是这里**：Phase1Response(27B/条)
+    //    + Phase2Response(43B/条) ⇒ 每台 `70·N` 字节量级。
+    virtual uint64_t recv_bytes() const = 0;
     // 会话结束：本地把 handler 换成"拒绝一切"的失效桩（避免悬垂捕获）；
     // 远程为空操作（服务器进程的表由下一次安装帧的 Clear() 覆盖）。
     virtual void Close() = 0;
@@ -418,6 +422,10 @@ struct SecureMulBatchStats {
     uint64_t install_frames = 0;   // 安装帧数（两台之和；远程 = 2）
     uint64_t install_rounds = 0;   // 安装 state 阶段的 Collect 次数（远程 = 2，每台一次）
     uint64_t install_bytes = 0;    // 安装帧的线上字节（两台之和）
+    // **下行**：两轮相位回执的字节（两台之和）。
+    // ⚠️ Sum 的**下行大头在这里**，不是 PIR 应答：每台约 `70·N`
+    //    （Phase1Response 27 B/条 + Phase2Response 43 B/条）。
+    uint64_t recv_bytes = 0;
 };
 
 // 帧层/传输层的失败细类（`failure[i]` 之外的第二根轴；见文件头 §4）

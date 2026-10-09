@@ -248,6 +248,7 @@ public:
     uint64_t processed_phase2() const override { return table_.processed_phase2(); }
     uint64_t install_frames() const override { return 0; }
     uint64_t install_bytes() const override { return 0; }
+    uint64_t recv_bytes() const override { return 0; }   // 进程内：无线上字节
 
     // 会话结束后把 handler 换成"拒绝一切"的桩：
     // handler 捕获的是 `this`（端点在调用方栈上）⇒ 不换掉就会留下**悬垂捕获**
@@ -594,6 +595,8 @@ SecureMulBatchOutcome RunSecureMulBatchImpl(const std::vector<uint8_t>& f_bits,
         ep1.FlushInstalls();
         out.stats.install_frames = ep0.install_frames() + ep1.install_frames();
         out.stats.install_bytes = ep0.install_bytes() + ep1.install_bytes();
+        // ⚠️ `recv_bytes` **不在这里取**：此刻两轮相位还没跑（下面 681/756 行才跑），
+        //    在这里取值只会数到"安装回执"两个空帧（实测 13 B/台）。见函数尾部。
         out.stats.install_rounds = ep0.install_frames() + ep1.install_frames();
     }
     // 常驻材料口径（每台）：N × (7×16 B triple 共享 + 16 B ⟨E⟩_p)
@@ -803,6 +806,9 @@ SecureMulBatchOutcome RunSecureMulBatchImpl(const std::vector<uint8_t>& f_bits,
         out.z[i] = r.z;
     }
     out.stats.verify_ms = MsSince(t_verify);
+    // **下行应答字节**（两台之和）：必须在**两轮相位都跑完之后**取 ——
+    // Phase1Response(27 B/条) + Phase2Response(43 B/条)，是 Sum 的下行大头。
+    out.stats.recv_bytes = ep0.recv_bytes() + ep1.recv_bytes();
     // 服务器侧**实测**计数（本地：端点直接读表；远程：端点从服务器回执里取得
     // "本轮实际处理的子消息数"——同样是服务端自报的**实测**值，不是按 N 估算的）
     out.stats.server_records_processed[0] = static_cast<uint64_t>(ep0.processed_phase1());

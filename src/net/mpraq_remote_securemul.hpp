@@ -227,6 +227,7 @@ public:
     uint64_t processed_phase2() const override { return processed_phase2_; }
     uint64_t install_frames() const override { return install_frames_; }
     uint64_t install_bytes() const override { return install_bytes_; }
+    uint64_t recv_bytes() const override { return recv_bytes_; }
     void Close() override {}  // 远程模式：服务器表由下一次安装帧的 Clear() 覆盖
 
     // ---- 诊断 ----
@@ -246,6 +247,7 @@ private:
     uint64_t processed_phase2_ = 0;
     uint64_t install_frames_ = 0;
     uint64_t install_bytes_ = 0;
+    uint64_t recv_bytes_ = 0;        // 下行：已收到的应答字节（含相位回执与安装回执）
     uint64_t relay_calls_ = 0;
 };
 

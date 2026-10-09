@@ -876,6 +876,8 @@ struct Row {
     uint64_t count = 0, baseline_count = 0;
     uint64_t queries_issued = 0, columns_used = 0;
     uint64_t rpc_delta[2] = {0, 0};
+    // **下行**：本次运行每台服务器发回的应答字节（实测；进程内为 0）。
+    uint64_t recv_delta[2] = {0, 0};
     uint64_t scalar_delta[2] = {0, 0};
     uint64_t node_queries_delta[2] = {0, 0};
     uint64_t node_words_delta[2] = {0, 0};
@@ -1041,7 +1043,7 @@ public:
             static_cast<void>(0);
             const auto t0 = Clock::now();
             CountResult c;
-            uint64_t rpc0 = 0, rpc1 = 0, s0 = 0, s1 = 0;
+            uint64_t rpc0 = 0, rpc1 = 0, rb0 = 0, rb1 = 0, s0 = 0, s1 = 0;
             uint64_t nq0 = 0, nq1 = 0, nw0 = 0, nw1 = 0;
             if (o_.columns > 0) {
                 // ---- 裸列路径：精确 K 列的查询集（不经过谓词层）----
@@ -1051,6 +1053,8 @@ public:
                 }
                 rpc0 = ChannelU64(RpcSnapshot(0));
                 rpc1 = ChannelU64(RpcSnapshot(1));
+                rb0 = RecvSnapshot(0);
+                rb1 = RecvSnapshot(1);
                 NodeSnapshot(0, &nq0, &nw0);
                 NodeSnapshot(1, &nq1, &nw1);
                 // 用**裸条目号**构造（一列 = 一个条目，条目号 = 全局列号）
@@ -1097,6 +1101,8 @@ public:
             } else {
                 rpc0 = ChannelU64(RpcSnapshot(0));
                 rpc1 = ChannelU64(RpcSnapshot(1));
+                rb0 = RecvSnapshot(0);
+                rb1 = RecvSnapshot(1);
                 s0 = ScalarSnapshot(0);
                 s1 = ScalarSnapshot(1);
                 NodeSnapshot(0, &nq0, &nw0);
@@ -1124,6 +1130,8 @@ public:
             r.columns_used = c.columns.size();
             r.rpc_delta[0] += ChannelU64(RpcSnapshot(0)) - rpc0;
             r.rpc_delta[1] += ChannelU64(RpcSnapshot(1)) - rpc1;
+            r.recv_delta[0] += RecvSnapshot(0) - rb0;
+            r.recv_delta[1] += RecvSnapshot(1) - rb1;
             r.scalar_delta[0] += ScalarSnapshot(0) - s0;
             r.scalar_delta[1] += ScalarSnapshot(1) - s1;
             uint64_t aq0 = 0, aw0 = 0, aq1 = 0, aw1 = 0;
@@ -1228,6 +1236,15 @@ public:
         } else if (st.install_bytes != 0 || st.install_frames != 0) {
             throw std::runtime_error("进程内模式的 install_* 必须为 0（实测 " +
                                      Num(st.install_bytes) + "）");
+        }
+        // 进程内**没有"线上字节"** ⇒ 两个下行账目都必须恒 0（不是漏统计，是语义如此）。
+        if (!remote() && st.recv_bytes != 0) {
+            throw std::runtime_error("进程内模式的 SecureMul 下行应答必须为 0（实测 " +
+                                     Num(st.recv_bytes) + "）");
+        }
+        if (!remote() && (r->recv_delta[0] != 0 || r->recv_delta[1] != 0)) {
+            throw std::runtime_error("进程内模式的 PIR 下行应答必须为 0（实测 " +
+                                     Num(r->recv_delta[0]) + " / " + Num(r->recv_delta[1]) + "）");
         }
         for (int i = 0; i < 2; ++i) {
             const ServerStats now = QueryServerStatsOrZero(i);
@@ -1337,6 +1354,15 @@ private:
         return client_->channel_rpc_stats(i).server_resp_batch_calls;
     }
     static uint64_t ChannelU64(uint64_t v) { return v; }
+    // **下行应答字节**的快照。两条路的口径一致：
+    //   * 两进程（gRPC）：通道按 `ByteSizeLong()` 实测；
+    //   * 进程内：恒 0（**没有"线上字节"**，是语义正确的值，不是漏统计）。
+    uint64_t RecvSnapshot(int i) const {
+        if (remote()) {
+            return i == 0 ? ch0_->recv_bytes() : ch1_->recv_bytes();
+        }
+        return client_->channel_rpc_stats(i).recv_bytes;
+    }
     uint64_t ScalarSnapshot(int i) const {
         if (remote()) {
             return i == 0 ? ch0_->server_resp_calls() : ch1_->server_resp_calls();
@@ -1431,6 +1457,11 @@ Json RowJson(const Row& r) {
         .Bool("queries_identity_ok", r.columns_identity_ok)
         .U64("pir_rpc_server0", r.rpc_delta[0])
         .U64("pir_rpc_server1", r.rpc_delta[1])
+        // **下行（PIR 应答）字节**：实测（gRPC 的 `ByteSizeLong()`）。
+        // ⚠️ 进程内模式恒 0 —— 没有"线上字节"，不是漏统计。
+        .U64("pir_recv_bytes_server0", r.recv_delta[0])
+        .U64("pir_recv_bytes_server1", r.recv_delta[1])
+        .U64("pir_recv_bytes_total", r.recv_delta[0] + r.recv_delta[1])
         .U64("scalar_server_resp_server0", r.scalar_delta[0])
         .U64("scalar_server_resp_server1", r.scalar_delta[1])
         .U64("node_queries_served_server0", r.node_queries_delta[0])
@@ -1467,6 +1498,11 @@ Json RowJson(const Row& r) {
         .U64("install_rounds", r.sm.install_rounds)
         .U64("install_bytes", r.sm.install_bytes)
         .U64("install_formula_bytes", 2ull * (13 + 152ull * r.geom.n))
+        // **下行（SecureMul 两轮应答）**：实测（两台之和）。
+        // ⚠️ 进程内模式恒 0；Sum 的下行大头是它，不是 PIR 应答。
+        .U64("recv_bytes", r.sm.recv_bytes)
+        .U64("recv_formula_bytes", 2ull * (6 + 27ull * r.geom.n) +
+                                   2ull * (6 + 43ull * r.geom.n))
         .U64("server_state_peak_bytes", r.sm.server_state_peak_bytes)
         .U64("server_state_allocated_bytes", r.sm.server_state_allocated_bytes);
 

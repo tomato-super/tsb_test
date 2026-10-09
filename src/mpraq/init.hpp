@@ -210,6 +210,9 @@ struct MpraqRpcStats {
     uint64_t server_resp_batch_calls = 0;
     uint64_t server_resp_single_calls = 0;
     uint64_t queries = 0;
+    // **下行**：本台服务器已发回的应答字节（实测，见 `IMpraqChannel::recv_bytes`）。
+    // ⚠️ 进程内通道恒 0。
+    uint64_t recv_bytes = 0;
     uint64_t rpc_calls() const { return server_resp_batch_calls + server_resp_single_calls; }
 };
 
@@ -512,6 +515,9 @@ private:
     uint64_t server_resp_calls_[2] = {0, 0};        // 标量 ServerResp 次数
     uint64_t server_resp_batch_calls_[2] = {0, 0};  // 批量 ServerRespBatch 次数 = RPC 次数
     uint64_t server_resp_queries_[2] = {0, 0};      // 累计处理的查询集个数
+    // **下行**：从通道实测的已收应答字节（`IMpraqChannel::recv_bytes()` 的差分）。
+    // ⚠️ 进程内通道恒 0（没有"线上字节"）⇒ `mode=local` 下这一项是 0，是**语义正确**的。
+    uint64_t server_recv_bytes_[2] = {0, 0};
 
 };
 

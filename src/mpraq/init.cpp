@@ -938,8 +938,12 @@ PlinkoEntry MpraqClient::FinishOne(MpraqQuery& q, const PlinkoAnswer& a0,
 PlinkoEntry MpraqClient::RunQuery(MpraqQuery& q) {
     // **单条**路径：1 个查询集 ⇒ 1 次标量 `ServerResp`（= 1 次往返）。
     // 标量语义正是"只有一条查询"的退化解，因此这里**不**套用批量接口。
+    const uint64_t rb0 = channels_[0]->recv_bytes();
+    const uint64_t rb1 = channels_[1]->recv_bytes();
     const PlinkoAnswer a0 = channels_[0]->ServerResp(q.query_);
     const PlinkoAnswer a1 = channels_[1]->ServerResp(q.query_);
+    server_recv_bytes_[0] += channels_[0]->recv_bytes() - rb0;
+    server_recv_bytes_[1] += channels_[1]->recv_bytes() - rb1;
     ++server_resp_calls_[0];
     ++server_resp_calls_[1];
     ++server_resp_queries_[0];
@@ -963,8 +967,12 @@ std::vector<PlinkoEntry> MpraqClient::RunBatch(MpraqQueryBatch& batch) {
     for (const MpraqQuery& q : batch.queries_) wire.push_back(q.query_);
 
     // 两台服务器各自在**本方 XOR 共享**上应答（服务器之间零通信）
+    const uint64_t rb0 = channels_[0]->recv_bytes();
+    const uint64_t rb1 = channels_[1]->recv_bytes();
     const std::vector<PlinkoAnswer> ans0 = channels_[0]->ServerRespBatch(wire);
     const std::vector<PlinkoAnswer> ans1 = channels_[1]->ServerRespBatch(wire);
+    server_recv_bytes_[0] += channels_[0]->recv_bytes() - rb0;
+    server_recv_bytes_[1] += channels_[1]->recv_bytes() - rb1;
     ++server_resp_batch_calls_[0];
     ++server_resp_batch_calls_[1];
     server_resp_queries_[0] += wire.size();
@@ -1055,6 +1063,7 @@ MpraqRpcStats MpraqClient::channel_rpc_stats(int server_id) const {
     s.server_resp_batch_calls = server_resp_batch_calls_[server_id];
     s.server_resp_single_calls = server_resp_calls_[server_id];
     s.queries = server_resp_queries_[server_id];
+    s.recv_bytes = server_recv_bytes_[server_id];
     return s;
 }
 
