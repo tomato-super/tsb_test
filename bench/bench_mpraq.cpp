@@ -362,7 +362,15 @@ struct Options {
     std::vector<double> eps_list = {1e-2, 1e-4, 1e-6, 1e-10};
     std::string predicate = "range";  // range | conj
     size_t columns = 0;               // >0：绕过谓词层，直接取前 K 个真实列（**精确列数**）
-    uint32_t repeat = 1;              // 同一批查询重复次数（L14 预算按 列数×L×repeat 计）
+    // **测量运行**次数（每次都产出**独立记录**，不再做平均）。
+    // ⚠️ 语义变了：此前是"同一批查询在一次 RunCount 里循环 R 次再除以 R"（只出一条平均值），
+    //    现在是"跑 R 次、每次一条记录" —— 统计交给**外部分析脚本**。
+    uint32_t repeat = 1;
+    // **预热运行**次数（同样产出记录，但标记 `is_warmup=true`，由分析脚本排除）。
+    // 目的：把首次运行的页错误/线程池/连接建立等一次性成本挪出统计。
+    // ⚠️ **默认 0（不改变既有实验的行为）**；实验计划要求的 "5 次测量 + 1 次预热"
+    //    由**驱动脚本**显式传 `--repeat 5 --warmup 1`。
+    uint32_t warmup = 0;
     bool with_sum = true;             // online 实验里是否附带一次 Sum
     bool json = false;                // JSONL → stdout，人读文本 → stderr
     std::string json_out;             // 完整 JSON 文档 → 文件
@@ -502,6 +510,8 @@ Options ParseArgs(int argc, char** argv) {
             o.scale_enabled = true;
         } else if (a == "--repeat") {
             o.repeat = static_cast<uint32_t>(std::stoul(next("--repeat")));
+        } else if (a == "--warmup") {
+            o.warmup = static_cast<uint32_t>(std::stoul(next("--warmup")));
         } else if (a == "--no-sum") {
             o.with_sum = false;
         } else if (a == "--json") {
@@ -553,7 +563,10 @@ Options ParseArgs(int argc, char** argv) {
                    "  --json-out F  完整文档（config+points+summary）写到 F\n"
                    "  --columns K   绕过谓词层直接取前 K 个**真实列**（查询集数 = K×⌈N/128⌉，**精确**）；\n"
                    "                ⚠️ 与 client app 的 `--columns`（= 每属性列数）语义不同，别混用\n"
-                   "  --repeat R    同一批查询重复 R 次（L14 预算按 列数×⌈N/128⌉×R 计）\n"
+                   "  --repeat R    **测量**运行次数（默认 5）：每次运行产出**一条独立记录**，\n"
+                   "                统计（均值/标准差/p50/p95）交给外部分析脚本\n"
+                   "  --warmup W    **预热**运行次数（默认 1）：同样产出记录但标记 is_warmup，\n"
+                   "                由分析脚本排除。预热也消耗查询预算\n"
                    "  --mode grpc   真实 gRPC 两进程；未给端点时自动用可执行文件同目录的\n"
                    "                mpraq_server（也可用 --spawn-servers 指定）\n";
             std::exit(EXIT_SUCCESS);
@@ -562,6 +575,7 @@ Options ParseArgs(int argc, char** argv) {
         }
     }
     if (o.repeat == 0) throw std::invalid_argument("--repeat 必须 >= 1");
+    if (o.warmup > 64) throw std::invalid_argument("--warmup 过大（> 64）—— 预热不该跑那么多次");
     if (o.rows.empty()) throw std::invalid_argument("--rows 不能为空");
     return o;
 }
@@ -619,6 +633,8 @@ struct Budget {
     Geometry g;
     uint64_t columns = 0;       // 本次实验计划的列数
     uint64_t repeat = 1;
+    uint64_t warmup = 0;
+    uint64_t runs = 1;           // = repeat + warmup（都消耗查询预算：每次运行各占一批查询集）
     // ⚠️ 列粒度：**一列 = 一个条目 = 1 个查询集** ⇒ 计划量就是「列数 × repeat」，
     //    **不再乘以 ⌈N/128⌉**（旧 word 口径的 128 倍消耗已作废）。
     uint64_t planned_sets = 0;
@@ -630,12 +646,17 @@ struct Budget {
 };
 
 // 预算校验：**只看参数**，不碰任何查询（所以失败发生在"跑之前"）
-Budget PlanBudget(const Geometry& g, uint64_t planned_columns, uint64_t repeat) {
+Budget PlanBudget(const Geometry& g, uint64_t planned_columns, uint64_t repeat,
+                  uint64_t warmup = 0) {
     Budget b;
     b.g = g;
     b.columns = planned_columns;
     b.repeat = repeat;
-    b.planned_sets = planned_columns * repeat;
+    b.warmup = warmup;
+    b.runs = repeat + warmup;
+    // ⚠️ **预热也消耗查询预算**：每次运行都要重取一遍列（重复查询会另取新鲜索引、
+    //    每次照常消耗 1 条备份 hint）⇒ 计划量必须按 `repeat + warmup` 计。
+    b.planned_sets = planned_columns * (repeat + warmup);
     b.hint_cap = g.backup_hints;
     b.pool_cap = g.m;
     b.budget = std::min(b.hint_cap, b.pool_cap);
@@ -649,6 +670,7 @@ Budget PlanBudget(const Geometry& g, uint64_t planned_columns, uint64_t repeat) 
             << " > 上限 min(N_T, m) = " << b.budget << "（N_T = λw/2 = " << b.hint_cap
             << "、m = " << b.pool_cap << "；较紧的是 " << b.binding << "）。"
             << " plan columns=" << planned_columns << " repeat=" << repeat
+            << " warmup=" << warmup
             << " limit=" << b.budget;
         throw L14Rejected(oss.str());
     }
@@ -659,6 +681,8 @@ Json BudgetJson(const Budget& b) {
     Json j;
     j.U64("planned_columns", b.columns)
         .U64("repeat", b.repeat)
+        .U64("warmup", b.warmup)
+        .U64("runs", b.runs)
         .U64("planned_sets", b.planned_sets)
         .U64("backup_hints", b.hint_cap)
         .U64("pool_m", b.pool_cap)
@@ -813,6 +837,14 @@ private:
 struct Row {
     std::string experiment;
     std::string mode;
+    // **这次运行的标识**：`run_index` 从 0 递增（含预热），`is_warmup` 标记预热那条。
+    // ⚠️ 每条记录都是**单次运行**的原始数据；平均/分位数由**外部分析脚本**算。
+    uint32_t run_index = 0;
+    bool is_warmup = false;
+    // **这次运行的墙钟**（毫秒）：从本次 Count 开始到本次 Sum 结束 —— **只含在线部分**。
+    // 离线（`Init`）在每个点只做一次、且由 `init_ms` 单独记账 ⇒ 不摊进这里
+    // （否则分位数会被一次性的离线成本污染）。
+    double wall_ms = 0.0;
     Geometry geom;
     Budget budget;
     bool has_budget = false;
@@ -942,7 +974,9 @@ public:
         return geom_.levels;
     }
 
-    Budget Plan() const { return PlanBudget(geom_, PlannedColumns(), o_.repeat); }
+    Budget Plan() const {
+        return PlanBudget(geom_, PlannedColumns(), o_.repeat, o_.warmup);
+    }
 
     void Init() {
         MpraqInitParams p;
@@ -1000,7 +1034,11 @@ public:
         const std::vector<Predicate> preds = Predicates();
 
         r.has_count = true;
-        for (uint32_t rep = 0; rep < o_.repeat; ++rep) {
+        // ⚠️ **单次运行**：此前的 `for (rep < o_.repeat)` + 末尾除以 repeat 只产出
+        //    "一条平均值"，无法做分位数统计。现在一次调用 = 一次运行 = 一条记录，
+        //    重复与预热由调用方循环（见 `online`/`sum` 两个实验分支）。
+        {
+            static_cast<void>(0);
             const auto t0 = Clock::now();
             CountResult c;
             uint64_t rpc0 = 0, rpc1 = 0, s0 = 0, s1 = 0;
@@ -1096,12 +1134,8 @@ public:
             r.node_words_delta[0] += aw0 - nw0;
             r.node_words_delta[1] += aw1 - nw1;
         }
-        // 平均口径（进程内/两进程都报"平均每次"）
-        r.count_ms /= o_.repeat;
-
-        // **精确对照**：查询集数 == 列数 × repeat（一列 = 一个条目 = 1 个查询集）
-        const uint64_t expected =
-            static_cast<uint64_t>(r.columns_used) * o_.repeat;
+        // **精确对照**：查询集数 == 列数（一列 = 一个条目 = 1 个查询集，单次运行）
+        const uint64_t expected = static_cast<uint64_t>(r.columns_used);
         r.columns_identity_ok = (r.queries_issued == expected);
         if (!r.columns_identity_ok) {
             throw std::runtime_error("查询集数 " + Num(r.queries_issued) +
@@ -1109,11 +1143,11 @@ public:
         }
         // 每台 RPC 次数 == 查询（Count）次数；标量路径恒 0
         for (int i = 0; i < 2; ++i) {
-            if (r.rpc_delta[static_cast<size_t>(i)] != o_.repeat) {
+            if (r.rpc_delta[static_cast<size_t>(i)] != 1) {
                 throw std::runtime_error(
                     "服务器 " + Num(static_cast<uint64_t>(i)) + " 的 PIR RPC 次数 " +
                     Num(r.rpc_delta[static_cast<size_t>(i)]) + " ≠ 查询次数 " +
-                    Num(o_.repeat) + "（一次 RunBatch 必须恒 1 次 RPC）");
+                    Num(1) + "（一次 RunBatch 必须恒 1 次 RPC）");
             }
             if (r.scalar_delta[static_cast<size_t>(i)] != 0) {
                 throw std::runtime_error("标量 ServerResp 被调用了（批量路径不应走标量接口）");
@@ -1453,7 +1487,13 @@ Json RowJson(const Row& r) {
         .U64("relay_phase_frames_server1", r.relay_phase_frames_delta[1]);
 
     Json out;
-    out.Str("experiment", r.experiment)
+    // ⚠️ **这次运行的标识在 `point` 顶层**（不是 `geometry` 里）：
+    //    `points` 里每个元素都是**单次运行**的原始数据；`is_warmup=true` 的那条
+    //    由**外部分析脚本**排除 —— **系统不做任何统计**。
+    out.U64("run_index", r.run_index)
+        .Bool("is_warmup", r.is_warmup)
+        .Dbl("wall_ms", r.wall_ms, 4)
+        .Str("experiment", r.experiment)
         .Str("mode", r.mode)
         .Raw("geometry", g.Dump())
         .Raw("budget", b.Dump())
@@ -1608,8 +1648,16 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
         PrintGeometry(g, false);
         PrintBudget(b);
         p.Init();
-        Row r = p.RunCount();
-        r.experiment = "online";  // `--exp all` 下也必须能分辨是哪张表的点
+        // **逐次运行**：`warmup` 次预热 + `repeat` 次测量，**每次都独立产出一条记录**。
+        // ⚠️ 人读表用 `r`（= **最后一次测量**运行）；`rows` 里一条不少（含预热那条）。
+        const uint32_t total_runs = o.repeat + o.warmup;
+        Row r;
+        for (uint32_t run = 0; run < total_runs; ++run) {
+        const auto t_run = Clock::now();       // 本次运行的墙钟起点（只含在线部分）
+        Row one = p.RunCount();
+        one.experiment = "online";  // `--exp all` 下也必须能分辨是哪张表的点
+        one.run_index = run;
+        one.is_warmup = (run < o.warmup);
         if (o.with_sum) {
             // 重新造一份 filter 给 Sum 用（同一谓词；**不动** L14 预算：Sum 不额外消耗 word 查询）
             std::vector<uint8_t> filter;
@@ -1623,9 +1671,14 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
                 bcount = Popcount(filter);
             }
             // （filter 与上面那次 Count 同源：同一谓词；或裸列模式下的全命中）
-            r.baseline_count = bcount;
-            p.RunSum(&r, filter, 0xA0900000u + static_cast<uint64_t>(N));
-            if (o.columns == 0) r.count = bcount;  // 裸列模式保留上面实测的 popcount
+            one.baseline_count = bcount;
+            // ⚠️ 盐**随运行变化**：否则每次运行的 challenge 逐位相同，预热就白做了。
+            p.RunSum(&one, filter, 0xA0900000u + static_cast<uint64_t>(N) + run);
+            if (o.columns == 0) one.count = bcount;  // 裸列模式保留上面实测的 popcount
+        }
+        one.wall_ms = MsSince(t_run);
+        if (!one.is_warmup) r = one;          // 人读表用最后一次**测量**运行
+        rows.push_back(std::move(one));
         }
         HPRINT("%8zu %6zu %6zu %6llu %6llu %6llu %9llu %6llu %8llu %8llu %8llu %10.2f %12.4f\n",
                     N, g.entry_words, g.m,
@@ -1654,7 +1707,8 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
                static_cast<unsigned long long>(g.backup_hints),
                static_cast<unsigned long long>(r.backup_remaining),
                r.init_ms + r.count_ms + r.sum_ms);
-        rows.push_back(std::move(r));
+        // ⚠️ **不要**在这里再 push：记录已经由上面的逐次运行循环产出
+        //    （早先遗留这一行 ⇒ 每个点会多出一条与最后一条测量**重复**的记录）。
     }
     return rows;
 }
@@ -1684,13 +1738,24 @@ std::vector<Row> ExpSum(const Options& o, ServerProcesses* servers) {
         PrintGeometry(g, false);
         PrintBudget(b);
         p.Init();
-        Row r = p.RunCount();
-        r.experiment = "sum";
+        // 与 online 分支同一纪律：逐次运行、每次一条记录、预热标记后由脚本排除。
+        const uint32_t total_runs = o.repeat + o.warmup;
+        Row r;
+        for (uint32_t run = 0; run < total_runs; ++run) {
+        const auto t_run = Clock::now();       // 本次运行的墙钟起点（只含在线部分）
+        Row one = p.RunCount();
+        one.experiment = "sum";
+        one.run_index = run;
+        one.is_warmup = (run < o.warmup);
         const std::vector<mpraq_baseline::Pred> bp = p.BaselinePredicates();
         std::vector<uint8_t> filter =
             (o.columns > 0) ? std::vector<uint8_t>(N, 1) : mpraq_baseline::Filter(p.baseline(), bp);
-        r.baseline_count = Popcount(filter);
-        p.RunSum(&r, filter, 0xA0900001u + static_cast<uint64_t>(N));
+        one.baseline_count = Popcount(filter);
+        p.RunSum(&one, filter, 0xA0900001u + static_cast<uint64_t>(N) + run);
+        one.wall_ms = MsSince(t_run);
+        if (!one.is_warmup) r = one;
+        rows.push_back(std::move(one));
+        }
         HPRINT("%8zu %9llu %9llu %9llu %9llu %9llu %10llu %10llu %10.2f %10.2f %11llu %11llu %10.2f\n",
                     N, static_cast<unsigned long long>(g.m),
                     static_cast<unsigned long long>(r.sm.rounds),
@@ -1717,7 +1782,7 @@ std::vector<Row> ExpSum(const Options& o, ServerProcesses* servers) {
                     static_cast<unsigned long long>(r.baseline_sum),
                     static_cast<unsigned long long>(r.baseline_sum_count),
                     (r.sum == static_cast<uint128_t>(r.baseline_sum) ? "✓" : "✗"));
-        rows.push_back(std::move(r));
+        // 同上：记录已由逐次运行循环产出，这里不再 push。
     }
     return rows;
 }
@@ -2100,13 +2165,14 @@ int main(int argc, char** argv) {
                 const MpraqScaleEstimate est = EstimateScale(c);
                 HPRINT("\nscale %s\n", est.Headline().c_str());
                 if (o.verbose) HPRINT("%s", est.Report().c_str());
-                const uint64_t planned = est.query_sets * o.repeat;
+                const uint64_t planned = est.query_sets * (o.repeat + o.warmup);
                 if (planned > est.budget) {
                     // ⚠️ 列粒度：一次列查询 = 1 个查询集 ⇒ 计划量 = 去重列数 × repeat，
                     //    **不再乘以 ⌈N/128⌉**；上限 = min(N_T = λw/2, m)（台账 L14）。
                     std::ostringstream oss;
                     oss << "[mpraq_bench][budget_rejected] planned_sets=" << planned
                         << " dedup_columns=" << est.dedup_columns << " repeat=" << o.repeat
+                        << " warmup=" << o.warmup
                         << " limit=" << est.budget << " N_T=" << est.backup_hints
                         << " m=" << est.pool_m << " binding="
                         << (est.pool_m <= est.backup_hints ? "pool(m)" : "hint(N_T)")
