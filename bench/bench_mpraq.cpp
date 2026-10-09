@@ -396,7 +396,7 @@ struct Options {
     bool has_seed = false;
     // ⚠️ 默认**拒绝** N > 2^15（D34：两进程下每次 Sum 要下发 2×(13+152N) 字节的安装帧）。
     // 加这个开关只是让"越界探测"成为**显式**动作（默认仍按文档的限制跳过）。
-    bool allow_large_n = false;
+    bool allow_large_n = false;   // 已废弃：保留只为兼容旧命令行（见上）
 };
 
 std::vector<size_t> ParseSizeList(const std::string& s) {
@@ -519,6 +519,7 @@ Options ParseArgs(int argc, char** argv) {
         } else if (a == "--sum-attr") {
             o.sum_attr = std::stoi(next("--sum-attr"));
         } else if (a == "--allow-large-n") {
+            // 兼容保留：N 上限已取消，本旗标**已无作用**（no-op）。
             o.allow_large_n = true;
         } else if (a == "--quick") {
             o.quick = true;
@@ -534,7 +535,7 @@ Options ParseArgs(int argc, char** argv) {
                    "                   [--server0 host:port --server1 host:port]\n"
                    "                   [--spawn-servers PATH_TO_mpraq_server] [--quick]\n"
                    "                   [--verbose]  # 额外打印规模派生明细（默认只打一行 [规模]）\n"
-                   "                   [--allow-large-n]  # 越过 N > 2^15 的默认保护（探测用）\n"
+                   "                   [--allow-large-n]  # 已废弃（N 上限已取消，保留只为兼容旧命令行）\n"
                    "\n"
                    "规模配置层（负责人只管三个量；其余全部自动派生）：\n"
                    "  --config FILE              规模配置 JSON（默认值同 config/mpraq_scale.json）\n"
@@ -1567,16 +1568,21 @@ std::vector<Row> ExpOnline(const Options& o, ServerProcesses* servers) {
                 "m", "e_words", "w", "kappa", "sets", "cols", "rpc0", "rpc1", "blocks",
                 "count_ms", "ms/set");
     for (size_t N : o.rows) {
-        if (N > (1u << 15)) {
-            if (!o.allow_large_n) {
-                // 默认跳过 N > 2^15：两进程安装帧 = 2×(13+152N)；D34 的限制（N ≥ 2^16 需
-                // 分块安装，未实现）。加 `--allow-large-n` 可探测。
-                HPRINT("  skip N=%zu reason=n_gt_2^15 install_frames_mb=%.1f allow_large_n=0\n",
-                       N, 2.0 * (13 + 152.0 * static_cast<double>(N)) / 1048576.0);
-                continue;
-            }
-            HPRINT("  large_n N=%zu allow_large_n=1 install_frames_mb=%.1f\n",
-                   N, 2.0 * (13 + 152.0 * static_cast<double>(N)) / 1048576.0);
+        // ⚠️ **N 不再有默认上限**（此前默认跳过 N > 2^15）。
+        //    但仍然存在一条**硬物理边界**：安装帧是**一条 gRPC 消息**，
+        //    大小 = `13 + 152·N` 字节/台，而两侧的收包上限都是 256 MiB
+        //    （`net/grpc_limits.hpp`）⇒
+        //        N = 2^20 ⇒ 152 MiB  ✅ 能过
+        //        N = 2^21 ⇒ 304 MiB  ❌ 超上限（RESOURCE_EXHAUSTED）
+        //        N = 2^22 ⇒ 608 MiB  ❌ 超上限
+        //    ⇒ 要跑 N ≥ 2^21 必须**抬收包上限**或**实现分块安装**（D34 的遗留项）。
+        //    这里只在越界时**提示**，不再跳过 —— 让失败在真实链路上一目了然，
+        //    而不是悄悄少跑一个点。
+        if (o.mode != Mode::kLocal && (13ull + 152ull * N) > static_cast<uint64_t>(kGrpcClientMaxReceiveBytes)) {
+            HPRINT("  warn N=%zu install_frame_mb=%.1f > max_receive_mb=%d"
+                   " ⇒ 该点在真实 gRPC 上会因收包上限失败（需抬上限或分块安装）\n",
+                   N, (13.0 + 152.0 * static_cast<double>(N)) / 1048576.0,
+                   kGrpcClientMaxReceiveBytes / 1048576);
         }
         Point p(o, N, o.lambda, o.eps, o.w, servers);
         const Geometry& g = p.geom();
