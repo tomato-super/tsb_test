@@ -46,6 +46,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     message(STATUS "未指定 CMAKE_BUILD_TYPE ⇒ 默认使用 Release（-O3）")
 endif()
 
+message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
+
 # ctest 必须在顶层启用，否则 build/CTestTestfile.cmake 不会生成，
 # `ctest` 会报告 "No tests were found"。
 enable_testing()
