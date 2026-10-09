@@ -230,7 +230,7 @@ result baseline_match=1 rpc_per_batch=1 sm_rounds=2 storage_formula_match=1
 | `net/transport.hpp` | 传输抽象（`Submit` / `Collect` / `SetHandler`） |
 | `net/grpc_mpraq.*` | MPRAQ 数据通道（线协议 **v3**） |
 | `net/grpc_transport.*` | 通用 **Relay**（SecureMul 四条腿，opaque 字节） |
-| `net/mpraq_remote_securemul.*` | 两进程 SecureMul（14 字节封套 + 原样批量帧） |
+| `net/mpraq_remote_securemul.*` | 两进程 SecureMul（**13 字节**标记封套 + 原样批量帧） |
 | `net/grpc_vmpq.*` | VMPQ 数据通道 |
 | `net/grpc_limits.hpp` | **收包上限**（gRPC 默认 4 MiB，必须显式放宽） |
 
