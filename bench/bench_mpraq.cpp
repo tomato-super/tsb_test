@@ -534,6 +534,8 @@ Options ParseArgs(int argc, char** argv) {
                    "                   [--security-mode malicious|semi-honest] [--no-sum] [--json] [--json-out FILE]\n"
                    "                   [--server0 host:port --server1 host:port]\n"
                    "                   [--spawn-servers PATH_TO_mpraq_server] [--quick]\n"
+                   "                                  # --quick：用小的默认扫描；**只覆盖未显式指定的轴**\n"
+                   "                                  #（显式给了 --rows/--lambda/--eps 就保留它们）\n"
                    "                   [--verbose]  # 额外打印规模派生明细（默认只打一行 [规模]）\n"
                    "                   [--allow-large-n]  # 已废弃（N 上限已取消，保留只为兼容旧命令行）\n"
                    "\n"
@@ -826,7 +828,14 @@ struct Row {
     double hint_logical_bytes = 0.0;   // 实现口径（每条 hint 的字段口径）
     uint64_t hint_state_bytes = 0;     // 实际分配
     uint64_t block_key_bytes = 0;      // c 把 iPRF 密钥
-    uint64_t cache_bytes = 0;          // Plinko 的重复查询缓存 Q（n 条）
+    // Plinko 的重复查询缓存 Q 的**实际分配**（= `m × entry_words × 16`；关缓存时为 0）。
+    // ⚠️ 它**已经包含在** `hint_state_bytes` 里（两者**不要相加**）。
+    uint64_t cache_bytes = 0;
+    // 两个客户端内存口径（见 `MpraqClient::client_state_bytes` 的注释）：
+    //   state = **真实部署**需要的（hint 表 + 块密钥）
+    //   sim   = **仅单机仿真**额外持有的（明文表 + 四份共享 + 明文属性）
+    uint64_t client_state_bytes = 0;
+    uint64_t client_sim_bytes = 0;
     double hint_formula_task_bytes = 0.0;   // H × 16.125
     double hint_formula_spec_bytes = 0.0;   // H × 32.125（= entry(16) + 16.125）
 
@@ -1248,7 +1257,13 @@ public:
         r.hint_logical_bytes = client_->logical_hint_bytes();
         r.hint_state_bytes = client_->hint_state_bytes();
         r.block_key_bytes = geom_.kappa * 32ull;  // IprfKey = 2 × AES-128 密钥
-        r.cache_bytes = geom_.m * (16ull + 1ull + 8ull);
+        // ⚠️ 此前这里写的是 `geom_.m * (16+1+8)` = `25·m`，**与真实分配不符**
+        //    （真实是 `m × entry_words × 16`；N=4096 时应为 8192，而它报 400），
+        //    并且与 `hint_state_bytes()` 里已含的 `cache_value_` **重复计数**。
+        //    改为读**实测值**（关缓存时 `cache_value_` 为空 ⇒ 0）。
+        r.cache_bytes = static_cast<uint64_t>(client_->plinko().cache_value_bytes());
+        r.client_state_bytes = client_->client_state_bytes();
+        r.client_sim_bytes = client_->client_sim_bytes();
         r.hint_formula_task_bytes =
             static_cast<double>(geom_.hint_slots) * 16.125;               // 任务书的写法（不含 parity）
         r.hint_formula_spec_bytes =
@@ -1366,6 +1381,9 @@ Json RowJson(const Row& r) {
         .Dbl("hint_formula_entry_plus_16_125_bytes", r.hint_formula_spec_bytes, 2)
         .U64("block_key_bytes", r.block_key_bytes)
         .U64("repeat_query_cache_bytes", r.cache_bytes)
+        // ⚠️ `repeat_query_cache_bytes` **已含在** `hint_state_bytes` 里，**不要相加**。
+        .U64("client_state_bytes", r.client_state_bytes)
+        .U64("client_sim_bytes", r.client_sim_bytes)
         .U64("hint_consumed", r.hint_consumed)
         .U64("backup_remaining", r.backup_remaining);
 
@@ -2109,9 +2127,29 @@ int main(int argc, char** argv) {
         }
 
         if (o.quick) {
-            o.rows = {1024, 2048, 4096};
-            o.lambda_list = {32, 80};
-            o.eps_list = {1e-4, 1e-8};
+            // ⚠️ 此前这里**无条件覆盖** `rows/lambda/eps` ⇒
+            //    `--exp online --rows 262144 --quick` 会**静默跑 1024/2048/4096**，
+            //    得到一份"看起来正常、实际不是你要的 N"的结果。对驱动脚本是致命的。
+            // ⇒ 改为**只覆盖用户没有显式指定的轴**，并把被跳过的轴明确说出来。
+            std::string kept;
+            if (o.has_rows) {
+                kept += " rows(显式 " + std::to_string(o.rows.size()) + " 个取值)";
+            } else {
+                o.rows = {1024, 2048, 4096};
+            }
+            if (o.has_lambda) {
+                kept += " lambda(" + std::to_string(o.lambda) + ")";
+            } else {
+                o.lambda_list = {32, 80};
+            }
+            if (o.has_eps) {
+                kept += " eps(" + std::to_string(o.eps) + ")";
+            } else {
+                o.eps_list = {1e-4, 1e-8};
+            }
+            if (!kept.empty()) {
+                HPRINT("  --quick: 保留显式指定的轴：%s\n", kept.c_str());
+            }
         }
 
         if (o.json) g_human = stderr;  // JSONL → stdout，人读表格 → stderr

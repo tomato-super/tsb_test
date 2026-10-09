@@ -748,6 +748,28 @@ IprfKey MpraqClient::block_key(uint64_t block) const {
 
 size_t MpraqClient::hint_slot_count() const { return plinko_->hint_slot_count(); }
 size_t MpraqClient::hint_state_bytes() const { return plinko_->hint_state_bytes(); }
+
+uint64_t MpraqClient::client_state_bytes() const {
+    // hint 表 + 重复查询缓存（都在 PlinkoClient 里，由 `hint_state_bytes()` 一并统计）
+    // + 每区块一把 iPRF 密钥（`IprfKey` = 2 × AES-128 密钥 = 32 B，架构相关但稳定）。
+    const uint64_t hints = static_cast<uint64_t>(plinko_ ? plinko_->hint_state_bytes() : 0);
+    const uint64_t keys = 32ull * static_cast<uint64_t>(store_.plinko.blocks());
+    return hints + keys;
+}
+
+uint64_t MpraqClient::client_sim_bytes() const {
+    // **仅单机仿真**的额外常驻（真实部署不需要）。逐项对应 `init.hpp` 的成员声明。
+    const uint64_t words = 16ull * static_cast<uint64_t>(plain_words_.size());
+    const uint64_t shares = 16ull * static_cast<uint64_t>(feature_share0_.size()) +
+                            16ull * static_cast<uint64_t>(feature_share1_.size());
+    const uint64_t tags = 16ull * static_cast<uint64_t>(tag_share0_.size()) +
+                          16ull * static_cast<uint64_t>(tag_share1_.size());
+    uint64_t attrs = 8ull * static_cast<uint64_t>(plain_features_.size());
+    for (const auto& col : plain_attrs_) attrs += 8ull * static_cast<uint64_t>(col.size());
+    for (const auto& v : attr_share0_) attrs += 16ull * static_cast<uint64_t>(v.size());
+    for (const auto& v : attr_share1_) attrs += 16ull * static_cast<uint64_t>(v.size());
+    return words + shares + tags + attrs;
+}
 double MpraqClient::logical_hint_bytes() const { return plinko_->logical_hint_bytes(); }
 size_t MpraqClient::backup_remaining() const { return plinko_->backup_remaining(); }
 uint64_t MpraqClient::query_count() const { return plinko_->query_count(); }

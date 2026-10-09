@@ -335,6 +335,24 @@ public:
     size_t hint_slot_count() const;      // H = λw+q
     size_t hint_state_bytes() const;     // 实际分配的状态字节
     double logical_hint_bytes() const;   // 按 §2 表口径的每条 hint 开销
+
+    // ---------------------------------------------------------------------
+    // **客户端内存的两个口径**（实验表要"客户端存储 KB"，必须先定口径）
+    // ---------------------------------------------------------------------
+    //
+    // `client_state_bytes()` —— **真实部署需要的客户端状态**：
+    //     hint 表（含重复查询缓存）+ 每区块的 iPRF 密钥。
+    //     这是"换台机器只拿客户端"时真正要常驻的东西。
+    //
+    // `client_sim_bytes()` —— **本仓库单机仿真额外持有的东西**：
+    //     明文特征表 + 两份特征 XOR 共享 + 两份 tag 共享（恶意档）
+    //     + 明文属性值 + 两份属性 mod q 共享 + 逐记录行标签。
+    //     真实部署里：明文表由 offline server 持有、共享传完即弃 ⇒ 这些**都不需要**。
+    //
+    // ⚠️ **两个数不要混用**：前者用于与其它协议对比"客户端存储"，
+    //    后者只有当你要解释"为什么本 demo 的客户端 RSS 比服务器还大"时才用。
+    uint64_t client_state_bytes() const;
+    uint64_t client_sim_bytes() const;
     size_t backup_remaining() const;
     uint64_t query_count() const;
     // 覆盖掩码（诊断/测试）：长度 n，1 = 该 word 被某条 hint 覆盖
