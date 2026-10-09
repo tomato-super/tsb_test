@@ -282,10 +282,14 @@ struct BenchScaleState {
         return static_cast<size_t>(cfg.attributes) *
                static_cast<size_t>(cfg.columns_per_attribute);
     }
-    // 谓词路径下去重列数（每个自动谓词恰好 1 列 ⇒ min(k, M)）
+    // 谓词路径下去重列数。⚠️ **这是规模层 `EstimateScale` 的重复公式** ——
+    //    加了新区间轴之后两处必须同步，否则预算会被**低估**（区间模式下实测
+    //    `columns_used` 会是这里的 2 倍）。本次就踩到了：预估 2、实测 4。
+    //    口径：单列阈值谓词 1 列/个；`kRange` **2 列/个**（下界 + 上界）。
     size_t dedup_columns() const {
         if (!enabled) return kRealColumns;  // 旧口径：按上界 M 计划（见 Point::PlannedColumns）
-        return std::min<size_t>(cfg.predicates, real_columns());
+        const size_t per = cfg.interval_width > 0 ? 2u : 1u;
+        return std::min<size_t>(static_cast<size_t>(cfg.predicates) * per, real_columns());
     }
 };
 
@@ -379,6 +383,10 @@ struct Options {
     std::string spawn_servers;        // grpc 模式：自动 fork/exec 服务器进程的路径
     bool keep_servers = false;        // 调试：跑完不杀自己起的服务器
     int sum_attr = 1;
+    // ⚠️ **是否显式给了 `--sum-attr`**。没给时必须回退到**规模层的派生值**
+    //    （`attributes >= 2 ? 1 : 0`）—— 否则 `--attributes 1` 会拿 attr_id=1 去求和，
+    //    当场 `SumOverFilter: 属性号越界`（本 bench 此前就有这个 bug，加区间轴时暴露）。
+    bool has_sum_attr = false;
     bool quick = false;
     // 默认只打一行 `[规模]` 摘要（连同表格已给出的几何）；`--verbose` 追加 `est.Report()`
     // 的完整派生明细。**只影响人读输出**：`--json` 契约与 L14 拒绝路径不受影响。
@@ -394,6 +402,8 @@ struct Options {
     bool has_attributes = false;
     uint32_t attributes = 0;
     bool has_predicates = false;
+    uint32_t interval_width = 0;          // 区间宽度 k（> 0 时启用区间模式）
+    bool has_interval_width = false;
     uint32_t predicates = 0;
     // 规模层只有在**显式**给出 `--config` 或上面三个规模旗标之一时启用（其余情况逐位保持旧行为）
     bool scale_enabled = false;
@@ -508,6 +518,10 @@ Options ParseArgs(int argc, char** argv) {
             o.predicates = static_cast<uint32_t>(std::stoul(next("--predicates")));
             o.has_predicates = true;
             o.scale_enabled = true;
+        } else if (a == "--interval-width") {
+            o.interval_width = static_cast<uint32_t>(std::stoul(next("--interval-width")));
+            o.has_interval_width = true;
+            o.scale_enabled = true;
         } else if (a == "--repeat") {
             o.repeat = static_cast<uint32_t>(std::stoul(next("--repeat")));
         } else if (a == "--warmup") {
@@ -528,6 +542,7 @@ Options ParseArgs(int argc, char** argv) {
             o.keep_servers = true;
         } else if (a == "--sum-attr") {
             o.sum_attr = std::stoi(next("--sum-attr"));
+            o.has_sum_attr = true;
         } else if (a == "--allow-large-n") {
             // 兼容保留：N 上限已取消，本旗标**已无作用**（no-op）。
             o.allow_large_n = true;
@@ -554,6 +569,8 @@ Options ParseArgs(int argc, char** argv) {
                    "  --columns-per-attribute C  列数 = **每个属性**的 LCTE 列数（**必须是 2 的幂**）\n"
                    "  --attributes A             属性数（M = 属性数 × 每属性列数）\n"
                    "  --predicates K             谓词数 k（谓词内容自动生成；去重列数 = min(k, M)）\n"
+                   "  --interval-width K         **区间宽度 k**：谓词改为 `kRange [a,a+k)`（>0 启用）\n"
+                   "                             ⚠️ 每谓词占 **2 列**，且要求 predicates <= attributes\n"
                    "  （--rows / --lambda / --eps / --seed 既有的旗标同样逐项覆盖配置）\n"
                    "  ⚠️ 只有给出 --config 或上面三个规模旗标之一时才启用规模层；\n"
                    "     否则逐位保持旧行为（属性 0/1 = 6/4 列、M = 10、谓词 = --predicate）。\n"
@@ -970,6 +987,13 @@ public:
     //   --columns K ⇒ 精确 K；
     //   规模层 ⇒ 谓词路径的**精确**去重列数 min(k, M)（每个自动谓词恰好 1 列）；
     //   旧行为 ⇒ 按谓词路径取**上界 M**（最坏情形，保证不会中途超预算）
+    // Sum/Avg 作用的属性号：**显式 > 规模层派生 > 老路径（2 个属性 ⇒ 1）**。
+    uint32_t SumAttr() const {
+        if (o_.has_sum_attr) return SumAttr();
+        if (has_scale_) return scale_setup_.sum_attr;
+        return 1u;   // 老路径 schema 固定 2 个属性
+    }
+
     uint64_t PlannedColumns() const {
         if (o_.columns > 0) return o_.columns;
         if (has_scale_) return g_scale.dedup_columns();
@@ -1185,12 +1209,12 @@ public:
         SumResult s;
         if (remote()) {
             s = SumOverFilter(CountResultFromFilter(filter, r->baseline_count), schema_,
-                              static_cast<uint32_t>(o_.sum_attr), *client_, *transport_,
+                              SumAttr(), *client_, *transport_,
                               *ep0_, *ep1_, *mac_, *prng_, salt);
         } else {
             local_net_ = std::make_unique<LocalTransport>(2);
             s = SumOverFilter(CountResultFromFilter(filter, r->baseline_count), schema_,
-                              static_cast<uint32_t>(o_.sum_attr), *client_, *local_net_,
+                              SumAttr(), *client_, *local_net_,
                               *mac_, *prng_, salt);
         }
         const double ms = MsSince(t0);
@@ -1212,7 +1236,7 @@ public:
         const std::vector<mpraq_baseline::Pred> bpreds =
             (o_.columns > 0) ? std::vector<mpraq_baseline::Pred>{} : MakeBaselinePreds();
         const mpraq_baseline::Moments bm =
-            mpraq_baseline::Aggregate(baseline_, bpreds, o_.sum_attr);
+            mpraq_baseline::Aggregate(baseline_, bpreds, SumAttr());
         r->baseline_sum = bm.sum;
         r->baseline_sum_count = bm.count;
         if (s.sum != static_cast<uint128_t>(bm.sum) || s.count != bm.count) {
@@ -2176,6 +2200,7 @@ int main(int argc, char** argv) {
             if (o.has_cpa) ov.columns_per_attribute = o.columns_per_attribute;
             if (o.has_attributes) ov.attributes = o.attributes;
             if (o.has_predicates) ov.predicates = o.predicates;
+            if (o.has_interval_width) ov.interval_width = o.interval_width;
             if (o.has_lambda) ov.lambda = o.lambda;
             if (o.has_eps) ov.eps = o.eps;
             if (o.has_seed) ov.seed = o.seed;

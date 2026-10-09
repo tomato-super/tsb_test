@@ -93,6 +93,13 @@ struct MpraqScaleConfig {
     // ③ 属性数（>= 1）与谓词数 k（>= 1）
     uint32_t attributes = 2;
     uint32_t predicates = 3;
+    // ④ **区间宽度 k**（值域上的宽度；`0` = 现状：生成**单列阈值**谓词）。
+    //    > 0 时每个谓词生成 `kRange [a, a+k)`，占 **2 个 LCTE 列**（下界 + 上界）。
+    //    ⚠️ 区间模式下**每个属性最多一个区间谓词**：`kRange` 在同一属性上**同时**
+    //       给出下界与上界，而"同一属性上的谓词必须同向"这条纪律（见 `MakeSingleColumnPredicate`
+    //       上方注释）正是为了防止合取被夹成空集 ⇒ 两个不相交的区间在同一属性上会
+    //       让 Count 恒 0、`AvgOverFilter` 抛 `std::domain_error`。
+    uint32_t interval_width = 0;
     // ⑤ 安全参数与确定性种子
     uint32_t lambda = 80;   // Plinko 的 λ（失败概率 2^-λ）
     double eps = 1e-4;      // iPRF 的 PRP 目标 ε（D22-1；测试可调小加速）
@@ -144,6 +151,7 @@ struct MpraqScaleOverrides {
     std::optional<uint32_t> columns_per_attribute;
     std::optional<uint32_t> attributes;
     std::optional<uint32_t> predicates;
+    std::optional<uint32_t> interval_width;   // 区间宽度 k（0 = 单列阈值模式）
     std::optional<uint32_t> lambda;
     std::optional<double> eps;
     std::optional<uint64_t> seed;
@@ -174,6 +182,7 @@ struct MpraqScaleEstimate {
     uint64_t columns_per_attribute = 0;   // 每属性列数
     uint64_t attributes = 0;
     uint64_t predicates = 0;              // k
+    uint32_t interval_width = 0;          // 区间宽度（0 = 单列阈值模式）
     uint32_t lambda = 0;
     double eps = 0.0;
     MpraqSecurityMode security_mode = kDefaultMpraqSecurityMode;   // 配置回声

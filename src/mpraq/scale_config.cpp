@@ -49,8 +49,8 @@ uint64_t NextPow2Local(uint64_t v) {
 }
 
 const char* const kKnownFields[] = {"rows",       "columns_per_attribute", "attributes",
-                                    "predicates", "lambda",                "eps",
-                                    "seed",       "security_mode",
+                                    "predicates", "interval_width",        "lambda",
+                                    "eps",        "seed",                   "security_mode",
                                     "enable_repeat_query_cache"};
 
 bool IsKnownField(const std::string& k) {
@@ -246,6 +246,8 @@ MpraqScaleConfig ParseDoc(const JsonConfig& doc) {
                    "columns_per_attribute");
     c.attributes = ToU32Field(GetU64(root, "attributes", c.attributes), "attributes");
     c.predicates = ToU32Field(GetU64(root, "predicates", c.predicates), "predicates");
+    c.interval_width =
+        ToU32Field(GetU64(root, "interval_width", c.interval_width), "interval_width");
     c.lambda = ToU32Field(GetU64(root, "lambda", c.lambda), "lambda");
     c.eps = GetDouble(root, "eps", c.eps);
     c.seed = GetU64(root, "seed", c.seed);
@@ -285,6 +287,19 @@ constexpr char kScaleGenTag[] = "mpraq-scale-gen";
 //   最紧的那个界在 q = ceil(k/属性数)−1 处取得 ⇒ 合取的选择性约 ((C−2)/(C−1))^属性数，
 //   既非空也非全命中（`test_mpraq_scale_config` 的 ⑫' 用例把这条钉住）。
 //   其中 q = j / 属性数（j = 全局谓词序号），C = 每属性列数。
+// **区间谓词**：`[lower, upper)`，宽度 = `upper − lower` = `interval_width`。
+// ⚠️ 它占 **2 个 LCTE 列**（下界 `¬[x<a]` 与上界 `[x<b]`），且**必须独占一个属性**
+//    —— 同一属性上放两个不相交区间会互相夹空（见 `ValidateScaleConfig` 的说明）。
+Predicate MakeRangePredicate(uint32_t attr_id, int64_t lower, int64_t upper) {
+    Predicate p;
+    p.by_id = true;
+    p.attribute_id = attr_id;
+    p.op = PredicateOp::kRange;
+    p.lower = lower;
+    p.upper = upper;
+    return p;
+}
+
 Predicate MakeSingleColumnPredicate(uint32_t attr_id, uint32_t column, bool lower_bound) {
     Predicate p;
     p.by_id = true;
@@ -367,6 +382,30 @@ void ValidateScaleConfig(const MpraqScaleConfig& c) {
         BadConfig("字段 'predicates'（谓词数 k）不能为 0 —— 至少要生成 1 个谓词；"
                   "`CountPredicates` 同样把空谓词列表视为调用方错误");
     }
+    // ④' **区间宽度 k** 的可行性（不满足即**拒绝**，绝不静默降级成单列谓词）
+    if (c.interval_width > 0) {
+        // 值域 = [0, C−2]（见 `ScaleDomainMax`），且要求下界 ≥ 1（躲开 `x >= 0` 恒真）
+        // ⇒ `[a, a+k)` 合法需要 `a ≥ 1` 且 `a+k ≤ C−1` ⇒ `C ≥ k + 2`。
+        if (static_cast<uint64_t>(c.columns_per_attribute) <
+            static_cast<uint64_t>(c.interval_width) + 2) {
+            BadConfig("区间宽度 interval_width = " + std::to_string(c.interval_width) +
+                      " 要求 columns_per_attribute >= interval_width + 2 = " +
+                      std::to_string(static_cast<uint64_t>(c.interval_width) + 2) +
+                      "（值域是 [0, 列数−2]，区间 [a, a+k) 还必须躲开恒真的下界 0）"
+                      " —— 当前每属性列数 = " +
+                      std::to_string(c.columns_per_attribute));
+        }
+        // `kRange` 在同一属性上**同时**给下界与上界；若同一属性上放两个**不相交**的区间，
+        // 合取会被夹成空集 ⇒ Count 恒 0、`AvgOverFilter` 抛 `std::domain_error`。
+        // ⇒ 区间模式下要求"每个属性最多一个区间谓词"，即 `谓词数 <= 属性数`。
+        if (c.predicates > c.attributes) {
+            BadConfig("区间模式（interval_width > 0）下每个属性最多 1 个区间谓词"
+                      "（同一属性上的两个区间会互相夹空）⇒ 要求 predicates <= attributes；"
+                      "当前 predicates = " + std::to_string(c.predicates) +
+                      "、attributes = " + std::to_string(c.attributes));
+        }
+    }
+
     const uint64_t M = static_cast<uint64_t>(c.attributes) *
                        static_cast<uint64_t>(c.columns_per_attribute);
     if (M > std::numeric_limits<uint32_t>::max()) {
@@ -532,6 +571,7 @@ MpraqScaleConfig ApplyOverrides(MpraqScaleConfig base, const MpraqScaleOverrides
     if (ov.columns_per_attribute) base.columns_per_attribute = *ov.columns_per_attribute;
     if (ov.attributes) base.attributes = *ov.attributes;
     if (ov.predicates) base.predicates = *ov.predicates;
+    if (ov.interval_width) base.interval_width = *ov.interval_width;
     if (ov.lambda) base.lambda = *ov.lambda;
     if (ov.eps) base.eps = *ov.eps;
     if (ov.seed) base.seed = *ov.seed;
@@ -628,7 +668,13 @@ MpraqScaleEstimate EstimateScale(const MpraqScaleConfig& config) {
     e.backup_hints = g.plinko.backup_hints();
     e.hint_slots = g.plinko.hint_slots();
 
-    e.dedup_columns = std::min<uint64_t>(config.predicates, e.levels);
+    // ⚠️ **区间模式每谓词占 2 列**（`kRange` = `¬[x<a] ∧ [x<b]` 两个 literal）；
+    //    单列阈值模式仍是 1 列。`levels = 属性数 × 每属性列数` 是天然上限。
+    const uint64_t cols_per_pred =
+        config.interval_width > 0 ? 2ull : 1ull;
+    e.dedup_columns =
+        std::min<uint64_t>(static_cast<uint64_t>(config.predicates) * cols_per_pred, e.levels);
+    e.interval_width = config.interval_width;
     // ⚠️ **一次列查询 = 1 个查询集**（一个条目 = 一整列）⇒ 查询集数 = 去重列数
     e.query_sets = e.dedup_columns;
     e.rpc_per_server = 1;
@@ -745,19 +791,36 @@ MpraqScaleSetup Build(const MpraqScaleConfig& config) {
     setup.predicates.reserve(config.predicates);
     std::set<std::pair<uint32_t, uint32_t>> seen;
     const uint32_t C = config.columns_per_attribute;
-    for (uint32_t j = 0; j < config.predicates; ++j) {
-        const uint32_t a = j % config.attributes;
-        const uint32_t q = (j / config.attributes) % C;   // 同一属性上的第几个谓词
-        const bool lower_bound = (a % 2 == 0);            // 偶属性 = 下界、奇属性 = 上界
-        const uint32_t c = lower_bound ? (1u + q) % C : (C - 2u + C - q) % C;
-        setup.predicates.push_back(MakeSingleColumnPredicate(a, c, lower_bound));
-        seen.insert({a, c});
+    if (config.interval_width > 0) {
+        // ---- 区间模式：每个谓词一个 `[a, a+k)`，**独占一个属性**（⇒ 合取恒可满足）----
+        // 值域 = [0, C−2]；下界从 1 起（躲开恒真的 `x >= 0`），上界 = 下界 + k <= C−1。
+        // `lower` 随 j 平移，让不同属性的区间**不是同一个**。
+        const int64_t k = static_cast<int64_t>(config.interval_width);
+        const int64_t room = static_cast<int64_t>(C) - 1 - k;   // 下界取值上界（含）
+        for (uint32_t j = 0; j < config.predicates; ++j) {
+            const uint32_t a = j % config.attributes;   // predicates <= attributes ⇒ 两两不同
+            const int64_t lower = 1 + (static_cast<int64_t>(j) * 3) % (room > 0 ? room : 1);
+            setup.predicates.push_back(MakeRangePredicate(a, lower, lower + k));
+            // 该区间用到的两个**阈值列**（列号 = 阈值，与单列模式同一口径）
+            seen.insert({a, static_cast<uint32_t>(lower)});
+            seen.insert({a, static_cast<uint32_t>(lower + k)});
+        }
+    } else {
+        for (uint32_t j = 0; j < config.predicates; ++j) {
+            const uint32_t a = j % config.attributes;
+            const uint32_t q = (j / config.attributes) % C;   // 同一属性上的第几个谓词
+            const bool lower_bound = (a % 2 == 0);            // 偶属性 = 下界、奇属性 = 上界
+            const uint32_t c = lower_bound ? (1u + q) % C : (C - 2u + C - q) % C;
+            setup.predicates.push_back(MakeSingleColumnPredicate(a, c, lower_bound));
+            seen.insert({a, c});
+        }
     }
     if (static_cast<uint64_t>(seen.size()) != e.dedup_columns) {
         std::ostringstream oss;
         oss << "规模层的内部不变量被破坏：生成的谓词落在 " << seen.size()
             << " 个不同 (属性, 列) 上，但预估的去重列数是 " << e.dedup_columns
-            << "（k=" << config.predicates << "、M=" << e.levels << "）";
+            << "（k=" << config.predicates << "、M=" << e.levels
+            << "、区间宽度=" << config.interval_width << "）";
         throw std::logic_error(oss.str());
     }
 
