@@ -88,10 +88,9 @@ bench/       bench_vmpq.cpp / bench_mpraq.cpp（参数与复杂度扫描，支�
 third_parts/json/json.hpp     JSON 解析（已入库，新克隆可构建）
 ```
 
-> ⚠️ **`doc/` 不在版本控制里**（`.gitignore` 排除，负责人的决定）。
-> 也就是说**新克隆里没有 `doc/`**，其中包括 `doc/TASK_PLAN.md`（决策台账）、
-> `doc/design/`（设计规格与评审）、`doc/evidence/`（实测原始输出）、`doc/paper/`。
-> 本文件的其余部分**不依赖** `doc/`，可独立阅读。
+> ⚠️ **本仓库的 `doc/` 目录不在版本控制里**（被 `.gitignore` 排除）。
+> 设计规格、评审报告与实测原始输出都放在那里，因此**拿到本仓库时不会有这些文件**。
+> 本文件的其余部分**不依赖** `doc/`，可独立阅读与使用。
 
 ---
 
@@ -105,20 +104,20 @@ third_parts/json/json.hpp     JSON 解析（已入库，新克隆可构建）
 
 ### MPRAQ（恶意，默认）
 
-`src/mpraq/` 按任务号组织：
+`src/mpraq/` 的模块划分（**自上而下即依赖方向**）：
 
-| 文件 | 任务 | 职责 |
-|---|---|---|
-| `lcte.{hpp,cpp}` | MPA-01 | LCTE 编码：阈值谓词 ⇒ 列；阈值对齐 |
-| `predicate.{hpp,cpp}` | MPA-02 | 谓词解析：操作符 → 列索引 + 取反；本地布尔组合（De Morgan） |
-| `init.{hpp,cpp}` | MPA-03 | 客户端 `Init`（离线七步）：LCTE → 位打包 → 共享 → 上传 |
-| `node.{hpp,cpp}` | MPA-03 | 服务器侧存储 + 与传输无关的通道抽象 |
-| `aggquery.{hpp,cpp}` | MPA-04 | **`Count`**（六步） |
-| `secure_mul_flow.{hpp,cpp}` | MPA-05 | **SecureMul 三方消息流** |
-| `aggvalue.{hpp,cpp}` | MPA-06 | **`Sum` / `Avg`**（批量 SecureMul） |
-| `verification.{hpp,cpp}` | MPA-07 | 验证边界：把"实际具备的验证能力"固化成可断言的代码 |
-| `scale_config.{hpp,cpp}` | MPA-08 | 规模配置：三个量 ⇒ 其余全自动派生 + 预估/实测对照 |
-| `security_mode.hpp` | — | 安全档位（恶意 / 半诚实） |
+| 文件 | 职责 |
+|---|---|
+| `lcte.{hpp,cpp}` | **LCTE 编码**：阈值谓词 ⇒ 列；阈值对齐 |
+| `predicate.{hpp,cpp}` | **谓词解析**：操作符 → 列索引 + 取反；本地布尔组合（De Morgan） |
+| `init.{hpp,cpp}` | **客户端 `Init`**（离线七步）：LCTE → 位打包 → 共享 → 上传 |
+| `node.{hpp,cpp}` | **服务器侧存储** + 与传输无关的通道抽象 |
+| `aggquery.{hpp,cpp}` | **`Count`**（六步） |
+| `secure_mul_flow.{hpp,cpp}` | **SecureMul 三方消息流** |
+| `aggvalue.{hpp,cpp}` | **`Sum` / `Avg`**（批量 SecureMul） |
+| `verification.{hpp,cpp}` | **验证边界**：把"实际具备的验证能力"固化成可断言的代码 |
+| `scale_config.{hpp,cpp}` | **规模配置**：三个量 ⇒ 其余全自动派生 + 预估/实测对照 |
+| `security_mode.hpp` | **安全档位**（恶意 / 半诚实） |
 
 > ⚠️ 命名空间是 **`tsb::mpraq`**（不是顶层 `tsb`）：`core/config.hpp` 已在 `tsb` 里
 > 定义了同名的 `PredicateOp` / `Predicate`。
@@ -165,13 +164,14 @@ Sum/Avg ① 离线 Beaver triple → ② 第 1 轮（N 条一个帧）→ ③ �
 | | **恶意**（默认） | **半诚实** |
 |---|---|---|
 | xmac（PIR 值层完整性） | ✅ 每条目每 chunk 一份 tag，逐 chunk 校验 `M_b = γ ⊙ R_b` | ❌ **什么都不做**（不采样 γ、不存、不传、不校验） |
-| SecureMul 的 SPDZ MAC 与 §4.5-A/B 复核 | ✅ 全部执行 | ❌ **全部跳过** |
+| SecureMul 的 SPDZ MAC 与两条纯客户端复核 | ✅ 全部执行 | ❌ **全部跳过** |
 | 存储 / 应答 | 含 tag ⇒ 数据表 ×2 | 减半 |
 | 可见证据 | `tag_checks = 查询集数` | `tag_checks=0`、`storage` 少 `16·m·entry_words` B |
 
 > ⚠️ **半诚实档下服务器篡改会被静默接受** —— 这是**如实声明的边界**，不是缺陷：
 > 该档的威胁模型里服务器不偏离协议。要验证请用恶意档（默认档）。
-> ⚠️ 两条**绝不随档位省掉**的：hint 消费 + 每轮 `Refresh`（D17）、查询预算预检。
+> ⚠️ 两条**绝不随档位省掉**的：**hint 消费 + 每轮刷新**（Plinko 的 hint 若被复用，
+> 会向半诚实服务器泄露查询落在哪个分区）、**查询预算预检**。
 
 ### 5.3 重复查询缓存开关
 
@@ -295,7 +295,7 @@ scripts/run.sh test          # 等价于 ctest --test-dir build --output-on-fail
 
 | 套件 | 用例 | 覆盖 |
 |---|---|---|
-| `test_mpraq_entry` | 13 | MPRAQ 条目/档位契约：四组不变量、列粒度、存储公式、档位接口、tag 存储、**篡改必拒**、协议版本拒绝、半诚实档不校验 |
+| `test_mpraq_entry` | 13 | MPRAQ 条目/档位契约：五条不变量、列粒度、存储公式、档位接口、tag 存储、**篡改必拒**、协议版本拒绝、半诚实档不校验 |
 | `test_plinko_contract` | 10 | Plinko 底座：几何自洽、精确重建、XOR 线性、**hint 生命周期**、重复查询重采样、备份耗尽、`Verify` 恒抛、确定性、**缓存开关** |
 | `test_gf128` | 6 | `GF(2^128)`：位序与约简多项式（**独立可推导**）、域公理、逆元与单射、XOR 同态、**不可约性严格证明** |
 | `test_aggvalue` | 6 | `Sum`/`Avg`：明文基准一致、`Avg` 口径、**篡改 ⇒ 整体 abort（绝不返回部分和）**、长度校验、确定性、两档 |
@@ -316,10 +316,10 @@ scripts/run.sh test          # 等价于 ctest --test-dir build --output-on-fail
 | 4 | **`bench_mpraq` 不单列"PIR 应答字节"** | 恶意档应答翻倍但账目里看不到 |
 | 5 | **`protoc` 路径钉死在 `~/.local`** | 换机器要改 `proto/CMakeLists.txt` |
 | 6 | **两台共谋与元数据信道在模型之外** | 中转 `e` 的隐信道（≈127 bit/记录，需共谋）、时序信道、abort 下标信道 |
-| 7 | **摊销式离线未实现**（D8） | 查询额度 = `min(m, N_T)`，用完须重跑 `HintInit` |
+| 7 | **摊销式离线未实现** | 查询额度 = `min(m, N_T)`，用完须重跑 `HintInit` |
 | 8 | **`doc/` 不在版本控制内** | 设计文档与实测证据只存在于本机 |
 
-论文侧待改的 6 条见 `doc/design/mparq_review/FINAL_ADJUDICATION.md`（本机文件）。
+论文侧还有 6 条措辞/符号需要订正（记录在本机的设计文档里，不在本仓库中）。
 
 ---
 
@@ -330,7 +330,7 @@ scripts/run.sh test          # 等价于 ctest --test-dir build --output-on-fail
 | **条目粒度** | 一个 PIR 条目 = **一整列**（`entry_words = ⌈n/128⌉` 个字），PIR index = 列索引。**不是一个 word** |
 | **几何规则** | `m = κ·w`、`w` 是 2 的幂、**`κ` 必须偶数**、`m ≥ levels`。`m` **不再要求是 2 的幂** |
 | **符号** | `n` 记录数 / `m` 条目数 / `entry_words` 条目宽度 / `levels` 真实层数 / `w` 区块大小 / `κ` 区块数 / `N_T` 备份 hint 数 |
-| **不变量 I1–I5** | I1 宽度自洽 / I2 尾部填充位两台恒 0 / I3 恰好暴露 `n` bit / I4 宽度不符即拒 / I5 tag 宽度 = 条目宽度 |
+| **五条不变量** | ① 宽度自洽（上传长度是 `entry_words` 的整数倍）② 尾部填充位在**两台分片上都为 0** ③ 上层恰好暴露 `n` bit ④ 宽度不符**即拒**（不静默截断/补齐）⑤ 恶意档下 tag 宽度必须等于条目宽度 |
 | **档位来源** | `StoreParams::has_tags()` **由 `security_mode` 推出**，不另设字段（避免自相矛盾）。半诚实档 = **什么都不做**，没有"按档位分支"的开关 |
 | **两个代数设定** | PIR 层用 `GF(2^128)`（xmac）；MPC 层用 `Z_q`，`q = 2^127−1`（Mersenne 素数）。**符号绝不混用** |
 | **线协议版本** | 当前 **v3**（1 = word 粒度 / 2 = 列粒度 / 3 = 列粒度 + xmac tag）。版本不匹配**直接拒绝** |
